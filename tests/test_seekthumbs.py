@@ -34,7 +34,7 @@ def make_film(path, seconds=130, size="1280x720", src="testsrc2", gop=48):
 
 def cfg(lib, store, **kw):
     c = dict(st.DEFAULTS)
-    c.update(library=lib, store=store, pause=0, film_pause=0, interval=10.0, min_size_mb=0, settle=60, yield_to_playback=0)
+    c.update(library=lib, store=store, pause=0, film_pause=0, interval=10.0, min_size_mb=0, settle=60, yield_to_playback=0, workers=4, rate_cooldown=0.2)
     c.update(kw)
     return c
 
@@ -101,6 +101,95 @@ try:
                        capture_output=True, text=True)
     check("prune refuses when the library is empty", r.returncode != 0 and os.path.isdir(st.entry_dir(store, "Fresh.mkv")))
     check("scan does nothing when the library is empty", st.scan_pass(cfg(empty, store)) == 0)
+
+
+    # --- the governor and the parallel build
+    import threading
+    g = st.Governor(4, 0.05)
+    for _ in range(4):
+        g.acquire()
+    g.release("throttled")
+    check("a rate-limit signal halves the parallel reads", g.limit == 2, g.limit)
+    g.release("throttled")
+    check("a burst of signals acts only once", g.limit == 2 and g.throttles == 2)
+    g.release("ok"); g.release("ok")
+    time.sleep(0.2)
+    for _ in range(45):
+        g.acquire(); g.release("ok")
+    check("clean reads raise the limit again", g.limit >= 3, g.limit)
+
+    rel2 = os.path.relpath(film, lib)
+    gov = st.Governor(4, 0.05)
+    cfg2 = cfg(lib, os.path.join(tmp, "store3"), extractor="ffmpeg")
+    orig = st.CliExtractor.grab
+    calls = {"n": 0}
+    cl = threading.Lock()
+
+    def flaky(self, t, out):
+        with cl:
+            calls["n"] += 1
+            k = calls["n"]
+        if k <= 6:
+            return False, "HTTP error 429 Too Many Requests"
+        return orig(self, t, out)
+
+    st.CliExtractor.grab = flaky
+    try:
+        ok_ = st.build_entry(rel2, film, os.path.getsize(film), cfg2, gov, False)
+    finally:
+        st.CliExtractor.grab = orig
+    ix3 = st.read_index(st.entry_dir(cfg2["store"], rel2))
+    check("the build survives a burst of 429s and still reads every thumbnail", ok_ and ix3 and all(l > 0 for l in ix3["lengths"]), calls)
+    check("the governor recorded the rate-limit signals and backed off", gov.throttles >= 1)
+
+    st.CliExtractor.grab = lambda self, t, out: (False, "HTTP error 429 Too Many Requests")
+    try:
+        try:
+            st.build_entry("x/" + rel2, film, os.path.getsize(film), cfg(lib, os.path.join(tmp, "store4"), extractor="ffmpeg", rate_cooldown=0.00005),
+                           st.Governor(2, 0.00005), False)
+            raised = None
+        except st.Throttled as ex:
+            raised = "Throttled"
+        except Exception as ex:
+            raised = type(ex).__name__
+    finally:
+        st.CliExtractor.grab = orig
+    check("endless 429s end in Throttled (film not marked as bad)", raised == "Throttled", raised)
+
+    st.CliExtractor.grab = lambda self, t, out: (False, "Invalid data found when processing input")
+    try:
+        try:
+            st.build_entry("y/" + rel2, film, os.path.getsize(film), cfg(lib, os.path.join(tmp, "store5"), extractor="ffmpeg"), st.Governor(2, 0.01), False)
+            raised = None
+        except st.ReadFailures:
+            raised = "ReadFailures"
+        except Exception as ex:
+            raised = type(ex).__name__
+    finally:
+        st.CliExtractor.grab = orig
+    check("plain read failures end in ReadFailures", raised == "ReadFailures", raised)
+
+    try:
+        import av  # noqa: F401
+        have_av = True
+    except ImportError:
+        have_av = False
+        print("SKIP PyAV tests (pip install av)")
+    if have_av:
+        cfg6 = cfg(lib, os.path.join(tmp, "store6"), extractor="pyav")
+        okv = st.build_entry(rel2, film, os.path.getsize(film), cfg6, st.Governor(4, 0.05), False)
+        ixv = st.read_index(st.entry_dir(cfg6["store"], rel2))
+        check("PyAV extractor builds the same number of thumbnails", okv and ixv and ixv["count"] == ix3["count"] and all(l > 0 for l in ixv["lengths"]))
+        with open(os.path.join(st.entry_dir(cfg6["store"], rel2), "thumbs.pack"), "rb") as f:
+            f.seek(ixv["offsets"][3])
+            check("PyAV thumbnails are JPEGs", f.read(2) == b"\xff\xd8")
+        # HDR-tagged film: the pip wheel has no zscale, so the PyAV path must fall back to the ffmpeg command and still finish
+        hdr = os.path.join(lib, "HDR.Film.mkv")
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=640x360:r=24", "-t", "60", "-g", "48", "-c:v", "libx264", "-preset",
+                        "ultrafast", "-pix_fmt", "yuv420p10le", "-color_trc", "smpte2084", "-color_primaries", "bt2020", "-colorspace", "bt2020nc", hdr], check=True)
+        cfg7 = cfg(lib, os.path.join(tmp, "store7"), extractor="auto")
+        okh = st.build_entry("HDR.Film.mkv", hdr, os.path.getsize(hdr), cfg7, st.Governor(4, 0.05), st.have_filter("zscale"))
+        check("an HDR film builds under extractor=auto (falls back when PyAV lacks zscale)", okh and st.read_index(st.entry_dir(cfg7["store"], "HDR.Film.mkv")))
 
     # --- the viewer
     try:
