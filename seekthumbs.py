@@ -12,6 +12,7 @@ films are processed one at a time, slowly, in the background, and only when no p
     seekthumbs.py verify            check every store entry against its index and the size budget
     seekthumbs.py prune [--yes]     list (or delete, with --yes) store entries whose film no longer exists; refuses if the library looks unmounted
     seekthumbs.py install-service [--enable]   write ~/.config/systemd/user/seekthumbs.service
+    seekthumbs.py install-viewer [--mpv-config-dir DIR]   put the mpv viewer (thumbfast.lua) into DIR/scripts, moving a real thumbfast aside
 
 Settings come from ~/.config/seekthumbs/config.ini ([seekthumbs] library=, store=, ...) and can be overridden on the command line.
 
@@ -535,6 +536,28 @@ WantedBy=default.target
         print("start it with: systemctl --user enable --now seekthumbs.service   (after setting library= and store= in ~/.config/seekthumbs/config.ini)")
 
 
+def cmd_install_viewer(mpv_dir):
+    mpv_dir = os.path.expanduser(mpv_dir)
+    sdir = os.path.join(mpv_dir, "scripts")
+    os.makedirs(sdir, exist_ok=True)
+    src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "thumbfast.lua")
+    dst = os.path.join(sdir, "thumbfast.lua")
+    if os.path.exists(dst):
+        with open(dst, errors="replace") as f:
+            ours = "seekthumbs viewer" in f.read(400)
+        if not ours:
+            shutil.move(dst, dst + ".bak")
+            print("moved the existing thumbfast.lua to thumbfast.lua.bak (two scripts cannot both be thumbfast)")
+    real_dir = os.path.join(sdir, "thumbfast")
+    if os.path.isdir(real_dir):
+        shutil.move(real_dir, real_dir + ".bak")
+        print("moved the scripts/thumbfast folder to thumbfast.bak")
+    shutil.copyfile(src, dst)
+    print("installed", dst)
+    print("Needs uosc (or another OSC that talks to thumbfast), ffmpeg on PATH, and library=/store= in ~/.config/seekthumbs/config.ini.")
+    print("Check: play a film that has a store entry; mpv's log shows 'seek thumbnails: <path>'. Undo: delete it and rename thumbfast.lua.bak back.")
+
+
 def main(argv):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config")
@@ -552,6 +575,8 @@ def main(argv):
     p.add_argument("--yes", action="store_true")
     p = sub.add_parser("install-service")
     p.add_argument("--enable", action="store_true")
+    p = sub.add_parser("install-viewer")
+    p.add_argument("--mpv-config-dir", default="~/.config/mpv-object-audio")
     args = ap.parse_args(argv)
     cfg = load_config(args)
     if args.cmd == "probe":
@@ -569,6 +594,8 @@ def main(argv):
         return cmd_verify(cfg)
     elif args.cmd == "prune":
         cmd_prune(cfg, args.yes)
+    elif args.cmd == "install-viewer":
+        cmd_install_viewer(args.mpv_config_dir)
     elif args.cmd == "install-service":
         cmd_install_service(cfg, args.enable)
     return 0
