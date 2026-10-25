@@ -10,7 +10,7 @@ import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TOOL = os.path.join(HERE, "..", "tools", "seekthumbs")
+TOOL = os.path.join(HERE, "..")
 sys.path.insert(0, TOOL)
 import seekthumbs as st  # noqa: E402
 

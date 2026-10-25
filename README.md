@@ -1,4 +1,4 @@
-# Seek-bar thumbnails for the rclone library (`tools/seekthumbs`)
+# seekthumbs: seek-bar thumbnails for an rclone library
 
 Netflix-style previews on the mpv seek bar (called *trickplay* or *seek thumbnails*), for a film library on a **read-only rclone mount**.
 The thumbnails are made in the background and kept in a **local folder**; the library is only ever read.
@@ -16,7 +16,7 @@ cat > ~/.config/seekthumbs/config.ini <<'INI'
 library = /path/to/the/rclone/mount/Movies
 store   = /path/to/local/thumbnail/folder
 INI
-cd ~/SDHT/tools/seekthumbs
+cd seekthumbs      # this repository
 ./seekthumbs.py probe "/path/to/one/film.mkv"     # seconds and MB received per thumbnail for each extractor, and the projected time for 100 such films
 ./seekthumbs.py plan                              # lists what would be built (directory listings only)
 ./seekthumbs.py scan --max-films 1                # build one film, look at the result
@@ -74,7 +74,7 @@ The viewer reads `library` and `store` from the same file; `script-opts/seekthum
 
 1. **Bytes read per seek on the real mount.** rclone read-ahead, chunk size and VFS cache mode decide it. `probe` now prints the bytes this machine received per
    thumbnail (all interfaces, so quiet the machine first). If it is large, a *separate* read-only mount for the overnight run with a small read-ahead
-   (`--buffer-size 0 --vfs-read-chunk-size 1M --vfs-cache-mode off` as a starting point; check the rclone docs for your version) would cut the bytes; `preflight` prints
+   (`--buffer-size 0 --vfs-read-chunk-size 1M --vfs-cache-mode off` as a starting point; check the rclone docs for your version) would cut the bytes; `preflight` (sdht repository) prints
    your current mount flags.
 2. **Rate-limit detection is by error text and timeouts.** ffmpeg and PyAV pass the HTTP error through only sometimes; a backend that throttles by silently slowing
    reads is caught only by the 90 s timeout. A hung read in a FUSE mount can block a PyAV worker thread (the ffmpeg command is killed by its timeout).
@@ -82,8 +82,12 @@ The viewer reads `library` and `store` from the same file; `script-opts/seekthum
    ffprobe/read failures and the backoff instead.
 4. **The viewer has been run only under a mocked mpv API** (lupa), not in real mpv with uosc. The thumbfast message names are from the thumbfast/uosc sources as I know
    them and are consistent with what the WebDAV-browser script sends (`script-message-to thumbfast clear`, overlay id 42), but are not checked against his uosc version.
-   `preflight` now lists the mpv `scripts/` and `script-opts/` folders and any uosc/thumbfast versions.
+   the `preflight` script of the [sdht](https://github.com/praveenchandrahas/sdht) repository lists the mpv `scripts/` and `script-opts/` folders and any uosc/thumbfast versions.
 5. Keyframe-only thumbnails can be a few seconds earlier than the hovered time (fine for scrubbing at 20 s).
 6. Dolby Vision profile 5, and HDR through PyAV on a real HDR file, are untested; the circuit breaker across films and `install-service` are not covered by tests.
 7. 6 parallel streams may exceed what your backend allows (some debrid/cloud services limit concurrent streams per link or per IP). If `probe`/the first film show
    throttling, lower `--workers`.
+
+## Tests
+
+`python3 tests/test_seekthumbs.py` (needs ffmpeg; `pip install lupa av` adds the viewer and PyAV tests). Part of the [software-defined home theatre](https://github.com/praveenchandrahas/sdht) project; licensed Apache-2.0.
