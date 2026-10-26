@@ -1,5 +1,9 @@
 # seekthumbs: seek-bar thumbnails for an rclone library
 
+![seekthumbs: seek, preview, explore. Background seek-bar thumbnails for your film library: a read-only rclone film library, a background thumbnail generator (FFmpeg or PyAV), a local thumbnail pack and index, shown on the mpv + uosc seek bar](docs/img/banner.png)
+
+*Illustration, not a screenshot: the film frames are made up, and the viewer has so far been run only under a mocked mpv API, not in real mpv with uosc (see "Open items" below).*
+
 > **Part of the [Software Defined Home Theatre](https://github.com/praveenchandrahas/Software-Defined-Home-Theatre) project.** The main repository holds the documentation, build log, results and the installer checks; this is one of its parts. Sibling repositories: [linux-theater-dsp](https://github.com/praveenchandrahas/linux-theater-dsp) · [mpv-object-audio](https://github.com/praveenchandrahas/mpv-object-audio) · [theater-measurement](https://github.com/praveenchandrahas/theater-measurement).
 
 Netflix-style previews on the mpv seek bar (called *trickplay* or *seek thumbnails*), for a film library on a **read-only rclone mount**.
