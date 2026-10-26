@@ -8,6 +8,7 @@ grows back one step per 40 clean reads. Standard library plus ffmpeg/ffprobe; Py
 
     seekthumbs.py probe FILE        time a few seeks with each extractor and the bytes the machine received; writes nothing. Run this first.
     seekthumbs.py plan              list films that still need thumbnails (reads directory listings only, no film is opened)
+    seekthumbs.py build FILE        build the thumbnails of ONE film now, gently (this is what the mpv viewer starts when you play a film that has none)
     seekthumbs.py scan              one pass: build thumbnails for every film that lacks them (--max-films N to limit)
     seekthumbs.py watch             scan, sleep --poll seconds, repeat (this is what the systemd service runs)
     seekthumbs.py status            store size, entry count, the largest entries against the size budget
@@ -21,12 +22,15 @@ Settings come from ~/.config/seekthumbs/config.ini ([seekthumbs] library=, store
 Store layout (mirrors the library, so a player script can find a film's entry by path alone):
     STORE/<path of the film relative to LIBRARY>.seekthumbs/index.json   {v, src, size, duration, interval, w, h, count, offsets[], lengths[], q, made}
     STORE/<same>.seekthumbs/thumbs.pack                                  the JPEGs one after another; thumbnail i is at offsets[i], lengths[i] bytes
+A release that is the same film as one already built (same title and year in the file name, runtime within 2 s) gets only a small alias entry:
+    STORE/<path>.seekthumbs/index.json   {v:2, alias_of:<path of the real entry>, src, size, duration, target_made, made}   (no thumbs.pack)
 Thumbnail i shows the film at about (i + 0.5) * interval seconds. A length of 0 means that one could not be read (use the previous one).
 Size budget: at most budget_mb per 2 hours of film (default 10), aimed at 80 % of it; quality and then width are lowered until it fits.
 """
 import argparse
 import configparser
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -37,13 +41,15 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 VIDEO_EXT = {".mkv", ".mp4", ".m4v", ".avi", ".mov", ".ts", ".m2ts", ".webm", ".wmv"}
 DEFAULTS = dict(library="", store="", interval=20.0, width=240, workers=6, pause=0.0, film_pause=0.0, poll=1800.0, settle=600.0,
                 min_size_mb=300.0, max_films=0, budget_mb=10.0, safety=0.8, seek_timeout=90.0, probesize="1M", yield_to_playback=1,
-                breaker_hours=1.0, extractor="auto", rate_cooldown=30.0)
+                breaker_hours=1.0, extractor="auto", rate_cooldown=30.0,
+                play_workers=2, play_pause=2.0, play_extractor="pyav", share=1, share_tolerance=2.0, encode_jobs=0)
 PLAYERS = ("mpv", "mpv-atmos", "mpv-object-audio", "vlc", "kodi", "kodi.bin")
 SUFFIX = ".seekthumbs"
 STOP = False
@@ -54,6 +60,10 @@ THROTTLE_RE = re.compile(r"429|too many request|rate.?limit|quota|slow.?down|ser
 
 class Throttled(Exception):
     """The mount kept saying 'slow down' even at the lowest concurrency and the longest cool-down."""
+
+
+class NoPyAV(Exception):
+    """The during-playback build needs PyAV and it is not usable (not installed, or its filter chain cannot be built)."""
 
 
 class ReadFailures(Exception):
@@ -143,9 +153,147 @@ def read_index(edir):
     return None
 
 
+def read_alias(edir):
+    """The alias index of an entry folder (another release of the same film), or None."""
+    try:
+        with open(os.path.join(edir, "index.json")) as f:
+            al = json.load(f)
+        if al.get("v") == 2 and isinstance(al.get("alias_of"), str) and al.get("target_made") and isinstance(al.get("size"), int):
+            return al
+    except (OSError, ValueError, AttributeError):
+        pass
+    return None
+
+
+def resolve_entry(store, rel, size=None, hops=4):
+    """The thumbnails to use for the film `rel`: (index, folder of the real entry, rel of the real entry) or None.
+    Follows aliases (an alias points at the entry of another release of the same film). `size`, if given, must equal the size recorded for `rel` itself,
+    so a replaced file never shows the old pictures. A broken link, a loop, a target that was rebuilt since (its `made` differs) or more than
+    `hops` links give None."""
+    seen, cur, expect = set(), rel, None
+    for hop in range(hops + 1):
+        if cur in seen or ".." in cur.split("/"):
+            return None
+        seen.add(cur)
+        edir = entry_dir(store, cur)
+        ix = read_index(edir)
+        if ix is not None:
+            if hop == 0 and size is not None and ix.get("size") != size:
+                return None
+            if expect is not None and ix.get("made") != expect:
+                return None
+            return ix, edir, cur
+        al = read_alias(edir)
+        if al is None:
+            return None
+        if hop == 0 and size is not None and al.get("size") != size:
+            return None
+        if expect is not None and al.get("made") != expect:
+            return None
+        expect, cur = al["target_made"], al["alias_of"]
+    return None
+
+
 def entry_current(store, rel, size):
-    ix = read_index(entry_dir(store, rel))
-    return ix is not None and ix.get("size") == size
+    return resolve_entry(store, rel, size) is not None
+
+
+# Words in a release name that end the title part ("Movie.Name.2019.2160p.UHD.BluRay.x265-GRP"). Not a complete list: a title that runs into an unknown tag
+# before its year is simply not grouped (never wrongly grouped).
+TAG_WORDS = {"bluray", "blu", "bdrip", "brrip", "bdremux", "remux", "web", "webdl", "webrip", "hdtv", "dvdrip", "dvd", "hdrip", "hdr", "hdr10", "hdr10plus",
+             "dv", "dovi", "uhd", "4k", "x264", "x265", "h264", "h265", "hevc", "avc", "av1", "aac", "ac3", "dts", "truehd", "atmos", "ddp", "eac3",
+             "repack", "proper", "internal", "multi", "dual", "extended", "unrated", "remastered", "imax", "directors", "theatrical", "criterion",
+             "amzn", "nf", "dsnp", "hmax", "atvp"}
+
+
+def release_key(name):
+    """'normalised title|year' parsed from a file name, or None when it cannot be done with certainty (no year, a TV episode, a year only before a tag).
+    The year is the last year-looking word before the first release tag; a year in first position belongs to the title (2001.A.Space.Odyssey.1968)."""
+    base = os.path.splitext(os.path.basename(name))[0]
+    s = "".join(c for c in unicodedata.normalize("NFKD", base) if not unicodedata.combining(c)).lower().replace("&", " and ")
+    while True:                                # leading site tags and bracket groups: "www.UIndex.org - ", "[YTS.MX] "
+        t = re.sub(r"^\s*(?:\[[^\]]*\]|\([^)]*\)|www\.[a-z0-9.-]+\.[a-z]{2,}\s*[-\u2013]?)\s*", "", s)
+        if t == s:
+            break
+        s = t
+    if re.search(r"\bs\d{1,2}[ ._-]?e\d{1,3}\b|\b\d{1,2}x\d{2,3}\b|\bseason[ ._-]?\d+|\bepisode[ ._-]?\d+", s):
+        return None
+    toks = [t for t in re.split(r"[^a-z0-9]+", s) if t]
+    cut = len(toks)
+    for i in range(1, len(toks)):
+        t = toks[i]
+        if t in TAG_WORDS or re.fullmatch(r"\d{3,4}[pi]", t) or re.fullmatch(r"[xh]26[45]", t):
+            cut = i
+            break
+    year_at = None
+    for i in range(1, cut):
+        if re.fullmatch(r"(19|20)\d\d", toks[i]):
+            year_at = i
+    if year_at is None:
+        return None
+    return " ".join(toks[:year_at]) + "|" + toks[year_at]
+
+
+def find_sibling(store, rel, duration, tol):
+    """The real entry of another release of the same film (same release_key, runtime within `tol` s), or None. Reads only the local store."""
+    key = release_key(rel)
+    if key is None:
+        return None
+    best = None
+    for edir in store_entries(store):
+        other = os.path.relpath(edir, store)[: -len(SUFFIX)]
+        if other == rel or release_key(other) != key:
+            continue
+        ix = read_index(edir)
+        if ix is None or abs(float(ix["duration"]) - duration) > tol:
+            continue
+        d = abs(float(ix["duration"]) - duration)
+        if best is None or d < best[0]:
+            best = (d, ix, other)
+    return best
+
+
+def write_alias(store, rel, size, duration, target_rel, tix):
+    final = entry_dir(store, rel)
+    os.makedirs(os.path.dirname(final), exist_ok=True)
+    work = tempfile.mkdtemp(prefix=".work-", dir=os.path.dirname(final))
+    try:
+        al = dict(v=2, alias_of=target_rel, src=rel, size=size, duration=round(duration, 2), target_made=tix["made"],
+                  made=datetime.now(timezone.utc).isoformat(timespec="milliseconds"))
+        with open(os.path.join(work, "index.json"), "w") as f:
+            json.dump(al, f, separators=(",", ":"))
+        if os.path.isdir(final):
+            shutil.rmtree(final)
+        os.rename(work, final)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def film_lock(store, rel):
+    """An exclusive lock for building one film (so two instances never build the same film). Returns the open file, or None if somebody holds it."""
+    d = os.path.join(store, ".locks")
+    os.makedirs(d, exist_ok=True)
+    f = open(os.path.join(d, hashlib.sha1(rel.encode()).hexdigest() + ".lock"), "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        return None
+    return f
+
+
+def clean_stale_work(store, max_age=86400.0):
+    """Removes .work-* folders left behind by a build that was killed (they hold raw frames, tens of MB per film)."""
+    for dp, dn, fn in os.walk(store):
+        for d in list(dn):
+            if d.startswith(".work-"):
+                dn.remove(d)
+                full = os.path.join(dp, d)
+                try:
+                    if time.time() - os.path.getmtime(full) > max_age:
+                        shutil.rmtree(full, ignore_errors=True)
+                except OSError:
+                    pass
 
 
 def store_entries(store):
@@ -474,6 +622,8 @@ def make_extractor(cfg, src, info, zscale_ok):
         return cli
     ok, why = AvExtractor.usable(vf)
     if not ok:
+        if want == "pyav" and cfg.get("strict_extractor"):
+            raise NoPyAV(why)
         if want == "pyav":
             log("pyav requested but not usable:", why, "- using the ffmpeg command")
         return cli
@@ -525,6 +675,12 @@ def build_entry(rel, src, size, cfg, gov, zscale_ok):
     """Returns True on success. All writes go to the local store; the source is only read."""
     t0 = time.time()
     info = ffprobe(src, cfg)
+    if cfg.get("share", 1):
+        sib = find_sibling(cfg["store"], rel, info["duration"], float(cfg.get("share_tolerance", 2.0)))
+        if sib:
+            write_alias(cfg["store"], rel, size, info["duration"], sib[2], sib[1])
+            log(f"shared {rel}: same film as {sib[2]} (runtimes {sib[0]:.1f} s apart); no thumbnails built")
+            return True
     n = max(1, int(info["duration"] // cfg["interval"]))
     allowed = cfg["budget_mb"] * 1e6 * (info["duration"] / 7200.0) * cfg["safety"]
     ext = make_extractor(cfg, src, info, zscale_ok)
@@ -591,7 +747,7 @@ def build_entry(rel, src, size, cfg, gov, zscale_ok):
         t_read = time.time() - t0
         enc = os.path.join(work, "jpg")
         os.makedirs(enc)
-        sizes, w, q = choose_and_encode(frames, enc, cfg["width"], allowed, os.cpu_count() or 2)
+        sizes, w, q = choose_and_encode(frames, enc, cfg["width"], allowed, int(cfg.get("encode_jobs") or 0) or (os.cpu_count() or 2))
         if not sizes:
             raise RuntimeError("encoding failed")
         offsets, lengths, pos = [], [], 0
@@ -609,7 +765,7 @@ def build_entry(rel, src, size, cfg, gov, zscale_ok):
                     lengths.append(0)
         h = int(round(w * info["height"] / info["width"] / 2) * 2)
         ix = dict(v=1, src=rel, size=size, duration=round(info["duration"], 2), interval=cfg["interval"], w=w, h=h, count=n,
-                  offsets=offsets, lengths=lengths, q=q, made=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+                  offsets=offsets, lengths=lengths, q=q, made=datetime.now(timezone.utc).isoformat(timespec="milliseconds"))
         with open(os.path.join(work, "index.json"), "w") as f:
             json.dump(ix, f, separators=(",", ":"))
         shutil.rmtree(enc, ignore_errors=True)
@@ -651,6 +807,22 @@ def library_ready(cfg):
         return False
 
 
+def order_todo(todo, share=True):
+    """Orders films for a pass and tells which are one film in several releases. Returns [(item, role, n)]: role 'build' (a singleton, or the release of a group that
+    is built: the smallest file, the cheapest to read) or 'alias' (the others of its group, which only get an alias if their runtime agrees); n = size of the group.
+    Groups are ordered by their newest file, so new additions still come first."""
+    groups = {}
+    for it in todo:
+        k = release_key(it[1]) if share else None
+        groups.setdefault(k if k else "\0" + it[1], []).append(it)
+    out = []
+    for k, members in sorted(groups.items(), key=lambda kv: (-max(m[0] for m in kv[1]), kv[0])):
+        members.sort(key=lambda m: (m[3], m[1]))
+        for i, it in enumerate(members):
+            out.append((it, "build" if i == 0 else "alias", len(members)))
+    return out
+
+
 def scan_pass(cfg, dry=False):
     need_paths(cfg)
     os.makedirs(cfg["store"], exist_ok=True)
@@ -664,6 +836,8 @@ def scan_pass(cfg, dry=False):
         log("library folder is missing or empty (mount down?); nothing done")
         return 0
     state = State(cfg["store"])
+    if not dry:
+        clean_stale_work(cfg["store"])
     if not dry and state.d["breaker_until"] > time.time():
         log(f"circuit breaker open for another {(state.d['breaker_until'] - time.time()) / 60:.0f} min after repeated read failures")
         return 0
@@ -674,11 +848,15 @@ def scan_pass(cfg, dry=False):
         if time.time() - mtime < cfg["settle"]:
             continue
         todo.append((mtime, rel, src, size))
-    todo.sort(reverse=True)          # newest additions first
+    ordered = order_todo(todo, bool(cfg.get("share", 1)))
+    todo = [it for it, role, n in ordered]       # newest additions first; the releases of one film together, the smallest file first
     if dry:
-        for mtime, rel, src, size in todo:
-            print(f"{size / 1e9:6.1f} GB  {rel}")
-        log(f"{len(todo)} film(s) need thumbnails")
+        for (mtime, rel, src, size), role, n in ordered:
+            note = f"   [{n} releases share this: built from this one, the smallest]" if role == "build" and n > 1 else \
+                   "   [alias of the one above if its runtime agrees within " + f"{cfg.get('share_tolerance', 2.0):g} s]" if role == "alias" else ""
+            print(f"{size / 1e9:6.1f} GB  {rel}{note}")
+        films = sum(1 for it, role, n in ordered if role == "build")
+        log(f"{len(todo)} file(s) need thumbnails = {films} film(s) to build" + (f" + {len(todo) - films} release(s) that would only get an alias" if len(todo) > films else ""))
         return len(todo)
     batch = todo if int(cfg["max_films"]) <= 0 else todo[: int(cfg["max_films"])]
     zs = have_filter("zscale")
@@ -691,6 +869,10 @@ def scan_pass(cfg, dry=False):
         while cfg["yield_to_playback"] and player_running() and not STOP:
             log("a player is running; waiting 5 min")
             sleep_interruptible(300)
+        lk = film_lock(cfg["store"], rel)
+        if lk is None:
+            log(f"{rel} is being built by another seekthumbs; skipping")
+            continue
         try:
             if build_entry(rel, src, size, cfg, gov, zs):
                 state.ok(rel)
@@ -716,11 +898,92 @@ def scan_pass(cfg, dry=False):
                     state.save()
                     log("three films in a row could not be read: pausing all work for", cfg["breaker_hours"], "h (mount trouble?)")
                     break
+        finally:
+            lk.close()
         if cfg["film_pause"]:
             sleep_interruptible(cfg["film_pause"])
     left = max(0, len(todo) - done)
     log(f"pass finished: {done} built, {left} still waiting; {gov.throttles} rate-limit signal(s), parallel reads ended at {gov.limit}/{gov.max}")
     return done
+
+
+def cmd_build(cfg, path, own_process=True):
+    """Builds the thumbnails of ONE film (the one that is playing). Meant to run beside playback: lowest CPU and I/O priority, play_workers parallel reads
+    (default 2) with the same governor and circuit breaker as scan, and it does NOT wait for players (the player is the reason it runs).
+    Returns 0 for 'done or nothing to do', 1 for a failed build, 2 for a bad request."""
+    need_paths(cfg)
+    if own_process:                            # (the tests call this inside their own process and leave signals and priority alone)
+        for sg in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sg, on_signal)
+        try:
+            os.nice(19)
+        except OSError:
+            pass
+        if shutil.which("ionice"):
+            subprocess.run(["ionice", "-c3", "-p", str(os.getpid())], capture_output=True)
+    path = os.path.abspath(os.path.expanduser(path))
+    rel = os.path.relpath(path, os.path.abspath(cfg["library"]))
+    if rel.startswith(".."):
+        log(f"{path} is not under the library {cfg['library']}; nothing built")
+        return 2
+    if os.path.splitext(path)[1].lower() not in VIDEO_EXT:
+        log("not a video file; skipped:", rel)
+        return 0
+    try:
+        size = os.stat(path).st_size
+    except OSError as ex:
+        log("cannot read", path, ex)
+        return 2
+    if size < cfg["min_size_mb"] * 1e6:
+        log(f"smaller than {cfg['min_size_mb']:g} MB; skipped: {rel}")
+        return 0
+    os.makedirs(cfg["store"], exist_ok=True)
+    lk = film_lock(cfg["store"], rel)
+    if lk is None:
+        log("already being built by another seekthumbs:", rel)
+        return 0
+    try:
+        if entry_current(cfg["store"], rel, size):
+            log("already has thumbnails:", rel)
+            return 0
+        clean_stale_work(cfg["store"])
+        state = State(cfg["store"])
+        if state.d["breaker_until"] > time.time():
+            log(f"circuit breaker open for another {(state.d['breaker_until'] - time.time()) / 60:.0f} min after repeated read failures; not building")
+            return 0
+        if state.blocked(rel, size):
+            log("this film failed recently and is not retried yet:", rel, "-", state.d["fail"][rel]["why"][:100])
+            return 0
+        c = dict(cfg)
+        c["workers"] = max(1, int(cfg["play_workers"]))
+        c["extractor"] = cfg["play_extractor"]
+        c["strict_extractor"] = cfg["play_extractor"] == "pyav"      # never fall back to one ffmpeg process per thumbnail next to a film that is playing
+        c["pause"] = float(cfg["play_pause"])      # each worker rests this long after a read: caps the extra bandwidth (a 4K remux is read at about its own bit rate otherwise)
+        c["encode_jobs"] = int(cfg.get("encode_jobs") or 0) or 2
+        gov = Governor(c["workers"], cfg["rate_cooldown"])
+        log(f"building {rel} ({size / 1e9:.1f} GB) with {c['workers']} parallel read(s), {c['pause']:g} s rest after each, lowest priority")
+        try:
+            build_entry(rel, path, size, c, gov, have_filter("zscale"))
+            state.ok(rel)
+            return 0
+        except KeyboardInterrupt:
+            log("interrupted; nothing kept")
+            return 1
+        except NoPyAV as ex:
+            log(f"NOT building {rel}: PyAV is not usable ({ex}). The ffmpeg command would read several times more data from the mount (measured on one 4K remux: "
+                "62.7 MB against 9.8 MB per thumbnail) while the film plays. Install python3-av (apt), or set play_extractor=auto to allow it. Not recorded as a failure.")
+            return 1
+        except Throttled as ex:
+            log(f"STOPPING: {ex}")
+            state.d["breaker_until"] = time.time() + cfg["breaker_hours"] * 3600
+            state.save()
+            return 1
+        except Exception as ex:                # noqa: BLE001
+            log(f"FAILED {rel}: {ex}")
+            state.failed(rel, size, str(ex))
+            return 1
+    finally:
+        lk.close()
 
 
 def cmd_watch(cfg):
@@ -789,7 +1052,7 @@ def cmd_probe(cfg, path):
 
 def cmd_status(cfg):
     need_paths(cfg, library=False)
-    n = tot = 0
+    n = tot = aliases = 0
     worst = []
     for edir in store_entries(cfg["store"]):
         ix = read_index(edir)
@@ -798,7 +1061,9 @@ def cmd_status(cfg):
         tot += sz
         if ix:
             worst.append((sz / max(1.0, ix["duration"] / 7200.0) / 1e6, sz, os.path.relpath(edir, cfg["store"])))
-    print(f"{n} entries, {tot / 1e6:.1f} MB in {cfg['store']}")
+        elif read_alias(edir):
+            aliases += 1
+    print(f"{n} entries ({n - aliases} with thumbnails, {aliases} sharing another release's), {tot / 1e6:.1f} MB in {cfg['store']}")
     for per2h, sz, rel in sorted(worst, reverse=True)[:5]:
         print(f"  {per2h:5.2f} MB per 2 h  ({sz / 1e6:.2f} MB)  {rel}")
     st = State(cfg["store"])
@@ -815,6 +1080,17 @@ def cmd_verify(cfg):
         n += 1
         ix = read_index(edir)
         if ix is None:
+            al = read_alias(edir)
+            if al is not None:
+                me = os.path.relpath(edir, cfg["store"])[: -len(SUFFIX)]
+                r = resolve_entry(cfg["store"], me)
+                if r is None:
+                    print("BROKEN alias (target missing, rebuilt since, or a loop):", edir)
+                    bad += 1
+                elif abs(float(r[0]["duration"]) - float(al.get("duration", 0))) > float(cfg.get("share_tolerance", 2.0)):
+                    print(f"ALIAS runtime differs from its target by more than {cfg.get('share_tolerance', 2.0):g} s:", edir)
+                    bad += 1
+                continue
             print("BAD index/pack:", edir)
             bad += 1
             continue
@@ -840,9 +1116,26 @@ def cmd_prune(cfg, yes):
     if not library_ready(cfg):
         sys.exit("library folder is missing or empty: refusing to prune (a missing mount would look like every film was deleted)")
     have = {rel for rel, _, _, _ in walk_library(cfg["library"], 0)}
-    gone = [e for e in store_entries(cfg["store"]) if os.path.relpath(e, cfg["store"])[: -len(SUFFIX)] not in have]
     if len(have) == 0:
         sys.exit("no videos found in the library: refusing to prune")
+    entries = {os.path.relpath(e, cfg["store"])[: -len(SUFFIX)]: e for e in store_entries(cfg["store"])}
+    gone, keep_target = [], {}
+    # aliases first: one goes when its film is gone or its link is broken; the ones that stay keep their target (the pack) alive
+    for rel, e in entries.items():
+        al = read_alias(e)
+        if al is None:
+            continue
+        if rel not in have or resolve_entry(cfg["store"], rel) is None:
+            gone.append(e)
+        else:
+            keep_target.setdefault(resolve_entry(cfg["store"], rel)[2], []).append(rel)
+    for rel, e in entries.items():
+        if read_alias(e) is not None or rel in have:
+            continue
+        if rel in keep_target:
+            print(f"keeping {e} (its film is gone, but {len(keep_target[rel])} other release(s) still use these thumbnails)")
+        else:
+            gone.append(e)
     for e in gone:
         print(("deleting " if yes else "would delete ") + e)
         if yes:
@@ -878,6 +1171,29 @@ WantedBy=default.target
         print("start it with: systemctl --user enable --now seekthumbs.service   (after setting library= and store= in ~/.config/seekthumbs/config.ini)")
 
 
+def set_conf_key(path, key, value):
+    """Sets key=value in an mpv script-opts file, keeping every other line (creates the file if needed)."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    lines = []
+    if os.path.exists(path):
+        with open(path) as f:
+            lines = f.read().split("\n")
+    out, done = [], False
+    for ln in lines:
+        if re.match(rf"^\s*{re.escape(key)}\s*=", ln):
+            if not done:
+                out.append(f"{key}={value}")
+                done = True
+            continue
+        out.append(ln)
+    if not done:
+        while out and out[-1] == "":
+            out.pop()
+        out.append(f"{key}={value}")
+    with open(path, "w") as f:
+        f.write("\n".join(out).rstrip("\n") + "\n")
+
+
 def cmd_install_viewer(mpv_dir):
     mpv_dir = os.path.expanduser(mpv_dir)
     sdir = os.path.join(mpv_dir, "scripts")
@@ -896,33 +1212,48 @@ def cmd_install_viewer(mpv_dir):
         print("moved the scripts/thumbfast folder to thumbfast.bak")
     shutil.copyfile(src, dst)
     print("installed", dst)
+    conf = os.path.join(mpv_dir, "script-opts", "seekthumbs.conf")
+    set_conf_key(conf, "builder", os.path.join(os.path.dirname(os.path.abspath(__file__)), "seekthumbs.py"))
+    print("set builder= in", conf, "(the viewer starts a background build of the playing film through it; build=no there turns that off)")
     print("Needs uosc (or another OSC that talks to thumbfast), ffmpeg on PATH, and library=/store= in ~/.config/seekthumbs/config.ini.")
     print("Check: play a film that has a store entry; mpv's log shows 'seek thumbnails: <path>'. Undo: delete it and rename thumbfast.lua.bak back.")
 
 
 def main(argv):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--config")
-    ap.add_argument("--library")
-    ap.add_argument("--store")
-    for k, v in DEFAULTS.items():
-        if k not in ("library", "store"):
-            ap.add_argument("--" + k.replace("_", "-"), dest=k, type=type(v) if not isinstance(v, str) else str, default=None)
+
+    def add_settings(parser, default):
+        """The settings options. Added to the main parser and to every subcommand, so they work before and after the subcommand
+        (`seekthumbs.py --max-films 1 scan` and `seekthumbs.py scan --max-films 1`). On the subcommands the default is SUPPRESS: only what was typed there counts."""
+        parser.add_argument("--config", default=default)
+        parser.add_argument("--library", default=default)
+        parser.add_argument("--store", default=default)
+        for k, v in DEFAULTS.items():
+            if k not in ("library", "store"):
+                parser.add_argument("--" + k.replace("_", "-"), dest=k, type=type(v) if not isinstance(v, str) else str, default=default)
+
+    add_settings(ap, None)
+    common = argparse.ArgumentParser(add_help=False)
+    add_settings(common, argparse.SUPPRESS)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    p = sub.add_parser("probe")
+    p = sub.add_parser("probe", parents=[common])
+    p.add_argument("file")
+    p = sub.add_parser("build", parents=[common])
     p.add_argument("file")
     for c in ("plan", "scan", "watch", "status", "verify"):
-        sub.add_parser(c)
-    p = sub.add_parser("prune")
+        sub.add_parser(c, parents=[common])
+    p = sub.add_parser("prune", parents=[common])
     p.add_argument("--yes", action="store_true")
-    p = sub.add_parser("install-service")
+    p = sub.add_parser("install-service", parents=[common])
     p.add_argument("--enable", action="store_true")
-    p = sub.add_parser("install-viewer")
+    p = sub.add_parser("install-viewer", parents=[common])
     p.add_argument("--mpv-config-dir", default="~/.config/mpv-object-audio")
     args = ap.parse_args(argv)
     cfg = load_config(args)
     if args.cmd == "probe":
         cmd_probe(cfg, args.file)
+    elif args.cmd == "build":
+        return cmd_build(cfg, args.file)
     elif args.cmd == "plan":
         scan_pass(cfg, dry=True)
     elif args.cmd == "scan":
@@ -945,5 +1276,19 @@ def main(argv):
     return 0
 
 
+def cli():
+    """Runs main(); a reader that closes the pipe early (`plan | head`) ends the program quietly instead of with a traceback."""
+    try:
+        rc = main(sys.argv[1:])
+        sys.stdout.flush()
+    except BrokenPipeError:
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except OSError:
+            pass
+        rc = 0
+    sys.exit(rc)
+
+
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    cli()

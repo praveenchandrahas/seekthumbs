@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Tests for tools/seekthumbs: generator (synthetic films made with ffmpeg) and the mpv viewer (Lua run under lupa with a mocked mp API).
 Needs ffmpeg and, for the viewer part, `pip install lupa` (skipped with a note if missing). Does not need mpv."""
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -191,6 +193,263 @@ try:
         okh = st.build_entry("HDR.Film.mkv", hdr, os.path.getsize(hdr), cfg7, st.Governor(4, 0.05), st.have_filter("zscale"))
         check("an HDR film builds under extractor=auto (falls back when PyAV lacks zscale)", okh and st.read_index(st.entry_dir(cfg7["store"], "HDR.Film.mkv")))
 
+
+    # ================================================================ on-play build and sharing between releases
+    cases = {
+        "Movie.Name.2019.2160p.UHD.BluRay.x265-GRP.mkv": "movie name|2019",
+        "Movie Name (2019) [1080p].mkv": "movie name|2019",
+        "Blade.Runner.2049.2017.2160p.WEB-DL.mkv": "blade runner 2049|2017",
+        "2001.A.Space.Odyssey.1968.1080p.mkv": "2001 a space odyssey|1968",
+        "Amélie.2001.720p.mkv": "amelie|2001",
+        "Tom & Jerry 2021.mkv": "tom and jerry|2021",
+        "Movies/Some Folder/Movie.2019.Extended.2160p.mkv": "movie|2019",
+        "www.UIndex.org - The Imitation Game 2014 REMUX 2160p.mkv": "the imitation game|2014",
+        "The.Imitation.Game.2014.MULTI.1080p.mkv": "the imitation game|2014",
+        "Avatar Fire and Ash 2025 Hybrid 2160p DV HDR10.mkv": "avatar fire and ash|2025",
+        "Avatar.Fire.And.Ash.2025.REPACK.MULTi.VF2.2160p.UHD.mkv": "avatar fire and ash|2025",
+        "[YTS.MX] Movie Name 2019 1080p.mkv": "movie name|2019",
+        "Everest.IMAX.2160p.mkv": None,
+        "The.Show.S01E02.2019.1080p.mkv": None,
+        "Show.1x05.2019.mkv": None,
+        "Show.Season.2.2019.mkv": None,
+        "No.Year.Here.1080p.mkv": None,
+        "Movie.1080p.2019.mkv": None,
+        "2019.mkv": None,
+    }
+    wrong = {k: st.release_key(k) for k, v in cases.items() if st.release_key(k) != v}
+    check("release_key parses titles and years (and refuses what it cannot be sure of)", not wrong, wrong)
+    check("different title strings do not match (a separate build is the safe fallback)",
+          st.release_key("Hope.2026.1080p.WEB.mkv") != st.release_key("Hopeu - Hope (2026)CZtit 1080p.mkv"))
+
+    lib2, store2 = os.path.join(tmp, "lib2"), os.path.join(tmp, "store2s")
+    names = {"a": "Cool.Film.2019.2160p.WEB-DL.mkv", "b": "Cool Film (2019) 1080p BluRay.mkv", "c": "Cool.Film.2019.Extended.mkv",
+             "d": "Cool.Film.2020.mkv", "e": "Other.Movie.mkv", "f": "Some.Show.S01E01.2019.mkv"}
+    for k, n in names.items():
+        make_film(os.path.join(lib2, n), seconds=75 if k == "c" else 60, size="1280x720" if k == "b" else "640x360")
+    c2 = cfg(lib2, store2)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        st.scan_pass(c2, dry=True)
+    pl = buf.getvalue()
+    check("plan marks the release that is built (the smaller file) and the one that only gets an alias",
+          "share this" in pl and "alias of the one above" in pl and pl.index(names["a"]) < pl.index(names["b"]), pl)
+    check("plan summary counts films and aliases", "6 file(s) need thumbnails = 4 film(s) to build + 2 release(s)" in pl, pl)
+    st.scan_pass(c2)
+    kinds = {k: ("real" if st.read_index(st.entry_dir(store2, n)) else "alias" if st.read_alias(st.entry_dir(store2, n)) else None) for k, n in names.items()}
+    ab = sorted([kinds["a"], kinds["b"]])
+    check("two releases of one film: one real entry and one alias", ab == ["alias", "real"], kinds)
+    check("a different cut (runtime), a different year, no year and a TV episode each get their own thumbnails",
+          all(kinds[k] == "real" for k in "cdef"), kinds)
+    check("batch: of two releases the smaller file is the one that is built", kinds["a"] == "real" and kinds["b"] == "alias", kinds)
+    alias_k = "a" if kinds["a"] == "alias" else "b"
+    real_k = "b" if alias_k == "a" else "a"
+    alias_rel, real_rel = names[alias_k], names[real_k]
+    adir = st.entry_dir(store2, alias_rel)
+    check("an alias folder holds only its small index.json", os.listdir(adir) == ["index.json"] and os.path.getsize(os.path.join(adir, "index.json")) < 1000)
+    asize, rsize = os.path.getsize(os.path.join(lib2, alias_rel)), os.path.getsize(os.path.join(lib2, real_rel))
+    r_al, r_re = st.resolve_entry(store2, alias_rel, asize), st.resolve_entry(store2, real_rel, rsize)
+    check("the alias resolves to the other release's thumbnails", r_al and r_re and r_al[2] == real_rel and r_al[0]["made"] == r_re[0]["made"])
+    check("the alias is only valid for its own file size", st.resolve_entry(store2, alias_rel, asize + 1) is None)
+    check("nothing is left to build", st.scan_pass(c2, dry=True) == 0)
+    check("verify accepts aliases", st.cmd_verify(c2) == 0)
+    out = subprocess.run([sys.executable, os.path.join(TOOL, "seekthumbs.py"), "--store", store2, "status"], capture_output=True, text=True).stdout
+    check("status counts aliases separately", "1 sharing another release" in out, out)
+
+    # a replaced alias file is queued and shares again
+    make_film(os.path.join(lib2, alias_rel), seconds=60, size="320x180")
+    check("a replaced file with an alias is queued again", st.scan_pass(c2, dry=True) == 1)
+    st.scan_pass(c2)
+    asize = os.path.getsize(os.path.join(lib2, alias_rel))
+    check("after the rebuild it shares again", st.read_alias(adir) is not None and st.resolve_entry(store2, alias_rel, asize))
+
+    # the target is rebuilt: the alias stops resolving (its pictures may no longer fit), then is re-linked
+    make_film(os.path.join(lib2, real_rel), seconds=60, size="480x270")
+    st.scan_pass(c2, dry=False) if False else None
+    rr = os.path.join(lib2, real_rel)
+    lk = st.film_lock(store2, alias_rel)                    # keep the alias out of the next pass so the stale state can be looked at
+    st.scan_pass(c2)
+    lk.close()
+    check("when the target is rebuilt the alias no longer resolves", st.resolve_entry(store2, alias_rel, asize) is None and st.read_index(st.entry_dir(store2, real_rel)))
+    st.scan_pass(c2)
+    check("the next pass links the alias to the new thumbnails", st.resolve_entry(store2, alias_rel, asize) is not None)
+
+    # loops and broken links
+    for nm in ("Loop.A.2000.mkv", "Loop.B.2000.mkv"):
+        os.makedirs(st.entry_dir(store2, nm))
+    for me, other in (("Loop.A.2000.mkv", "Loop.B.2000.mkv"), ("Loop.B.2000.mkv", "Loop.A.2000.mkv")):
+        with open(os.path.join(st.entry_dir(store2, me), "index.json"), "w") as f:
+            json.dump(dict(v=2, alias_of=other, src=me, size=5, duration=60, target_made="x", made="x"), f)
+    check("an alias loop gives nothing (and does not hang)", st.resolve_entry(store2, "Loop.A.2000.mkv", 5) is None)
+    os.makedirs(st.entry_dir(store2, "Dangling.2000.mkv"))
+    with open(os.path.join(st.entry_dir(store2, "Dangling.2000.mkv"), "index.json"), "w") as f:
+        json.dump(dict(v=2, alias_of="Not.There.2000.mkv", src="Dangling.2000.mkv", size=5, duration=60, target_made="x", made="x"), f)
+    check("an alias to a missing entry gives nothing", st.resolve_entry(store2, "Dangling.2000.mkv", 5) is None)
+    check("verify reports broken aliases", st.cmd_verify(c2) == 1)
+    for nm in ("Loop.A.2000.mkv", "Loop.B.2000.mkv", "Dangling.2000.mkv"):
+        shutil.rmtree(st.entry_dir(store2, nm))
+
+    # prune and aliases
+    lib3, store3 = os.path.join(tmp, "lib3"), os.path.join(tmp, "store3s")
+    for n in ("Real.Film.2018.mkv", "Real Film (2018) 720p.mkv", "Zed.Keep.mkv"):
+        make_film(os.path.join(lib3, n), seconds=60, size="640x360" if n.startswith("Real.") else "320x180")
+    c3 = cfg(lib3, store3)
+    st.scan_pass(c3)
+    kinds3 = {n: ("real" if st.read_index(st.entry_dir(store3, n)) else "alias" if st.read_alias(st.entry_dir(store3, n)) else None)
+              for n in ("Real.Film.2018.mkv", "Real Film (2018) 720p.mkv")}
+    real3 = [n for n, k in kinds3.items() if k == "real"][0]
+    alias3 = [n for n, k in kinds3.items() if k == "alias"][0]
+
+    def prune():
+        return subprocess.run([sys.executable, os.path.join(TOOL, "seekthumbs.py"), "--library", lib3, "--store", store3, "--min-size-mb", "0", "prune", "--yes"],
+                              capture_output=True, text=True).stdout
+
+    os.remove(os.path.join(lib3, real3))
+    out = prune()
+    check("prune keeps a pack whose film is gone while an alias still uses it", os.path.isfile(os.path.join(st.entry_dir(store3, real3), "thumbs.pack")) and "keeping" in out, out)
+    check("the alias still resolves after that prune", st.resolve_entry(store3, alias3, os.path.getsize(os.path.join(lib3, alias3))) is not None)
+    os.remove(os.path.join(lib3, alias3))
+    prune()
+    check("when both films are gone, prune removes the alias and the pack", not os.path.isdir(st.entry_dir(store3, real3)) and not os.path.isdir(st.entry_dir(store3, alias3)))
+    # a broken alias whose film still exists is removed
+    make_film(os.path.join(lib3, "Orphan.Alias.2011.mkv"), seconds=60)
+    os.makedirs(st.entry_dir(store3, "Orphan.Alias.2011.mkv"))
+    with open(os.path.join(st.entry_dir(store3, "Orphan.Alias.2011.mkv"), "index.json"), "w") as f:
+        json.dump(dict(v=2, alias_of="Gone.2011.mkv", src="Orphan.Alias.2011.mkv", size=5, duration=60, target_made="x", made="x"), f)
+    prune()
+    check("prune removes an alias whose target is gone", not os.path.isdir(st.entry_dir(store3, "Orphan.Alias.2011.mkv")))
+    check("prune leaves entries of films that still exist", st.read_index(st.entry_dir(store3, "Zed.Keep.mkv")) is not None)
+
+    # ---- build FILE (what the viewer starts)
+    lib4, store4 = os.path.join(tmp, "lib4"), os.path.join(tmp, "store4s")
+    bf = os.path.join(lib4, "Build.Me.2021.mkv")
+    make_film(bf, seconds=60, size="640x360")
+    BASE = [sys.executable, os.path.join(TOOL, "seekthumbs.py"), "--library", lib4, "--store", store4, "--min-size-mb", "0", "--interval", "10", "--play-pause", "0"]
+
+    def run_build(path, extra=()):
+        return subprocess.run(BASE + list(extra) + ["build", path], capture_output=True, text=True)
+
+    t0 = time.time()
+    r = run_build(bf)
+    check("build FILE builds the film's thumbnails", r.returncode == 0 and st.resolve_entry(store4, "Build.Me.2021.mkv", os.path.getsize(bf)), r.stdout + r.stderr)
+    check("build FILE said it uses the gentle settings (2 reads, lowest priority)", "2 parallel read(s)" in r.stdout and "lowest priority" in r.stdout, r.stdout)
+    r = run_build(bf)
+    check("a second build FILE finds the entry and does nothing", r.returncode == 0 and "already has thumbnails" in r.stdout, r.stdout)
+    check("build FILE for a path outside the library is refused", run_build(os.path.join(tmp, "elsewhere.mkv")).returncode == 2)
+    iso = os.path.join(lib4, "disc.iso")
+    open(iso, "wb").write(b"x" * 100000)
+    r = run_build(iso)
+    check("build FILE skips a non-video file", r.returncode == 0 and "not a video" in r.stdout and not os.path.isdir(st.entry_dir(store4, "disc.iso")), r.stdout)
+    r = subprocess.run([sys.executable, os.path.join(TOOL, "seekthumbs.py"), "--library", lib4, "--store", store4, "build", bf.replace("Build.Me", "Build.Me")],
+                       capture_output=True, text=True, env=dict(os.environ, HOME=tmp))
+    small = os.path.join(lib4, "Small.One.2020.mkv")
+    make_film(small, seconds=20, size="320x180")
+    r = subprocess.run([sys.executable, os.path.join(TOOL, "seekthumbs.py"), "--library", lib4, "--store", store4, "build", small], capture_output=True, text=True,
+                       env=dict(os.environ, HOME=tmp))
+    check("build FILE skips a film under the minimum size (300 MB by default)", r.returncode == 0 and "smaller than" in r.stdout and not os.path.isdir(st.entry_dir(store4, "Small.One.2020.mkv")), r.stdout)
+
+    lockme = os.path.join(lib4, "Lock.Me.2022.mkv")
+    make_film(lockme, seconds=60, size="320x180")
+    lk = st.film_lock(store4, "Lock.Me.2022.mkv")
+    r = run_build(lockme)
+    check("build FILE does nothing while another instance holds the film's lock", r.returncode == 0 and "already being built" in r.stdout and not os.path.isdir(st.entry_dir(store4, "Lock.Me.2022.mkv")), r.stdout)
+    check("scan skips a film whose lock is held", st.scan_pass(cfg(lib4, store4)) >= 0 and not os.path.isdir(st.entry_dir(store4, "Lock.Me.2022.mkv")))
+    lk.close()
+    r = run_build(lockme)
+    check("once the lock is free build FILE builds it", r.returncode == 0 and st.read_index(st.entry_dir(store4, "Lock.Me.2022.mkv")) is not None, r.stdout)
+
+    race = os.path.join(lib4, "Race.Me.2023.mkv")
+    make_film(race, seconds=60, size="320x180")
+    procs = [subprocess.Popen(BASE + ["build", race], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) for _ in range(3)]
+    outs = [p_.communicate()[0] for p_ in procs]
+    nbuilt = sum(o.count("built Race.Me.2023.mkv") for o in outs)
+    check("three builds started together build the film exactly once", nbuilt == 1 and st.read_index(st.entry_dir(store4, "Race.Me.2023.mkv")), outs)
+
+    broken = os.path.join(lib4, "Broken.Build.2020.mkv")
+    open(broken, "wb").write(b"not a video" * 1000)
+    r1 = run_build(broken)
+    r2 = run_build(broken)
+    check("a film that cannot be read fails once and is then not retried at once", r1.returncode == 1 and r2.returncode == 0 and "failed recently" in r2.stdout, (r1.stdout, r2.stdout))
+
+    # in-process: workers, no waiting for players, scan still waits
+    seen = {}
+    orig_build, orig_pr = st.build_entry, st.player_running
+    st.build_entry = lambda rel, src, size, c_, gov, zs: seen.update(workers=c_["workers"], jobs=c_["encode_jobs"], limit=gov.max, pause=c_["pause"]) or True
+    def boom():
+        raise AssertionError("build FILE must not wait for players")
+    st.player_running = boom
+    newf = os.path.join(lib4, "Workers.Test.2024.mkv")
+    make_film(newf, seconds=30, size="320x180")
+    try:
+        rc = st.cmd_build(cfg(lib4, store4, play_workers=3, play_pause=0.5, yield_to_playback=1), newf, own_process=False)
+    finally:
+        st.build_entry, st.player_running = orig_build, orig_pr
+    check("build FILE uses play_workers (not workers) and does not wait for a running player", rc == 0 and seen.get("workers") == 3 and seen.get("limit") == 3 and seen.get("jobs") == 2 and seen.get("pause") == 0.5, (rc, seen))
+
+    # during playback: never fall back to one ffmpeg process per thumbnail
+    strict = os.path.join(lib4, "Strict.Pyav.2025.mkv")
+    make_film(strict, seconds=40, size="320x180")
+    orig_usable, orig_grab = st.AvExtractor.usable, st.CliExtractor.grab
+    st.AvExtractor.usable = staticmethod(lambda vf: (False, "PyAV is not installed"))
+    used_cli = []
+    st.CliExtractor.grab = lambda self, t_, out: used_cli.append(1) or orig_grab(self, t_, out)
+    try:
+        rc = st.cmd_build(cfg(lib4, store4, play_pause=0), strict, own_process=False)
+        check("build FILE skips (and says why) when PyAV is unusable instead of reading with ffmpeg commands",
+              rc == 1 and not used_cli and not os.path.isdir(st.entry_dir(store4, "Strict.Pyav.2025.mkv")), (rc, used_cli))
+        check("that skip is not recorded as a failure (installing python3-av must work at once)", "Strict.Pyav.2025.mkv" not in st.State(store4).d["fail"])
+        rc = st.cmd_build(cfg(lib4, store4, play_pause=0, play_extractor="auto"), strict, own_process=False)
+        check("play_extractor=auto allows the ffmpeg command when PyAV is unusable", rc == 0 and used_cli and st.read_index(st.entry_dir(store4, "Strict.Pyav.2025.mkv")), (rc, used_cli))
+    finally:
+        st.AvExtractor.usable, st.CliExtractor.grab = orig_usable, orig_grab
+
+    waits = []
+    orig_sleep = st.sleep_interruptible
+    calls_pr = {"n": 0}
+    def fake_pr():
+        calls_pr["n"] += 1
+        return calls_pr["n"] == 1
+    st.player_running, st.sleep_interruptible = fake_pr, lambda sec: waits.append(sec)
+    try:
+        st.scan_pass(cfg(lib4, store4, yield_to_playback=1))
+    finally:
+        st.player_running, st.sleep_interruptible = orig_pr, orig_sleep
+    check("scan still waits while a player is running", waits == [300] and calls_pr["n"] >= 2, (waits, calls_pr))
+
+    # stale work folders
+    stale = os.path.join(store4, "Some", ".work-old"); fresh = os.path.join(store4, "Some", ".work-new")
+    os.makedirs(os.path.join(stale, "jpg")); os.makedirs(fresh)
+    os.utime(stale, (time.time() - 3 * 86400,) * 2)
+    st.clean_stale_work(store4)
+    check("a build that was killed leaves a work folder; old ones are removed, fresh ones kept", not os.path.exists(stale) and os.path.isdir(fresh))
+
+    # settings work after the subcommand too (the README writes `scan --max-films 1`)
+    lib7, store7 = os.path.join(tmp, "lib7"), os.path.join(tmp, "store7s")
+    for n in ("Two.Films.Alpha.mkv", "Two.Films.Beta.mkv"):
+        make_film(os.path.join(lib7, n), seconds=30, size="320x180")
+    after = [sys.executable, os.path.join(TOOL, "seekthumbs.py")]
+    r = subprocess.run(after + ["plan", "--library", lib7, "--store", store7, "--min-size-mb", "0"], capture_output=True, text=True)
+    check("options after the subcommand work (plan --library ... --store ...)", r.returncode == 0 and "2 file(s) need thumbnails" in r.stdout, r.stdout + r.stderr)
+    r = subprocess.run(after + ["scan", "--library", lib7, "--store", store7, "--min-size-mb", "0", "--interval", "10", "--max-films", "1"], capture_output=True, text=True)
+    check("scan --max-films 1 builds exactly one film", r.returncode == 0 and len(list(st.store_entries(store7))) == 1, r.stdout + r.stderr)
+    r = subprocess.run(after + ["--library", lib7, "--store", store7, "--min-size-mb", "0", "--interval", "10", "--max-films", "1", "scan"], capture_output=True, text=True)
+    check("the options before the subcommand still work, and they are not undone by the subcommand", r.returncode == 0 and len(list(st.store_entries(store7))) == 2, r.stdout + r.stderr)
+
+    # a reader that closes the pipe early ends the program quietly
+    r = subprocess.run(["bash", "-c", f"cd '{TOOL}' && python3 -c \"import seekthumbs as st, sys; st.main = lambda a: [print('x' * 200) for _ in range(20000)] and 0; sys.argv = ['x']; st.cli()\" | head -1"],
+                       capture_output=True, text=True)
+    check("plan | head ends quietly on a closed pipe (no BrokenPipeError traceback)", "Traceback" not in r.stderr and "BrokenPipe" not in r.stderr, r.stderr[-300:])
+
+    # install-viewer records the builder
+    mc2 = os.path.join(tmp, "mpvconf2")
+    os.makedirs(os.path.join(mc2, "script-opts"))
+    with open(os.path.join(mc2, "script-opts", "seekthumbs.conf"), "w") as f:
+        f.write("debug=yes\nbuilder=/old/place/seekthumbs.py\n")
+    st.cmd_install_viewer(mc2)
+    st.cmd_install_viewer(mc2)
+    conf = open(os.path.join(mc2, "script-opts", "seekthumbs.conf")).read().split("\n")
+    check("install-viewer sets builder= once, keeps the other lines, and repeats cleanly",
+          conf.count("debug=yes") == 1 and [l for l in conf if l.startswith("builder=")] == ["builder=" + os.path.join(os.path.abspath(TOOL), "seekthumbs.py")], conf)
+
     # --- the viewer
     try:
         import lupa
@@ -201,11 +460,11 @@ try:
         LUA = lupa.LuaRuntime(unpack_returned_tuples=True)
         source = open(os.path.join(TOOL, "thumbfast.lua")).read()
 
-        def viewer(path, file_size, library=lib, store_=store):
+        def viewer(path, file_size, library=lib, store_=store, builder="", build=True, min_size=300):
             """Loads thumbfast.lua with a mocked mp API. Returns (handlers, log, props)."""
             log = []
             props = {"path": path, "file-size": str(file_size) if file_size is not None else None, "working-directory": "/", "pid": "4242"}
-            handlers = {"msg": {}, "ev": {}}
+            handlers = {"msg": {}, "ev": {}, "timers": [], "killed": [], "clock": {"t": 1000.0}}
             py = {}
 
             def get_property(name):
@@ -237,7 +496,8 @@ try:
             # Stand-ins for the three modules the script requires.
             g = LUA.globals()
             mp = LUA.table(get_property=get_property, commandv=commandv, command_native=command_native, command_native_async=command_native_async,
-                           register_script_message=reg_msg, register_event=reg_ev,
+                           register_script_message=reg_msg, register_event=reg_ev, get_time=lambda: handlers["clock"]["t"],
+                           add_periodic_timer=lambda sec, fn: (handlers["timers"].append(fn), LUA.table(kill=lambda *a: handlers["killed"].append(1)))[1],
                            msg=LUA.table(info=lambda *a: log.append(("info",) + tuple(str(x) for x in a))))
             utils = LUA.eval("""function(json_decode, json_encode)
                 return { join_path = function(a, b) if b:sub(1,1) == '/' then return b end return (a:gsub('/+$','')) .. '/' .. b end,
@@ -249,6 +509,8 @@ try:
             g.package.loaded["mp.options"] = options
             os.environ["XDG_RUNTIME_DIR"] = tmp
             chunk = source.replace('local opts = { library = "", store = "",', f'local opts = {{ library = "{library}", store = "{store_}",')
+            chunk = chunk.replace('build = true, builder = "", python = "python3", min_size_mb = 300,',
+                                  f'build = {"true" if build else "false"}, builder = "{builder}", python = "python3", min_size_mb = {min_size},')
             LUA.execute(chunk)
             return handlers, log, props
 
@@ -307,6 +569,94 @@ try:
         h["ev"]["file-loaded"]()
         infos = [json.loads(l[3]) for l in log if len(l) > 3 and l[1] == "script-message" and l[2] == "thumbfast-info"]
         check("a URL gets no thumbnails and no errors", infos and infos[-1]["available"] is False)
+
+
+        # ---- aliases in the viewer (the stores were made above)
+        h, log, _ = viewer(os.path.join(lib2, alias_rel), os.path.getsize(os.path.join(lib2, alias_rel)), library=lib2, store_=store2)
+        h["ev"]["file-loaded"]()
+        infos = [json.loads(l[3]) for l in log if len(l) > 3 and l[1] == "script-message" and l[2] == "thumbfast-info"]
+        check("viewer follows an alias to the other release's thumbnails", infos and infos[-1]["available"] is True and infos[-1]["width"] > 0, log)
+        log.clear()
+        h["msg"]["thumb"]("25", "10", "10")
+        check("an alias shows the real entry's pictures", len([l for l in log if l[1] == "overlay-add"]) == 1)
+        h, log, _ = viewer(os.path.join(lib2, alias_rel), os.path.getsize(os.path.join(lib2, alias_rel)) + 1, library=lib2, store_=store2)
+        h["ev"]["file-loaded"]()
+        infos = [json.loads(l[3]) for l in log if len(l) > 3 and l[1] == "script-message" and l[2] == "thumbfast-info"]
+        check("an alias checks its own file size: a replaced file shows nothing", infos and infos[-1]["available"] is False)
+        for nm, tgt in (("Vloop.A.2000.mkv", "Vloop.B.2000.mkv"), ("Vloop.B.2000.mkv", "Vloop.A.2000.mkv"), ("Vdangle.2000.mkv", "Not.There.2000.mkv")):
+            os.makedirs(st.entry_dir(store2, nm), exist_ok=True)
+            with open(os.path.join(st.entry_dir(store2, nm), "index.json"), "w") as f:
+                json.dump(dict(v=2, alias_of=tgt, src=nm, size=5, duration=60, target_made="x", made="x"), f)
+        for nm in ("Vloop.A.2000.mkv", "Vdangle.2000.mkv"):
+            h, log, _ = viewer(os.path.join(lib2, nm), 5, library=lib2, store_=store2)
+            h["ev"]["file-loaded"]()
+            infos = [json.loads(l[3]) for l in log if len(l) > 3 and l[1] == "script-message" and l[2] == "thumbfast-info"]
+            check(f"viewer ignores a broken or looping alias ({nm})", infos and infos[-1]["available"] is False)
+
+        # ---- the on-play build
+        lib6, store6 = os.path.join(tmp, "lib6"), os.path.join(tmp, "store6s")
+        vf = os.path.join(lib6, "View.Me.2023.mkv")
+        make_film(vf, seconds=60, size="640x360")
+        vsize = os.path.getsize(vf)
+        BUILDER = os.path.join(TOOL, "seekthumbs.py")
+        h, log, _ = viewer(vf, vsize, library=lib6, store_=store6, builder=BUILDER, min_size=0)
+        h["ev"]["file-loaded"]()
+        runs = [l for l in log if l[:2] == ("commandv", "run")]
+        check("a film without thumbnails starts one background build", len(runs) == 1 and runs[0][2:] == ("python3", BUILDER, "--library", lib6, "--store", store6, "--min-size-mb", "0", "build", vf), runs)
+        infos = [json.loads(l[3]) for l in log if len(l) > 3 and l[1] == "script-message" and l[2] == "thumbfast-info"]
+        check("until it is built the viewer reports no thumbnails and shows no error", infos and infos[-1]["available"] is False)
+        h["ev"]["file-loaded"]()
+        check("loading the same film again in the session does not start a second build", len([l for l in log if l[:2] == ("commandv", "run")]) == 1)
+        infos = [json.loads(l[3]) for l in log if len(l) > 3 and l[1] == "script-message" and l[2] == "thumbfast-info"]
+        n_info = len(infos)
+        n_killed = len(h["killed"])
+        h["timers"][-1]()
+        infos = [json.loads(l[3]) for l in log if len(l) > 3 and l[1] == "script-message" and l[2] == "thumbfast-info"]
+        check("the re-check before the build finished changes nothing", len(infos) == n_info)
+        env = dict(os.environ, HOME=tmp)
+        os.makedirs(os.path.join(tmp, ".config", "seekthumbs"), exist_ok=True)
+        with open(os.path.join(tmp, ".config", "seekthumbs", "config.ini"), "w") as f:
+            f.write("[seekthumbs]\nmin_size_mb = 0\ninterval = 10\nplay_pause = 0\n")
+        rr_ = subprocess.run(list(runs[0][2:]), capture_output=True, text=True, env=env)       # the command mpv's `run` would execute
+        check("the command the viewer issued really builds the film", rr_.returncode == 0 and st.read_index(st.entry_dir(store6, "View.Me.2023.mkv")), rr_.stdout + rr_.stderr)
+        h["timers"][-1]()
+        infos = [json.loads(l[3]) for l in log if len(l) > 3 and l[1] == "script-message" and l[2] == "thumbfast-info"]
+        check("when the build is done the next re-check tells the OSC the thumbnails are available", infos and infos[-1]["available"] is True and len(infos) == n_info + 1)
+        check("and the re-check timer is stopped", len(h["killed"]) == n_killed + 1, (n_killed, h["killed"]))
+        log.clear()
+        h["msg"]["thumb"]("33", "10", "10")
+        check("hovering then shows the new thumbnail", len([l for l in log if l[1] == "overlay-add"]) == 1)
+
+        vf2 = os.path.join(lib6, "Hover.Me.2023.mkv")
+        make_film(vf2, seconds=60, size="320x180")
+        h, log, _ = viewer(vf2, os.path.getsize(vf2), library=lib6, store_=store6, builder="", min_size=0)
+        h["ev"]["file-loaded"]()
+        log.clear()
+        h["msg"]["thumb"]("10", "5", "5")           # nothing yet: looks (first look), finds nothing
+        c6 = cfg(lib6, store6)
+        st.scan_pass(c6)                             # built by somebody else meanwhile
+        h["clock"]["t"] += 1
+        h["msg"]["thumb"]("10", "5", "5")
+        check("hover re-checks are throttled (not every hover)", not [l for l in log if l[1] == "overlay-add"])
+        h["clock"]["t"] += 6
+        h["msg"]["thumb"]("10", "5", "5")
+        infos = [json.loads(l[3]) for l in log if len(l) > 3 and l[1] == "script-message" and l[2] == "thumbfast-info"]
+        check("a later hover finds an entry built by somebody else and tells the OSC", infos and infos[-1]["available"] is True and [l for l in log if l[1] == "overlay-add"], log)
+
+        # no build in these cases
+        def runs_for(path, size, **kw):
+            hh, ll, _ = viewer(path, size, **kw)
+            hh["ev"]["file-loaded"]()
+            return [l for l in ll if l[:2] == ("commandv", "run")]
+
+        fresh_film = os.path.join(lib6, "Not.Built.2024.mkv")
+        check("a URL is never built", not runs_for("https://example.com/Not.Built.2024.mkv", None, library=lib6, store_=store6, builder=BUILDER, min_size=0))
+        check("a file outside the library is never built", not runs_for(os.path.join(tmp, "elsewhere", "Not.Built.2024.mkv"), 10 ** 9, library=lib6, store_=store6, builder=BUILDER, min_size=0))
+        check("a non-video file is never built", not runs_for(os.path.join(lib6, "disc.iso"), 10 ** 9, library=lib6, store_=store6, builder=BUILDER, min_size=0))
+        check("a file under the minimum size is never built", not runs_for(fresh_film, 10 * 10 ** 6, library=lib6, store_=store6, builder=BUILDER, min_size=300))
+        check("a big enough film is built", len(runs_for(fresh_film, 4 * 10 ** 9, library=lib6, store_=store6, builder=BUILDER, min_size=300)) == 1)
+        check("build=no turns the on-play build off", not runs_for(fresh_film, 4 * 10 ** 9, library=lib6, store_=store6, builder=BUILDER, build=False))
+        check("without a builder path nothing is started (install-viewer sets it)", not runs_for(fresh_film, 4 * 10 ** 9, library=lib6, store_=store6, builder=""))
 
     # --- install-viewer moves a real thumbfast aside and is repeatable
     mc = os.path.join(tmp, "mpvconf")

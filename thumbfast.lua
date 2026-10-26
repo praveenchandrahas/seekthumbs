@@ -11,12 +11,22 @@
 -- the old film's pictures. If the path does not start with the library folder (opened through another mount point, say), shorter and shorter
 -- tails of the path are tried against the store, and the size check decides.
 --
+-- Aliases: a release that is the same film as one already built has only a small index.json with alias_of=<entry of the other release>; this script
+-- follows it (the size check uses the alias's own recorded size, so a replaced file still shows nothing; broken links, loops and a target that was
+-- rebuilt since are ignored).
+--
+-- On play: when the playing file is a video under `library`, at least min_size_mb big, and has no entry, the script starts `seekthumbs.py build FILE`
+-- in the background (mpv's detached `run`, so it never blocks mpv and finishes even if you stop watching), once per file per session. `install-viewer`
+-- records the path of seekthumbs.py as builder= in script-opts/seekthumbs.conf; build=no there turns this off. Until the entry exists nothing is shown;
+-- the script looks again every recheck_s seconds and tells the OSC as soon as it is there.
+--
 -- Settings: ~/.config/seekthumbs/config.ini (the same file the generator reads: library=, store=), overridable in script-opts/seekthumbs.conf.
 local mp = require "mp"
 local utils = require "mp.utils"
 local options = require "mp.options"
 
-local opts = { library = "", store = "", overlay_id = 42, ffmpeg = "ffmpeg", cache_items = 80, debug = false }
+local opts = { library = "", store = "", overlay_id = 42, ffmpeg = "ffmpeg", cache_items = 80, debug = false,
+              build = true, builder = "", python = "python3", min_size_mb = 300, recheck_s = 10 }
 options.read_options(opts, "seekthumbs")
 
 local SUFFIX = ".seekthumbs"
@@ -46,6 +56,7 @@ local function read_ini()
             local k, v = line:match("^%s*([%w_]+)%s*[=:]%s*(.-)%s*$")
             if k == "library" and opts.library == "" then opts.library = v end
             if k == "store" and opts.store == "" then opts.store = v end
+            if k == "min_size_mb" and tonumber(v) and opts.min_size_mb == 300 then opts.min_size_mb = tonumber(v) end
         end
     end
     f:close()
@@ -69,6 +80,28 @@ local function valid(i)
     return i and i.v == 1 and i.interval and i.count and i.offsets and i.lengths and i.w and i.h
 end
 
+-- The entry for `rel` in the store: a real entry, or an alias followed to the real one. Returns index, folder of the real entry, or nil.
+-- `size` (if known) must equal the size recorded for `rel` itself.
+local function load_entry(store, rel, size)
+    local seen, cur, expect = {}, rel, nil
+    for hop = 0, 4 do
+        if seen[cur] or ("/" .. cur .. "/"):find("/%.%./") then return nil end
+        seen[cur] = true
+        local d = utils.join_path(store, cur .. SUFFIX)
+        local i = json_file(utils.join_path(d, "index.json"))
+        if type(i) ~= "table" then return nil end
+        if hop == 0 and size and i.size ~= size then return nil end
+        if expect and i.made ~= expect then return nil end
+        if valid(i) then return i, d end
+        if i.v == 2 and type(i.alias_of) == "string" and i.target_made then
+            expect, cur = i.target_made, i.alias_of
+        else
+            return nil
+        end
+    end
+    return nil
+end
+
 -- Returns the index table and its folder for the film that is playing, or nil.
 local function locate()
     local path = mp.get_property("path")
@@ -89,9 +122,8 @@ local function locate()
         if not tail then break end
     end
     for _, rel in ipairs(candidates) do
-        local d = utils.join_path(store, rel .. SUFFIX)
-        local i = json_file(utils.join_path(d, "index.json"))
-        if valid(i) and (not size or i.size == size) then return i, d, rel end
+        local i, d = load_entry(store, rel, size)
+        if i then return i, d, rel end
     end
     return nil
 end
@@ -106,6 +138,57 @@ end
 local function clear()
     mp.commandv("overlay-remove", tostring(opts.overlay_id))
     shown = nil
+end
+
+local VIDEO = { mkv = true, mp4 = true, m4v = true, avi = true, mov = true, ts = true, m2ts = true, webm = true, wmv = true }
+local ini_done = false
+local started = {}          -- path -> true: a build was started for it in this session
+local timer, ticks = nil, 0
+local last_check = -1e9
+
+local function stop_timer()
+    if timer then timer:kill(); timer = nil end
+end
+
+-- Looks for the entry of the playing film and, if it is there, starts using it. Returns true if it found one.
+local function adopt()
+    local i, d, rel = locate()
+    if not i then return false end
+    ix, edir = i, d
+    if not tmpdir then
+        local base = os.getenv("XDG_RUNTIME_DIR") or "/tmp"
+        tmpdir = utils.join_path(base, "seekthumbs-" .. tostring(mp.get_property("pid") or os.time()))
+        mp.command_native({ name = "subprocess", args = { "mkdir", "-p", tmpdir } })
+    end
+    mp.msg.info(string.format("seek thumbnails: %s (%d x %d, every %gs)", rel, ix.w, ix.h, ix.interval))
+    return true
+end
+
+-- Starts the background build for the playing film when it has none (see the header). Everything about the decision is here.
+local function maybe_build()
+    if not opts.build or opts.builder == "" then return end
+    local path = mp.get_property("path")
+    if not path or path:match("^%a[%w+.-]*://") then return end
+    path = absolute(path)
+    local lib, store = expand(opts.library), expand(opts.store)
+    if lib == "" or store == "" or path:sub(1, #lib + 1) ~= lib .. "/" then return end
+    local ext = path:match("%.([^./]+)$")
+    if not ext or not VIDEO[ext:lower()] then return end
+    local size = tonumber(mp.get_property("file-size"))
+    if size and size < (tonumber(opts.min_size_mb) or 300) * 1e6 then return end
+    if not started[path] then
+        started[path] = true
+        -- min_size_mb is passed along so the build uses the same threshold as this check
+        local args = { "run", opts.python, expand(opts.builder), "--library", lib, "--store", store, "--min-size-mb", tostring(tonumber(opts.min_size_mb) or 300), "build", path }
+        mp.commandv((table.unpack or unpack)(args))
+        mp.msg.info("seek thumbnails: none yet for this film; building them in the background (they appear when it is done)")
+    end
+    -- (a film loaded again while its build may still run keeps looking, without starting a second build)
+    ticks = 0
+    timer = mp.add_periodic_timer(tonumber(opts.recheck_s) or 10, function()
+        ticks = ticks + 1
+        if adopt() then stop_timer(); send_info() elseif ticks > 720 then stop_timer() end
+    end)
 end
 
 local function remember(i, entry)
@@ -173,7 +256,15 @@ local function convert(i, x, y)
 end
 
 local function on_thumb(t, x, y)
-    if not ix then return end
+    if not ix then
+        -- an OSC that still sends hovers: look again now and then (a build may have finished, started by this session or another program)
+        local now = mp.get_time and mp.get_time() or os.time()
+        if now - last_check >= 5 then
+            last_check = now
+            if adopt() then send_info() end
+        end
+        if not ix then return end
+    end
     t, x, y = tonumber(t), tonumber(x), tonumber(y)
     if not (t and x and y) then return end
     local i = pick(t)
@@ -189,21 +280,14 @@ end
 
 local function on_file_loaded()
     clear()
+    stop_timer()
     for k in pairs(cache) do os.remove(cache[k].file) end
     cache, order, pending, want = {}, {}, {}, nil
     ix, edir = nil, nil
-    if opts.store == "" then read_ini() end
-    local i, d, rel = locate()
-    if i then
-        ix, edir = i, d
-        if not tmpdir then
-            local base = os.getenv("XDG_RUNTIME_DIR") or "/tmp"
-            tmpdir = utils.join_path(base, "seekthumbs-" .. tostring(mp.get_property("pid") or os.time()))
-            mp.command_native({ name = "subprocess", args = { "mkdir", "-p", tmpdir } })
-        end
-        mp.msg.info(string.format("seek thumbnails: %s (%d x %d, every %gs)", rel, ix.w, ix.h, ix.interval))
-    else
+    if not ini_done then ini_done = true; read_ini() end     -- library=, store= (if not set in script-opts) and min_size_mb from the generator's config.ini
+    if not adopt() then
         mp.msg.info("seek thumbnails: none for this file")
+        maybe_build()
     end
     send_info()
 end

@@ -9,8 +9,12 @@
 Netflix-style previews on the mpv seek bar (called *trickplay* or *seek thumbnails*), for a film library on a **read-only rclone mount**.
 The thumbnails are made in the background and kept in a **local folder**; the library is only ever read.
 
-State (2026-10-25): generator (parallel, adaptive), watcher, mpv viewer and tests are written and pass on synthetic films. **Not yet run on the real library or
-inside real mpv/uosc** (the sandbox has neither). Open items are listed at the end.
+State (2026-10-26): generator (parallel, adaptive), on-play build, one set per film across releases, watcher, mpv viewer and tests are written and pass on synthetic
+films. **The viewer, and the on-play trigger in particular, have not been run in real mpv/uosc** (the sandbox has neither). The generator has been probed on the owner's
+debrid mount (numbers below). Open items are listed at the end.
+
+**Two ways to get thumbnails, use either or both:** (1) *on play* (the default once `install-viewer` has run): the first time you play a film that has none, the viewer starts a
+gentle background build of that one film; (2) *batch*: `scan` / `watch` build the whole library ahead of time. In both, releases of the same film share one set (see below).
 
 ## Setup (once the paths are known)
 
@@ -25,12 +29,17 @@ INI
 cd seekthumbs      # this repository
 ./seekthumbs.py probe "/path/to/one/film.mkv"     # seconds and MB received per thumbnail for each extractor, and the projected time for 100 such films
 ./seekthumbs.py plan                              # lists what would be built (directory listings only)
-./seekthumbs.py scan --max-films 1                # build one film, look at the result
+./seekthumbs.py scan --max-films 1                # build one film, look at the result (settings work before or after the subcommand)
+./seekthumbs.py build "/path/to/one/film.mkv"     # what the viewer starts when you play a film with no thumbnails: one film, low priority, 2 reads at a time
 ./seekthumbs.py scan                              # the whole library, as fast as the mount allows (run it overnight; Ctrl+C is safe, it resumes)
 ./seekthumbs.py status                            # size per 2 h against the 10 MB budget
 ./seekthumbs.py install-service --enable          # afterwards: the background watcher picks up new films (systemd user service)
-./seekthumbs.py install-viewer                    # the mpv side, into ~/.config/mpv-object-audio/scripts (see below)
+./seekthumbs.py install-viewer                    # the mpv side, into ~/.config/mpv-object-audio/scripts (see below); also records where seekthumbs.py is, for the on-play build
 ```
+
+`min_size_mb` (default 300; the owner sets 20000 in `config.ini`) decides which files count as films: **everything smaller is ignored, by `plan`/`scan`/`watch`, by `build`
+and by the viewer's on-play check alike** (the viewer reads the same `config.ini` value and passes it to the build). At 20000 that excludes all 1080p encodes under 20 GB,
+DVD rips, documentaries and sample clips; such films never get thumbnails. Non-video files (`.iso`, `.rar`, `.nfo`, ...) are never considered whatever their size.
 
 ## How it works
 
@@ -40,6 +49,28 @@ cd seekthumbs      # this repository
 - **Storage:** `STORE/<path relative to the library>.seekthumbs/thumbs.pack` (the JPEGs back to back) and `index.json` (offsets, lengths, file size, interval,
   width/height, quality). Budget: at most `budget_mb` (10) per 2 h of film, aimed at 80 %; quality, then width, are lowered until it fits.
   `verify` flags anything over budget.
+- **On play (the viewer starts a build):** when the playing file is a video under `library`, at least `min_size_mb`, and has no usable entry, `thumbfast.lua` runs
+  `seekthumbs.py build FILE` through mpv's detached `run` (it never blocks mpv and finishes even if you stop watching), once per file per session. Until it is done
+  nothing is shown and no error appears; every 10 s the viewer looks again and tells uosc as soon as the entry exists (hovering also re-checks, at most every 5 s).
+  `build=no` in `script-opts/seekthumbs.conf` turns the trigger off; `install-viewer` writes `builder=<path of seekthumbs.py>` there (without it nothing is started).
+  **The first play of a film has no thumbnails for the first minutes**; later plays do. The build is made to stay out of the way of the film that is playing:
+  `nice 19` and idle I/O class, `play_workers` parallel reads (default 2), each worker resting `play_pause` seconds (default 2) after a read, the same rate-limit governor
+  and circuit breaker as `scan`, a lock so two instances never build the same film, and it does **not** wait for players (that rule stays in `scan`/`watch`).
+  It still competes for the same debrid link and bandwidth as the film. **It never falls back to one ffmpeg process per thumbnail**: if PyAV is not installed or its filter chain
+  cannot be built (an HDR film needs a PyAV with `zscale`: the apt package `python3-av`, not the pip wheel), it logs why and skips the film (not recorded as a failure);
+  `play_extractor=auto` (or `ffmpeg`) allows the fallback. One example, **from the owner's mount and not general**: on a 54 GB 4K DV/HDR10 remux the ffmpeg command read
+  62.7 MB per thumbnail (22.3 GB per film) at 3.57 s each, PyAV 9.8 MB (3.5 GB per film) at 0.47 s each (6 workers).
+- **One set per film across releases:** files are grouped by a key from the *file name*: the title (lower case, accents removed, `.`/`_`/`-` as spaces, leading `www.site.org - ` and
+  `[group]` tags dropped) plus the 4-digit year, which is the last year-looking word before the first release tag (`2160p`, `WEB`, `REMUX`, `x265`, ...); a year in first position belongs to
+  the title (`2001.A.Space.Odyssey.1968`). **Never grouped:** names without a year (many IMAX documentaries), TV episodes (`S01E02`, `1x05`), names where the only year comes after a tag,
+  and titles that differ in any word (`Hope.2026...` and `Hopeu - Hope (2026)CZtit...` are two films to this program; that costs a second build, never a wrong picture). Before sharing,
+  ffprobe reads the new release's runtime (a cheap header read) and it must be within `share_tolerance` (2 s) of the built one, else it gets its own set (an extended cut stays separate).
+  The release that gets the alias is then a small `index.json` with `alias_of`; the viewer follows it (its own file size is checked, so a replaced file shows nothing; a broken link, a loop,
+  or a target that was rebuilt since is ignored) and `status`, `verify` and `prune` understand aliases (`prune` never deletes a pack an alias still uses). Releases can differ by a few seconds of
+  logos or cuts, so a shared thumbnail can be that much off; at 20 s spacing it is mostly not noticeable. `share=0` turns sharing off. Limits: siblings are found in the local store, so the
+  first release is built (or aliased) before the others; if a real entry that others alias is itself rebuilt, those aliases stop resolving until their next build or play re-links them.
+- **Batch passes group the same way:** `plan` and `scan` order the releases of one film together and build the **smallest file** of the group (the cheapest to read); `plan` marks it
+  ("N releases share this") and marks the others "alias ... if its runtime agrees", and its summary counts films to build and releases that would only get an alias.
 - **New films:** `watch` loops: list the library (directory listings only), queue films with no entry or whose **size changed**, newest first, build at most
   3 per pass, sleep `poll` (30 min). Files under 300 MB are ignored; files modified in the last 10 min are skipped.
   If the library folder is empty or missing the pass does nothing (a dead mount must not look like "all films deleted"). `prune` is manual (`--yes` to delete).
@@ -73,8 +104,11 @@ cd seekthumbs      # this repository
 
 `library`, `store`, `interval` (20), `width` (240), `workers` (6), `extractor` (auto | pyav | ffmpeg), `rate_cooldown` (30 s), `pause` (0), `film_pause` (0),
 `poll` (1800), `settle` (600), `min_size_mb` (300), `max_films` (0 = all), `budget_mb` (10), `safety` (0.8), `seek_timeout` (90 s), `yield_to_playback` (1),
-`breaker_hours` (1).
-The viewer reads `library` and `store` from the same file; `script-opts/seekthumbs.conf` can override them (also `overlay_id`, `ffmpeg`, `debug=yes`).
+`breaker_hours` (1), and for the on-play build and sharing: `play_workers` (2, the parallel reads of the on-play build), `play_pause` (2 s rest after each read),
+`play_extractor` (`pyav`: PyAV only | `auto` | `ffmpeg`), `share` (1; 0 = one set per file), `share_tolerance` (2 s), `encode_jobs` (0 = all CPUs; the on-play build uses 2 unless set).
+Every setting can also be given on the command line, before or after the subcommand (`./seekthumbs.py scan --max-films 1`).
+The viewer reads `library`, `store` and `min_size_mb` from the same file; `script-opts/seekthumbs.conf` can override them (also `overlay_id`, `ffmpeg`, `debug=yes`,
+`build=no`, `builder=` (set by `install-viewer`), `python=`, `recheck_s`).
 
 ## Not verified yet / known weak spots
 
@@ -89,9 +123,12 @@ The viewer reads `library` and `store` from the same file; `script-opts/seekthum
 4. **The viewer has been run only under a mocked mpv API** (lupa), not in real mpv with uosc. The thumbfast message names are from the thumbfast/uosc sources as I know
    them and are consistent with what the WebDAV-browser script sends (`script-message-to thumbfast clear`, overlay id 42), but are not checked against his uosc version.
    the `preflight` script of the [sdht](https://github.com/praveenchandrahas/Software-Defined-Home-Theatre) repository lists the mpv `scripts/` and `script-opts/` folders and any uosc/thumbfast versions.
-5. Keyframe-only thumbnails can be a few seconds earlier than the hovered time (fine for scrubbing at 20 s).
-6. Dolby Vision profile 5, and HDR through PyAV on a real HDR file, are untested; the circuit breaker across films and `install-service` are not covered by tests.
-7. 6 parallel streams may exceed what your backend allows (some debrid/cloud services limit concurrent streams per link or per IP). If `probe`/the first film show
+5. **The on-play trigger** uses mpv's detached `run` and a periodic timer, and tells uosc afterwards with a second `thumbfast-info` message; both are checked only against a
+   mocked mpv. Whether uosc starts showing thumbnails after such a late message, without reloading the file, is unverified. If it does not, the thumbnails appear from the next play.
+   Films opened through a different mount point than `library` are matched for display but never built on play (the path cannot be turned into the store path).
+6. Keyframe-only thumbnails can be a few seconds earlier than the hovered time (fine for scrubbing at 20 s).
+7. Dolby Vision profile 5, and HDR through PyAV on a real HDR file, are untested; the circuit breaker across films and `install-service` are not covered by tests.
+8. 6 parallel streams may exceed what your backend allows (some debrid/cloud services limit concurrent streams per link or per IP). If `probe`/the first film show
    throttling, lower `--workers`.
 
 ## Tests
