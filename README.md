@@ -1,5 +1,7 @@
 # seekthumbs: seek-bar thumbnails for an rclone library
 
+> **Part of the [Software Defined Home Theatre](https://github.com/praveenchandrahas/Software-Defined-Home-Theatre) project.** The main repository holds the documentation, build log, results and the installer checks; this is one of its parts. Sibling repositories: [linux-theater-dsp](https://github.com/praveenchandrahas/linux-theater-dsp) · [mpv-object-audio](https://github.com/praveenchandrahas/mpv-object-audio) · [theater-measurement](https://github.com/praveenchandrahas/theater-measurement).
+
 Netflix-style previews on the mpv seek bar (called *trickplay* or *seek thumbnails*), for a film library on a **read-only rclone mount**.
 The thumbnails are made in the background and kept in a **local folder**; the library is only ever read.
 
