@@ -2,6 +2,12 @@
 """Tests for tools/seekthumbs: generator (synthetic films made with ffmpeg) and the mpv viewer (Lua run under lupa with a mocked mp API).
 Needs ffmpeg and, for the viewer part, `pip install lupa` (skipped with a note if missing). Does not need mpv."""
 import contextlib
+try:
+    import av as _av_probe  # noqa: F401
+    HAVE_AV = True
+except Exception:
+    HAVE_AV = False
+EXTRACTOR_ARGS = [] if HAVE_AV else ["--play-extractor", "auto"]   # CI runners have no PyAV: allow the ffmpeg fallback in the tests that are not about that rule
 import io
 import json
 import os
@@ -323,7 +329,7 @@ try:
     lib4, store4 = os.path.join(tmp, "lib4"), os.path.join(tmp, "store4s")
     bf = os.path.join(lib4, "Build.Me.2021.mkv")
     make_film(bf, seconds=60, size="640x360")
-    BASE = [sys.executable, os.path.join(TOOL, "seekthumbs.py"), "--library", lib4, "--store", store4, "--min-size-mb", "0", "--interval", "10", "--play-pause", "0"]
+    BASE = [sys.executable, os.path.join(TOOL, "seekthumbs.py"), "--library", lib4, "--store", store4, "--min-size-mb", "0", "--interval", "10", "--play-pause", "0"] + EXTRACTOR_ARGS
 
     def run_build(path, extra=()):
         return subprocess.run(BASE + list(extra) + ["build", path], capture_output=True, text=True)
@@ -616,7 +622,7 @@ try:
         env = dict(os.environ, HOME=tmp)
         os.makedirs(os.path.join(tmp, ".config", "seekthumbs"), exist_ok=True)
         with open(os.path.join(tmp, ".config", "seekthumbs", "config.ini"), "w") as f:
-            f.write("[seekthumbs]\nmin_size_mb = 0\ninterval = 10\nplay_pause = 0\n")
+            f.write("[seekthumbs]\nmin_size_mb = 0\ninterval = 10\nplay_pause = 0\n" + ("" if HAVE_AV else "play_extractor = auto\n"))
         rr_ = subprocess.run(list(runs[0][2:]), capture_output=True, text=True, env=env)       # the command mpv's `run` would execute
         check("the command the viewer issued really builds the film", rr_.returncode == 0 and st.read_index(st.entry_dir(store6, "View.Me.2023.mkv")), rr_.stdout + rr_.stderr)
         h["timers"][-1]()
