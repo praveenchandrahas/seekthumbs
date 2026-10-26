@@ -82,7 +82,7 @@ The viewer reads `library` and `store` from the same file; `script-opts/seekthum
    ffprobe/read failures and the backoff instead.
 4. **The viewer has been run only under a mocked mpv API** (lupa), not in real mpv with uosc. The thumbfast message names are from the thumbfast/uosc sources as I know
    them and are consistent with what the WebDAV-browser script sends (`script-message-to thumbfast clear`, overlay id 42), but are not checked against his uosc version.
-   the `preflight` script of the [sdht](https://github.com/praveenchandrahas/sdht) repository lists the mpv `scripts/` and `script-opts/` folders and any uosc/thumbfast versions.
+   the `preflight` script of the [sdht](https://github.com/praveenchandrahas/SDHT) repository lists the mpv `scripts/` and `script-opts/` folders and any uosc/thumbfast versions.
 5. Keyframe-only thumbnails can be a few seconds earlier than the hovered time (fine for scrubbing at 20 s).
 6. Dolby Vision profile 5, and HDR through PyAV on a real HDR file, are untested; the circuit breaker across films and `install-service` are not covered by tests.
 7. 6 parallel streams may exceed what your backend allows (some debrid/cloud services limit concurrent streams per link or per IP). If `probe`/the first film show
@@ -100,4 +100,4 @@ Examples use the author's mount style (an rclone mount, read-only) and paths; se
 
 [Apache License 2.0](LICENSE) (see also [NOTICE](NOTICE)). Dolby, Dolby Atmos, DTS and DTS:X are trademarks of their owners; this project is not affiliated with or endorsed by them. It contains no media files and no decoder code.
 
-Part of the [software-defined home theatre](https://github.com/praveenchandrahas/sdht) project.
+Part of the [software-defined home theatre](https://github.com/praveenchandrahas/SDHT) project.
