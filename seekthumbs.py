@@ -49,7 +49,7 @@ VIDEO_EXT = {".mkv", ".mp4", ".m4v", ".avi", ".mov", ".ts", ".m2ts", ".webm", ".
 DEFAULTS = dict(library="", store="", interval=20.0, width=240, workers=6, pause=0.0, film_pause=0.0, poll=1800.0, settle=600.0,
                 min_size_mb=300.0, max_films=0, budget_mb=10.0, safety=0.8, seek_timeout=90.0, probesize="1M", yield_to_playback=1,
                 breaker_hours=1.0, extractor="auto", rate_cooldown=30.0,
-                play_workers=2, play_pause=2.0, play_extractor="pyav", share=1, share_tolerance=2.0, encode_jobs=0)
+                play_workers=2, play_pause=2.0, play_extractor="pyav", share=1, share_tolerance=2.0, encode_jobs=0, skip_tv=0, exclude="")
 PLAYERS = ("mpv", "mpv-atmos", "mpv-object-audio", "vlc", "kodi", "kodi.bin")
 SUFFIX = ".seekthumbs"
 STOP = False
@@ -145,6 +145,23 @@ def need_paths(cfg, library=True):
 
 
 # ---------------------------------------------------------------- library and store
+
+TV_RE = re.compile(r"(?<![A-Za-z0-9])S\d{1,3}E\d{1,3}(?![0-9])", re.I)      # S01E02 as one word in the path: a TV episode
+
+
+def excluded(cfg, rel):
+    """True if the owner asked for this file to be left out: skip_tv=1 skips names with an SxxExx episode tag, exclude=REGEX skips any relative path that
+    matches (case-insensitive, `|` for several). Applies to plan/scan/watch and to build FILE (so no film is built while it plays either); prune and status ignore it."""
+    if cfg.get("skip_tv") and TV_RE.search(rel):
+        return True
+    rx = cfg.get("exclude")
+    if rx:
+        try:
+            return re.search(rx, rel.replace(os.sep, "/"), re.I) is not None
+        except re.error:
+            return False
+    return False
+
 
 def walk_library(root, min_size):
     """Yields (relpath, abspath, size, mtime) for video files. Directory listings only; no file is opened."""
@@ -929,12 +946,18 @@ def scan_pass(cfg, dry=False):
         log(f"circuit breaker open for another {(state.d['breaker_until'] - time.time()) / 60:.0f} min after repeated read failures")
         return 0
     todo = []
+    n_excluded = 0
     for rel, src, size, mtime in walk_library(cfg["library"], cfg["min_size_mb"] * 1e6):
+        if excluded(cfg, rel):
+            n_excluded += 1
+            continue
         if entry_current(cfg["store"], rel, size) or state.blocked(rel, size):
             continue
         if time.time() - mtime < cfg["settle"]:
             continue
         todo.append((mtime, rel, src, size))
+    if n_excluded:
+        log(f"{n_excluded} file(s) left out by skip_tv/exclude")
     ordered = order_todo(todo, bool(cfg.get("share", 1)))
     todo = [it for it, role, n in ordered]       # newest additions first; the releases of one film together, the smallest file first
     if dry:
@@ -1023,6 +1046,9 @@ def cmd_build(cfg, path, own_process=True):
         return 2
     if size < cfg["min_size_mb"] * 1e6:
         log(f"smaller than {cfg['min_size_mb']:g} MB; skipped: {rel}")
+        return 0
+    if excluded(cfg, rel):
+        log(f"left out by skip_tv/exclude; skipped: {rel}")
         return 0
     os.makedirs(cfg["store"], exist_ok=True)
     lk = film_lock(cfg["store"], rel)

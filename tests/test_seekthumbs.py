@@ -838,6 +838,26 @@ try:
     st.cmd_install_viewer(mc)
     with open(os.path.join(mc, "scripts", "thumbfast.lua.bak")) as f:
         check("a second install-viewer does not overwrite the .bak with ours", f.read().startswith("-- the real thumbfast"))
+    # ---- skip_tv / exclude
+    c_tv = cfg("/x", "/y", skip_tv=1)
+    names_tv = ["Game of Thrones S01-S08 Complete UHD/Game.of.Thrones.S08E05.The.Bells.2160p.mkv", "Show Name s02e10 1080p/Show.Name.s02e10.mkv", "Show.S1E2.mkv"]
+    names_film = ["Tron.Ares.2025.2160p/Tron.Ares.2025.2160p.mkv", "IMAX - Wolves.2001.1080p.mkv", "Game of Thrones S01-S08 Complete UHD/extras.mkv", "Rise.of.Skywalker.2019.mkv", "Wes.Anderson.S1ND.mkv"]
+    check("skip_tv leaves out names with an SxxExx tag", all(st.excluded(c_tv, n) for n in names_tv), [n for n in names_tv if not st.excluded(c_tv, n)])
+    check("skip_tv keeps films (and folders that only say S01-S08)", not any(st.excluded(c_tv, n) for n in names_film), [n for n in names_film if st.excluded(c_tv, n)])
+    check("nothing is excluded by default", not any(st.excluded(cfg("/x", "/y"), n) for n in names_tv + names_film))
+    c_rx = cfg("/x", "/y", exclude="game.of.thrones|IMAX")
+    check("exclude is a case-insensitive regex on the relative path, | for several", st.excluded(c_rx, "IMAX - Wolves.mkv") and st.excluded(c_rx, "GAME OF THRONES/x.mkv") and not st.excluded(c_rx, "Tron.mkv"))
+    check("a broken exclude regex excludes nothing instead of crashing", not st.excluded(cfg("/x", "/y", exclude="("), "Tron.mkv"))
+    lib7, store7 = os.path.join(tmp, "lib7"), os.path.join(tmp, "store7s")
+    ep = os.path.join(lib7, "Show.Name.S01E02.1080p.mkv"); make_film(ep, seconds=30, size="320x180")
+    fl = os.path.join(lib7, "Some.Film.2020.mkv"); make_film(fl, seconds=30, size="320x180")
+    rc = st.cmd_build(cfg(lib7, store7, skip_tv=1, play_pause=0, play_extractor="auto"), ep, own_process=False)
+    check("build FILE skips a TV episode when skip_tv=1", rc == 0 and not os.path.isdir(st.entry_dir(store7, "Show.Name.S01E02.1080p.mkv")))
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        st.scan_pass(cfg(lib7, store7, skip_tv=1, settle=0), dry=True)
+    check("plan lists the film but not the episode, and says how many were left out", "Some.Film.2020.mkv" in out.getvalue() and "S01E02" not in out.getvalue(), out.getvalue())
+
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 
