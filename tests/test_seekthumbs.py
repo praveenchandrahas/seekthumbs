@@ -200,6 +200,170 @@ try:
         check("an HDR film builds under extractor=auto (falls back when PyAV lacks zscale)", okh and st.read_index(st.entry_dir(cfg7["store"], "HDR.Film.mkv")))
 
 
+    # ================================================================ garbage decodes (seen on a rate-limited mount: errors printed, exit code 0, a grey frame)
+    import re as _re
+    check("decode-error lines are recognised", all(st.decode_error_in(x) for x in (
+        "[hevc @ 0x55] Invalid NAL unit size (2147483647 > 10650).", "Error splitting the input into NAL units.", "Invalid data found when processing input",
+        "Could not find ref with POC 12", "corrupt decoded frame", "missing reference picture", "Read error at pos. 123")), "")
+    check("ordinary ffmpeg lines are not decode errors", not any(st.decode_error_in(x) for x in (
+        "", "Changing video frame properties on the fly is not supported by all filters", "deprecated pixel format used", "Past duration 0.99 too large")))
+
+    def ppm(path, fill=None, rnd=False, black_with_dots=False, w=64, h=36):
+        import random as _r
+        n = w * h * 3
+        data = bytes(_r.randrange(256) for _ in range(n)) if rnd else (bytes([0] * n) if black_with_dots else bytes([fill] * n))
+        if black_with_dots:
+            b = bytearray(data)
+            for i in range(0, 60, 3):
+                b[i * 50: i * 50 + 3] = b"\xff\xff\xff"
+            data = bytes(b)
+        with open(path, "wb") as f:
+            f.write(b"P6\n%d %d\n255\n" % (w, h) + data)
+        return path
+
+    pp = os.path.join(tmp, "f.ppm")
+    check("a mid-grey frame is suspicious", st.suspicious_frame(ppm(pp, 128)))
+    check("a white frame is suspicious", st.suspicious_frame(ppm(pp, 255)))
+    check("a black frame (credits) is not", not st.suspicious_frame(ppm(pp, 0)))
+    check("a dark grey frame (fade) is not", not st.suspicious_frame(ppm(pp, 40)))
+    check("black with a few white pixels (credits text) is not", not st.suspicious_frame(ppm(pp, black_with_dots=True)))
+    check("a busy picture is not", not st.suspicious_frame(ppm(pp, rnd=True)))
+    check("only PPM frames are looked at", not st.suspicious_frame(os.path.join(tmp, "x.png")))
+
+    def build_logged(rel, cfg_, src=None):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ok_ = st.build_entry(rel, src or film, os.path.getsize(src or film), cfg_, st.Governor(4, 0.05), False)
+        m = _re.search(r"(\d+) reads retried after decode errors, (\d+) near-constant", buf.getvalue())
+        return ok_, (int(m.group(1)), int(m.group(2))) if m else None, buf.getvalue()
+
+    # the ffmpeg-command path: exit code 0 and a frame, but decode errors on stderr
+    real_run = subprocess.run
+    inj = {"n": 0}
+
+    def run_noisy(cmd, *a, **k):
+        r = real_run(cmd, *a, **k)
+        if isinstance(cmd, list) and "-noaccurate_seek" in cmd and inj["n"] < 3:
+            inj["n"] += 1
+            r = subprocess.CompletedProcess(r.args, r.returncode, r.stdout, (r.stderr or "") +
+                                            "[hevc @ 0x1] Invalid NAL unit size (2147483647 > 10650).\n[hevc @ 0x1] Error splitting the input into NAL units.\n")
+        return r
+
+    subprocess.run = run_noisy
+    try:
+        ok_, counts, out_ = build_logged(rel2, cfg(lib, os.path.join(tmp, "store8"), extractor="ffmpeg"))
+    finally:
+        subprocess.run = real_run
+    ix8 = st.read_index(st.entry_dir(os.path.join(tmp, "store8"), rel2))
+    check("ffmpeg command: three reads with decode errors are retried and the film is complete", ok_ and counts and counts[0] == 3 and ix8 and all(l > 0 for l in ix8["lengths"]), (counts, out_[-300:]))
+
+    if have_av:
+        import av as _av
+        orig_g = st.AvExtractor._grab
+        seen_t, inj2 = set(), {"n": 0}
+
+        def noisy_grab(self, t, out):
+            if t not in seen_t and inj2["n"] < 4:
+                inj2["n"] += 1
+                _av.logging.log(_av.logging.ERROR, "hevc", "Invalid NAL unit size (2147483647 > 10650).")
+            seen_t.add(t)
+            return orig_g(self, t, out)
+
+        st.AvExtractor._grab = noisy_grab
+        try:
+            ok_, counts, out_ = build_logged(rel2, cfg(lib, os.path.join(tmp, "store9"), extractor="pyav"))
+        finally:
+            st.AvExtractor._grab = orig_g
+        ix9 = st.read_index(st.entry_dir(os.path.join(tmp, "store9"), rel2))
+        check("PyAV: libav log lines with decode errors make the read fail, it is retried once, the film is complete",
+              ok_ and counts and counts[0] == 4 and ix9 and all(l > 0 for l in ix9["lengths"]), (counts, out_[-300:]))
+
+        # extractor=auto must not answer a decode error with the dearer ffmpeg command
+        used_cli = []
+        orig_cg = st.CliExtractor.grab
+        st.CliExtractor.grab = lambda self, t_, out: used_cli.append(1) or orig_cg(self, t_, out)
+        seen_t.clear(); inj2["n"] = 0
+        st.AvExtractor._grab = noisy_grab
+        try:
+            ok_, counts, out_ = build_logged(rel2, cfg(lib, os.path.join(tmp, "store10"), extractor="auto"))
+        finally:
+            st.AvExtractor._grab = orig_g
+            st.CliExtractor.grab = orig_cg
+        check("extractor=auto retries a decode error with PyAV (no fall-through to one ffmpeg process per thumbnail)", ok_ and counts and counts[0] == 4 and not used_cli, (counts, used_cli))
+
+        # a grey frame once: read again; the same white frame every time is kept (a real white-out)
+        def grey_first(self, t, out):
+            if t not in seen_t:
+                seen_t.add(t)
+                ppm(out, 128, w=64, h=36)
+                return True, ""
+            return orig_g(self, t, out)
+
+        seen_t.clear()
+        st.AvExtractor._grab = grey_first
+        try:
+            ok_, counts, out_ = build_logged(rel2, cfg(lib, os.path.join(tmp, "store11"), extractor="pyav"))
+        finally:
+            st.AvExtractor._grab = orig_g
+        check("a grey frame is read again and replaced by the real picture", ok_ and counts and counts[1] == 14, (counts, out_[-200:]))
+        st.AvExtractor._grab = lambda self, t, out: (ppm(out, 255, w=64, h=36), (True, ""))[1]
+        try:
+            ok_, counts, out_ = build_logged(rel2, cfg(lib, os.path.join(tmp, "store12"), extractor="pyav"))
+        finally:
+            st.AvExtractor._grab = orig_g
+        check("the same white frame twice is kept (it is real), not retried forever", ok_ and counts and counts[1] == 14, (counts, out_[-200:]))
+
+    # a real corrupt file: a bad NAL length in one keyframe (HEVC in mp4)
+    has_x265 = "libx265" in subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True).stdout
+    if has_x265:
+        cor = os.path.join(tmp, "corlib", "Corrupt.One.2022.mp4")
+        os.makedirs(os.path.dirname(cor))
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=640x360:r=24", "-t", "60", "-c:v", "libx265", "-preset", "ultrafast",
+                        "-x265-params", "keyint=24:min-keyint=24:log-level=none", "-pix_fmt", "yuv420p", cor], check=True)
+        pk = json.loads(subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pos,pts_time,flags", "-of", "json", cor],
+                                       capture_output=True, text=True).stdout)["packets"]
+        kp = [p_ for p_ in pk if "K" in p_["flags"] and abs(float(p_["pts_time"]) - 35.0) < 0.01][0]
+        raw = bytearray(open(cor, "rb").read())
+        raw[int(kp["pos"]):int(kp["pos"]) + 4] = bytes([0x7f, 0xff, 0xff, 0xff])
+        open(cor, "wb").write(raw)
+        for ex_name in ("ffmpeg",) + (("pyav",) if have_av else ()):
+            ok_, counts, out_ = build_logged("Corrupt.One.2022.mp4", cfg(lib, os.path.join(tmp, "store13" + ex_name), extractor=ex_name), src=cor)
+            ixc = st.read_index(st.entry_dir(os.path.join(tmp, "store13" + ex_name), "Corrupt.One.2022.mp4"))
+            check(f"a corrupt keyframe ({ex_name}): the read is retried, then left out; the other thumbnails are good",
+                  ok_ and counts and counts[0] >= 1 and ixc and ixc["lengths"][3] == 0 and sum(1 for l in ixc["lengths"] if l == 0) == 1, (counts, ixc and ixc["lengths"], out_[-300:]))
+    else:
+        print("SKIP corrupt-keyframe test (ffmpeg without libx265)")
+
+    # verify --deep
+    cd = cfg(lib, os.path.join(tmp, "store14"), extractor="ffmpeg")
+    st.build_entry(rel2, film, os.path.getsize(film), cd, st.Governor(4, 0.05), False)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc0 = st.cmd_verify(cd, deep=True)
+    check("verify --deep accepts a good entry", rc0 == 0, buf.getvalue())
+    edir14 = st.entry_dir(cd["store"], rel2)
+    ix14 = st.read_index(edir14)
+    wd, hd = ix14["w"], ix14["h"]
+    flat = {}
+    for nm, colour in (("grey", "gray"), ("black", "black")):
+        fp = os.path.join(tmp, f"flat-{nm}.jpg")
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", f"color=c={colour}:s={wd}x{hd}", "-frames:v", "1", "-pix_fmt", "yuvj420p", fp], check=True)
+        flat[nm] = open(fp, "rb").read()
+    pack = open(os.path.join(edir14, "thumbs.pack"), "rb").read()
+    parts = [pack[o:o + l] for o, l in zip(ix14["offsets"], ix14["lengths"])]
+    parts[2], parts[4] = flat["grey"], flat["black"]
+    offs, pos = [], 0
+    for b_ in parts:
+        offs.append(pos); pos += len(b_)
+    open(os.path.join(edir14, "thumbs.pack"), "wb").write(b"".join(parts))
+    ix14.update(offsets=offs, lengths=[len(b_) for b_ in parts])
+    json.dump(ix14, open(os.path.join(edir14, "index.json"), "w"))
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc1 = st.cmd_verify(cd, deep=True)
+    check("verify --deep lists a flat grey thumbnail (and not a black one)", rc1 == 1 and "thumbnail 2 " in buf.getvalue() and "thumbnail 4 " not in buf.getvalue(), buf.getvalue())
+    check("plain verify does not decode and still passes", st.cmd_verify(cd) == 0)
+
     # ================================================================ on-play build and sharing between releases
     cases = {
         "Movie.Name.2019.2160p.UHD.BluRay.x265-GRP.mkv": "movie name|2019",

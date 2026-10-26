@@ -110,6 +110,14 @@ Every setting can also be given on the command line, before or after the subcomm
 The viewer reads `library`, `store` and `min_size_mb` from the same file; `script-opts/seekthumbs.conf` can override them (also `overlay_id`, `ffmpeg`, `debug=yes`,
 `build=no`, `builder=` (set by `install-viewer`), `python=`, `recheck_s`).
 
+### Garbage decodes
+
+A throttled or flaky mount can make libav print decode errors ("Invalid NAL unit size", "Error splitting the input…") while still exiting 0 with a grey or smeared frame. Each grab now captures libav's log lines (stderr for the ffmpeg command, `av.logging.Capture` for PyAV). A decode-error line turns the read into a failed one, which is retried once and counted in the summary ("N reads retried after decode errors"); a second failure is an ordinary failed read. With `extractor=auto` a decode error is retried with PyAV, never handed to one ffmpeg process per thumbnail.
+
+On the PyAV path a cheap check also looks at the frame: a near-constant mid-grey or white picture is read once more, then accepted if it comes back the same (a real white-out). Black and dark frames (credits, fades) are never flagged. `verify --deep` decodes the stored thumbnails and lists the flat grey or white ones.
+
+Limits: the frame check only runs on the PyAV path; PyAV log lines are process-wide, so with several workers an error from one thread can be blamed on another's read (an extra retry, nothing worse).
+
 ## Not verified yet / known weak spots
 
 1. **Bytes read per seek on the real mount.** rclone read-ahead, chunk size and VFS cache mode decide it. `probe` now prints the bytes this machine received per

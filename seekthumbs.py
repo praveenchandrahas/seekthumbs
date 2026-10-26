@@ -12,7 +12,7 @@ grows back one step per 40 clean reads. Standard library plus ffmpeg/ffprobe; Py
     seekthumbs.py scan              one pass: build thumbnails for every film that lacks them (--max-films N to limit)
     seekthumbs.py watch             scan, sleep --poll seconds, repeat (this is what the systemd service runs)
     seekthumbs.py status            store size, entry count, the largest entries against the size budget
-    seekthumbs.py verify            check every store entry against its index and the size budget
+    seekthumbs.py verify [--deep]   check every store entry against its index and the size budget; --deep also decodes every thumbnail and lists likely corrupt ones
     seekthumbs.py prune [--yes]     list (or delete, with --yes) store entries whose film no longer exists; refuses if the library looks unmounted
     seekthumbs.py install-service [--enable]   write ~/.config/systemd/user/seekthumbs.service
     seekthumbs.py install-viewer [--mpv-config-dir DIR]   put the mpv viewer (thumbfast.lua) into DIR/scripts, moving a real thumbfast aside
@@ -56,6 +56,38 @@ STOP = False
 # Words that mean "the server is pushing back" rather than "this part of the file is bad".
 THROTTLE_RE = re.compile(r"429|too many request|rate.?limit|quota|slow.?down|service unavailable|\b503\b|\b403\b|forbidden|temporar|timed? ?out|timeout",
                          re.I)
+
+
+# Lines libav/ffmpeg print when it decoded garbage or lost data: seen on a rate-limited debrid mount, where ffmpeg still returned a frame and exit code 0.
+# A read during which one of these appears is a failed read (it is retried once), whatever frame came out.
+DECODE_ERR_RE = re.compile(r"invalid nal unit|error splitting the input|invalid data|corrupt|missing reference|could not find ref|error parsing|"
+                           r"error while decoding|read error|invalid slice", re.I)
+
+
+def decode_error_in(text):
+    """The first decode-error line in some libav/ffmpeg log text, or None."""
+    for line in (text or "").splitlines():
+        if DECODE_ERR_RE.search(line):
+            return line.strip()[:160]
+    return None
+
+
+def suspicious_frame(path):
+    """True for a PPM frame that is near-constant and not dark: what a decoder emits when it lost its reference (mid-grey) or failed (white).
+    Black or dark frames (credits, fades, a few hundred bytes as JPEG) are never flagged, nor is anything with a visible picture in it. A flagged frame is only
+    read once more; if the second read gives the same, it is kept (a white-out or a grey fade is then real)."""
+    if not path.endswith(".ppm"):
+        return False
+    try:
+        with open(path, "rb") as f:
+            f.readline(); f.readline(); f.readline()
+            data = f.read()
+    except OSError:
+        return False
+    if not data:
+        return False
+    sample = data[:: max(1, len(data) // 3000)]
+    return (max(sample) - min(sample)) <= 6 and sum(sample) / len(sample) >= 90
 
 
 class Throttled(Exception):
@@ -458,6 +490,14 @@ class CliExtractor:
         except subprocess.TimeoutExpired:
             return False, "timeout"
         ok = r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0
+        if ok:
+            bad = decode_error_in(r.stderr)
+            if bad:                            # exit code 0 and a frame, but ffmpeg said it could not decode properly: do not trust the frame
+                try:
+                    os.remove(out)
+                except OSError:
+                    pass
+                return False, "decode error: " + bad
         return ok, "" if ok else (r.stderr.strip()[-300:] or "no output")
 
     def close(self):
@@ -547,7 +587,36 @@ class AvExtractor:
             except Exception:                  # noqa: BLE001
                 pass
 
+    @staticmethod
+    def _log_setup():
+        import av
+        av.logging.set_level(av.logging.ERROR)          # decode errors are error-level; warnings would only be noise
+        av.logging.set_skip_repeated(False)             # an identical error in the next grab must be reported again
+
     def grab(self, t, out):
+        """Decodes one frame. libav's log is captured during the grab (all threads: a decoder's helper threads log too, so a concurrent grab can be
+        blamed for another one's error: only ever an extra retry); a decode-error line makes it a failed read, whatever frame came out."""
+        import av
+        self._log_setup()
+        exc = None
+        res = (False, "")
+        with av.logging.Capture(local=False) as logs:
+            try:
+                res = self._grab(t, out)
+            except Exception as ex:            # noqa: BLE001
+                exc = ex
+        bad = decode_error_in("\n".join(str(l[2]) for l in logs))
+        if bad:
+            try:
+                os.remove(out)
+            except OSError:
+                pass
+            return False, "decode error: " + bad
+        if exc is not None:
+            raise exc
+        return res
+
+    def _grab(self, t, out):
         try:
             c, stream, g, buf, sink = self._state()
             ts = int(t / stream.time_base) + int(stream.start_time or 0)
@@ -598,6 +667,8 @@ class AutoExtractor:
                 r = self.av.grab(t, out)
                 if r[0]:
                     self.av_ok += 1
+                    return r
+                if r[1].startswith("decode error"):          # a bad read, not a broken PyAV: the caller retries; no 6x dearer ffmpeg command
                     return r
             except Exception as ex:            # noqa: BLE001
                 why = str(ex)
@@ -688,13 +759,14 @@ def build_entry(rel, src, size, cfg, gov, zscale_ok):
     os.makedirs(os.path.dirname(final), exist_ok=True)
     work = tempfile.mkdtemp(prefix=".work-", dir=os.path.dirname(final))
     try:
-        frames, stats, lock, abort = {}, dict(ok=0, fail=0), threading.Lock(), []
+        frames, stats, lock, abort = {}, dict(ok=0, fail=0, retried=0, suspect=0), threading.Lock(), []
         times = [min((i + 0.5) * cfg["interval"], max(0.0, info["duration"] - 1.0)) for i in range(n)]
         ext_of_frame = "ppm" if ext.name == "pyav" or (isinstance(ext, AutoExtractor) and ext.name == "pyav") else "png"
 
         def work_one(i):
             if abort or STOP:
                 return
+            decode_retried = suspect_seen = False
             for attempt in range(12):
                 if abort or STOP:
                     return
@@ -715,11 +787,25 @@ def build_entry(rel, src, size, cfg, gov, zscale_ok):
                 gov.release(kind)
                 if cfg["pause"]:
                     time.sleep(cfg["pause"])
+                if ok and not suspect_seen and suspicious_frame(out):
+                    suspect_seen = True                                   # a near-constant grey/white frame: read it once more; the same again is kept
+                    with lock:
+                        stats["suspect"] += 1
+                    try:
+                        os.remove(out)
+                    except OSError:
+                        pass
+                    continue
                 if ok:
                     with lock:
                         frames[i] = out
                         stats["ok"] += 1
                     return
+                if (why or "").startswith("decode error") and not decode_retried:
+                    decode_retried = True                                 # garbage decoded (typically while the mount was rate-limiting): one retry
+                    with lock:
+                        stats["retried"] += 1
+                    continue
                 if kind == "throttled":
                     if gov.hopeless():
                         abort.append(("throttled", why))
@@ -778,7 +864,8 @@ def build_entry(rel, src, size, cfg, gov, zscale_ok):
         os.rename(work, final)
         dt = time.time() - t0
         log(f"built {rel}: {n} thumbs ({len(frames)} read, {stats['fail']} failed reads, {ext.name}), {w}x{h} q{q}, {total / 1e6:.2f} MB "
-            f"(budget {allowed / 1e6:.2f}), {dt:.0f}s total, {n / max(0.1, t_read):.1f} reads/s")
+            f"(budget {allowed / 1e6:.2f}), {dt:.0f}s total, {n / max(0.1, t_read):.1f} reads/s; "
+            f"{stats['retried']} reads retried after decode errors, {stats['suspect']} near-constant grey/white frame(s) read again")
         return True
     finally:
         try:
@@ -1073,7 +1160,33 @@ def cmd_status(cfg):
         print(f"  {rel}: {f['why']} (x{f['count']})")
 
 
-def cmd_verify(cfg):
+def deep_check(edir, ix):
+    """Decodes every thumbnail of an entry (one ffmpeg process for the whole pack) and lists the ones that are likely corrupt: undecodable, or
+    near-constant grey/white (what a decoder that lost its reference produces). Returns a list of messages. Black frames are not flagged."""
+    w, h = ix["w"], ix["h"]
+    present = [i for i, ln in enumerate(ix["lengths"]) if ln]
+    cmd = ["ffmpeg", "-nostdin", "-v", "error", "-f", "image2pipe", "-c:v", "mjpeg", "-i", os.path.join(edir, "thumbs.pack"),
+           "-vf", f"scale={w}:{h}", "-f", "rawvideo", "-pix_fmt", "gray", "-"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=300)
+    except (OSError, subprocess.SubprocessError) as ex:
+        return [f"could not run ffmpeg: {ex}"]
+    out = []
+    sz = w * h
+    got = len(r.stdout) // sz
+    if r.stderr.strip():
+        out.append("ffmpeg said: " + r.stderr.decode(errors="replace").strip()[:120])
+    if got != len(present):
+        out.append(f"{got} of {len(present)} thumbnails decode")
+    for k in range(min(got, len(present))):
+        fr = r.stdout[k * sz:(k + 1) * sz]
+        sample = fr[:: max(1, sz // 2000)]
+        if (max(sample) - min(sample)) <= 6 and sum(sample) / len(sample) >= 90:
+            out.append(f"thumbnail {present[k]} (about {int((present[k] + 0.5) * ix['interval'])} s) is a flat grey/white picture")
+    return out
+
+
+def cmd_verify(cfg, deep=False):
     need_paths(cfg, library=False)
     bad = n = 0
     for edir in store_entries(cfg["store"]):
@@ -1099,6 +1212,10 @@ def cmd_verify(cfg):
         if per2h > cfg["budget_mb"]:
             print(f"OVER BUDGET {per2h:.2f} MB per 2 h: {edir}")
             bad += 1
+        if deep:
+            for msg in deep_check(edir, ix):
+                print(f"SUSPECT {edir}: {msg}")
+                bad += 1
         with open(os.path.join(edir, "thumbs.pack"), "rb") as f:
             for off, ln in list(zip(ix["offsets"], ix["lengths"]))[:3]:
                 if ln:
@@ -1240,8 +1357,10 @@ def main(argv):
     p.add_argument("file")
     p = sub.add_parser("build", parents=[common])
     p.add_argument("file")
-    for c in ("plan", "scan", "watch", "status", "verify"):
+    for c in ("plan", "scan", "watch", "status"):
         sub.add_parser(c, parents=[common])
+    p = sub.add_parser("verify", parents=[common])
+    p.add_argument("--deep", action="store_true", help="also decode every thumbnail and list the ones that look corrupt (flat grey/white, undecodable)")
     p = sub.add_parser("prune", parents=[common])
     p.add_argument("--yes", action="store_true")
     p = sub.add_parser("install-service", parents=[common])
@@ -1266,7 +1385,7 @@ def main(argv):
     elif args.cmd == "status":
         cmd_status(cfg)
     elif args.cmd == "verify":
-        return cmd_verify(cfg)
+        return cmd_verify(cfg, deep=args.deep)
     elif args.cmd == "prune":
         cmd_prune(cfg, args.yes)
     elif args.cmd == "install-viewer":
