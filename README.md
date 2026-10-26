@@ -90,4 +90,14 @@ The viewer reads `library` and `store` from the same file; `script-opts/seekthum
 
 ## Tests
 
-`python3 tests/test_seekthumbs.py` (needs ffmpeg; `pip install lupa av` adds the viewer and PyAV tests). Part of the [software-defined home theatre](https://github.com/praveenchandrahas/sdht) project; licensed Apache-2.0.
+`python3 tests/test_seekthumbs.py` (needs ffmpeg; `pip install lupa av` adds the viewer and PyAV tests).
+
+## Adapting it to your system
+
+Examples use the author's mount style (an rclone mount, read-only) and paths; set `library` and `store` in `~/.config/seekthumbs/config.ini` to your own.
+
+## Licence
+
+[Apache License 2.0](LICENSE) (see also [NOTICE](NOTICE)). Dolby, Dolby Atmos, DTS and DTS:X are trademarks of their owners; this project is not affiliated with or endorsed by them. It contains no media files and no decoder code.
+
+Part of the [software-defined home theatre](https://github.com/praveenchandrahas/sdht) project.
