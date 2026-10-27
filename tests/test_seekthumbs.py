@@ -914,6 +914,37 @@ try:
     check("the scan says which film it is reading and how many thumbnails", "reading 6 thumbnails of Progress.Film.2022.mkv" in out9.getvalue(), out9.getvalue()[-400:])
     check("periodic counts appear while a film is read", "thumbnails read," in out9.getvalue(), out9.getvalue()[-400:])
 
+    # ---- memory guard: the number of parallel reads follows the free memory
+    real_mem = st.mem_available_mb
+    try:
+        mc = {"worker_mem_mb": 600, "mem_reserve_mb": 3000}
+        st.mem_available_mb = lambda: 7500.0
+        n7, note7 = st.memory_limited_workers(16, mc)
+        check("16 reads asked for with 7.5 GB free: 7 used, and the note says why", n7 == 7 and "16 parallel reads asked for, 7 used" in note7 and "7.3 GB" in note7, (n7, note7))
+        st.mem_available_mb = lambda: 20000.0
+        check("plenty of memory: the request is kept, no note", st.memory_limited_workers(16, mc) == (16, ""))
+        st.mem_available_mb = lambda: 1000.0
+        check("almost no memory: never fewer than one read", st.memory_limited_workers(16, mc)[0] == 1)
+        st.mem_available_mb = lambda: None
+        check("memory unknown: the request is kept", st.memory_limited_workers(16, mc) == (16, ""))
+        st.mem_available_mb = lambda: 1000.0
+        check("worker_mem_mb = 0 turns the limit off", st.memory_limited_workers(16, dict(mc, worker_mem_mb=0)) == (16, ""))
+        st.mem_available_mb = lambda: 3700.0              # (3700 - 3000) / 600 = 1 read
+        out10 = io.StringIO()
+        lib10, store10 = os.path.join(tmp, "lib10"), os.path.join(tmp, "store10")
+        make_film(os.path.join(lib10, "Memory.Film.2022.mkv"), seconds=60, size="320x180")
+        with contextlib.redirect_stderr(out10), contextlib.redirect_stdout(out10):
+            st.scan_pass(cfg(lib10, store10, settle=0, share=0, workers=8, pause=0.0))
+        check("a build logs the memory limit and reads with the reduced number", "MEMORY: 8 parallel reads asked for, 1 used" in out10.getvalue() and "with 1 parallel read(s)" in out10.getvalue(), out10.getvalue()[-500:])
+    finally:
+        st.mem_available_mb = real_mem
+    ok_adj = st.prefer_to_be_killed_first(300)
+    if ok_adj:
+        with open("/proc/self/oom_score_adj") as f:
+            check("the process asks to be the first the kernel kills when memory runs out", int(f.read()) >= 300)
+    else:
+        print("SKIP oom_score_adj (not writable here)")
+
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 

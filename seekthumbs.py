@@ -49,7 +49,7 @@ VIDEO_EXT = {".mkv", ".mp4", ".m4v", ".avi", ".mov", ".ts", ".m2ts", ".webm", ".
 DEFAULTS = dict(library="", store="", interval=20.0, width=240, workers=6, pause=0.0, film_pause=0.0, poll=1800.0, settle=600.0,
                 min_size_mb=300.0, max_films=0, budget_mb=10.0, safety=0.8, seek_timeout=90.0, probesize="1M", yield_to_playback=1,
                 breaker_hours=1.0, extractor="auto", rate_cooldown=30.0,
-                play_workers=2, play_pause=2.0, play_extractor="pyav", share=1, share_tolerance=2.0, encode_jobs=0, skip_tv=0, exclude="",
+                play_workers=2, play_pause=2.0, worker_mem_mb=600, mem_reserve_mb=3000, play_extractor="pyav", share=1, share_tolerance=2.0, encode_jobs=0, skip_tv=0, exclude="",
                 probe_timeout=300.0, wake_ahead=3, progress_every=60.0)
 PLAYERS = ("mpv", "mpv-atmos", "mpv-object-audio", "vlc", "kodi", "kodi.bin")
 SUFFIX = ".seekthumbs"
@@ -961,7 +961,10 @@ def build_entry(rel, src, size, cfg, gov, zscale_ok):
                             abort.append(("fail", why))
                     return
 
-        log(f"reading {n} thumbnails of {rel} with {max(1, int(cfg['workers']))} parallel read(s) (wake {t_wake:.0f} s, probe {t_probe:.0f} s)")
+        n_workers, mem_note = memory_limited_workers(cfg["workers"], cfg)
+        if mem_note:
+            log("MEMORY: " + mem_note)
+        log(f"reading {n} thumbnails of {rel} with {n_workers} parallel read(s) (wake {t_wake:.0f} s, probe {t_probe:.0f} s)")
         every = float(cfg.get("progress_every", 60.0) or 0)
         halt = threading.Event()
 
@@ -979,7 +982,7 @@ def build_entry(rel, src, size, cfg, gov, zscale_ok):
         tk = threading.Thread(target=ticker, daemon=True)
         tk.start()
         try:
-            with ThreadPoolExecutor(max_workers=max(1, int(cfg["workers"]))) as pool:
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
                 list(pool.map(work_one, range(n)))
         finally:
             halt.set()
@@ -1282,6 +1285,49 @@ def cmd_watch(cfg):
     log("stopped")
 
 
+def mem_available_mb():
+    """MemAvailable from /proc/meminfo in MB, or None."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / 1024.0
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def memory_limited_workers(requested, cfg):
+    """(workers to use, note). Every parallel read keeps its own open decoder (about 180 MB each for a 4K 10-bit HEVC film measured without HDR
+    tone-mapping, more with it), so the number of reads is cut to what the free memory allows after `mem_reserve_mb` is left for the rest of the
+    computer: workers <= (MemAvailable - mem_reserve_mb) / worker_mem_mb. worker_mem_mb = 0 turns the limit off. Never below 1."""
+    requested = max(1, int(requested))
+    per, reserve = float(cfg.get("worker_mem_mb") or 0), float(cfg.get("mem_reserve_mb") or 0)
+    avail = mem_available_mb() if per > 0 else None
+    if avail is None:
+        return requested, ""
+    n = max(1, min(requested, int((avail - reserve) // per)))
+    if n < requested:
+        return n, (f"{requested} parallel reads asked for, {n} used: {avail / 1024:.1f} GB of memory is free, {reserve / 1024:.1f} GB is kept for the rest of the "
+                   f"computer and each read is counted at {per:.0f} MB (settings worker_mem_mb and mem_reserve_mb)")
+    return n, ""
+
+
+def prefer_to_be_killed_first(adj=300):
+    """If the computer runs out of memory, let the kernel pick this process (and the ffmpeg children it starts) before the desktop, browser and player.
+    An ordinary user may raise this value, never lower it. Returns True when it was set."""
+    try:
+        with open("/proc/self/oom_score_adj") as f:
+            cur = int(f.read().strip() or 0)
+        if cur >= adj:
+            return True
+        with open("/proc/self/oom_score_adj", "w") as f:
+            f.write(str(adj))
+        return True
+    except (OSError, ValueError):
+        return False
+
+
 def net_rx_bytes():
     """Bytes received by this machine on all interfaces except lo (rough: includes everything else the machine is doing)."""
     try:
@@ -1568,6 +1614,8 @@ def main(argv):
     p.add_argument("--mpv-config-dir", default="~/.config/mpv-object-audio")
     args = ap.parse_args(argv)
     cfg = load_config(args)
+    if args.cmd in ("build", "scan", "watch", "serve", "probe"):
+        prefer_to_be_killed_first()
     if args.cmd == "probe":
         cmd_probe(cfg, args.file)
     elif args.cmd == "build":
