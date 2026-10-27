@@ -110,7 +110,7 @@ DVD rips, documentaries and sample clips; such films never get thumbnails. Non-v
 Cold files: on a debrid mount the first touch of a file can take 20 s or more before any data arrives (with the network almost idle), then reads in the same file
 are fast. So before probing a film, seekthumbs reads 1 MB at the start and end of the file to wake it (`probe_timeout`, 300 s, is how long it waits), wakes
 the next `wake_ahead` (3) files in the background so those waits overlap, and a file that is still not answering is skipped, tried again at the end of the
-pass, and never recorded as a failure on the first timeout. The "built" log line shows the wake, probe and read seconds of each film.
+pass, and never recorded as a failure on the first timeout. The "built" log line shows the wake, probe and read seconds of each film; while a film is read, a line every `progress_every` (60) seconds shows the count, the rate and the time left.
 Every setting can also be given on the command line, before or after the subcommand (`./seekthumbs.py scan --max-films 1`).
 The viewer reads `library`, `store` and `min_size_mb` from the same file; `script-opts/seekthumbs.conf` can override them (also `overlay_id`, `ffmpeg`, `debug=yes`,
 `build=no`, `builder=` (set by `install-viewer`), `python=`, `recheck_s`).

@@ -50,7 +50,7 @@ DEFAULTS = dict(library="", store="", interval=20.0, width=240, workers=6, pause
                 min_size_mb=300.0, max_films=0, budget_mb=10.0, safety=0.8, seek_timeout=90.0, probesize="1M", yield_to_playback=1,
                 breaker_hours=1.0, extractor="auto", rate_cooldown=30.0,
                 play_workers=2, play_pause=2.0, play_extractor="pyav", share=1, share_tolerance=2.0, encode_jobs=0, skip_tv=0, exclude="",
-                probe_timeout=300.0, wake_ahead=3)
+                probe_timeout=300.0, wake_ahead=3, progress_every=60.0)
 PLAYERS = ("mpv", "mpv-atmos", "mpv-object-audio", "vlc", "kodi", "kodi.bin")
 SUFFIX = ".seekthumbs"
 STOP = False
@@ -898,8 +898,28 @@ def build_entry(rel, src, size, cfg, gov, zscale_ok):
                             abort.append(("fail", why))
                     return
 
-        with ThreadPoolExecutor(max_workers=max(1, int(cfg["workers"]))) as pool:
-            list(pool.map(work_one, range(n)))
+        log(f"reading {n} thumbnails of {rel} with {max(1, int(cfg['workers']))} parallel read(s) (wake {t_wake:.0f} s, probe {t_probe:.0f} s)")
+        every = float(cfg.get("progress_every", 60.0) or 0)
+        halt = threading.Event()
+
+        def ticker():
+            last, t_last = 0, time.time()
+            while every and not halt.wait(every):
+                with lock:
+                    ok = stats["ok"]
+                now = time.time()
+                rate = (ok - last) / max(0.001, now - t_last)
+                left = (n - ok) / rate / 60 if rate > 0 else float("inf")
+                log(f"  {ok}/{n} thumbnails read, {rate:.2f}/s in the last {now - t_last:.0f} s" + (f", about {left:.0f} min left" if left != float("inf") else ", no progress"))
+                last, t_last = ok, now
+
+        tk = threading.Thread(target=ticker, daemon=True)
+        tk.start()
+        try:
+            with ThreadPoolExecutor(max_workers=max(1, int(cfg["workers"]))) as pool:
+                list(pool.map(work_one, range(n)))
+        finally:
+            halt.set()
         ext.close()
         if STOP:
             raise KeyboardInterrupt

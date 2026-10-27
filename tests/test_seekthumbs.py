@@ -905,6 +905,15 @@ try:
     check("the retry came after the other film (it was skipped, not waited for)", calls.index("Fast.Film.2021.mkv") < len(calls) - 1 and calls[-1] == "Slow.Film.2020.mkv", calls)
     check("a slow open is not recorded as a failure", not st_state.d["fail"], st_state.d["fail"])
 
+    # ---- progress lines: a start line and periodic counts while a film is read
+    lib9, store9 = os.path.join(tmp, "lib9"), os.path.join(tmp, "store9")
+    make_film(os.path.join(lib9, "Progress.Film.2022.mkv"), seconds=60, size="320x180")
+    out9 = io.StringIO()
+    with contextlib.redirect_stderr(out9), contextlib.redirect_stdout(out9):
+        st.scan_pass(cfg(lib9, store9, settle=0, share=0, progress_every=0.05, pause=0.3, workers=1))
+    check("the scan says which film it is reading and how many thumbnails", "reading 6 thumbnails of Progress.Film.2022.mkv" in out9.getvalue(), out9.getvalue()[-400:])
+    check("periodic counts appear while a film is read", "thumbnails read," in out9.getvalue(), out9.getvalue()[-400:])
+
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 
