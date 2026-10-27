@@ -128,6 +128,7 @@ class Engine:
         self.rev = 0
         self._tb, self._tb_rev = 0, -1
         self.retry_once = set()
+        self.no_alias = set()                # releases that matched no built release this session: not probed again
         self.bad_streak = 0
         self.closing = False
         self.started = time.time()
@@ -198,7 +199,7 @@ class Engine:
         films = []
         for g in self.groups.values():
             cur = self._members_current(g)
-            status = "done" if all(cur) else ("partial" if any(cur) else "new")
+            status = "done" if any(cur) else "new"        # one set per film: a release that matched no other has none of its own until it is played
             first = g["members"][0]
             failed = None
             for (_, rel, src, size) in g["members"]:
@@ -344,10 +345,15 @@ class Engine:
         if g is None:
             return
         st, cfg0 = self.st, self.cfg
+        # One set per film: once any release of the film has thumbnails (built, or an alias of one), the other releases may only become aliases.
+        # A release whose runtime matches nothing is left alone (it is built when you play it), never read in full a second time.
+        covered = any(st.entry_current(cfg0["store"], rel, size) for (_, rel, _s, size) in g["members"])
         for (mtime, rel, src, size) in g["members"]:
             if self.closing or self.stop_requested:
                 return
             if st.entry_current(cfg0["store"], rel, size):
+                continue
+            if rel in self.no_alias:
                 continue
             if time.time() - mtime < cfg0["settle"]:
                 st.log(f"skipped {rel}: modified {time.time() - mtime:.0f} s ago, it may still be downloading")
@@ -364,7 +370,7 @@ class Engine:
                 settings = dict(self.settings)
             self.wake.ahead(self._next_sources())
             cfg = dict(cfg0)
-            cfg.update(workers=settings["workers"], pause=settings["pause"], _job=job)
+            cfg.update(workers=settings["workers"], pause=settings["pause"], _job=job, _alias_only=covered)
             gov = st.Governor(settings["workers"], cfg0["rate_cooldown"])
             state = st.State(cfg0["store"])
             t0 = time.time()
@@ -374,6 +380,11 @@ class Engine:
                 state.ok(rel)
                 self.bad_streak = 0
                 rec.update(status="shared" if job.shared else "built")
+                covered = True
+            except st.NoMatchingRelease as ex:
+                self.no_alias.add(rel)
+                st.log(f"left out {rel}: {ex}; this film already has thumbnails, so this release gets its own set only when you play it")
+                rec.update(status="skipped", why=str(ex)[:160])
             except st.JobStopped:
                 rec.update(status="stopped")
                 if not self.closing:
@@ -483,7 +494,7 @@ class Engine:
             built = [h for h in self.history if h["status"] == "built"]
             avg = (sum(h["seconds"] for h in built[-8:]) / len(built[-8:])) if built else None
             if self._tb_rev != self.rev:                       # the store only changes when a film ends, which bumps rev: do not re-read it every second
-                self._tb = sum(1 for gid in self.queue if gid in self.groups and not all(self._members_current(self.groups[gid])))
+                self._tb = sum(1 for gid in self.queue if gid in self.groups and not any(self._members_current(self.groups[gid])))
                 self._tb_rev = self.rev
             to_build = self._tb
             eta = None

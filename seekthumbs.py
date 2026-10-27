@@ -469,6 +469,10 @@ class ProbeTimeout(Exception):
     'slow', not 'broken': the scan skips the file and tries it again at the end of the pass instead of recording a failure."""
 
 
+class NoMatchingRelease(Exception):
+    """Alias-only build: this release is not the same film as anything already built (runtime differs by more than share_tolerance)."""
+
+
 class JobStopped(Exception):
     """The owner stopped the build from the web page; the partial work is thrown away."""
 
@@ -885,6 +889,8 @@ def build_entry(rel, src, size, cfg, gov, zscale_ok):
                 job.shared, job.phase = True, "shared"
             log(f"shared {rel}: same film as {sib[2]} (runtimes {sib[0]:.1f} s apart); no thumbnails built")
             return True
+        if cfg.get("_alias_only"):
+            raise NoMatchingRelease(f"runtime {info['duration']:.1f} s matches no release already built (tolerance {float(cfg.get('share_tolerance', 2.0)):g} s)")
     n = max(1, int(info["duration"] // cfg["interval"]))
     allowed = cfg["budget_mb"] * 1e6 * (info["duration"] / 7200.0) * cfg["safety"]
     ext = make_extractor(cfg, src, info, zscale_ok)

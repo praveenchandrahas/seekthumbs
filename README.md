@@ -43,6 +43,8 @@ DVD rips, documentaries and sample clips; such films never get thumbnails. Non-v
 
 ## The web page: pick the films yourself
 
+
+**One release is read per film.** The page reads the smallest release of a film in full. Every other release of that film can only become an alias (a few seconds), and only if its runtime is within `share_tolerance` (2 s) of one already built; otherwise the page logs `left out ...` and leaves it alone, and that release gets its own set when you play it. A film counts as Done once any release has a set; the release list shows which ones do. (Found on 2026-10-27: a film with 8 releases, e.g. Avengers Endgame, was being read in full once per release whose runtime differed by more than 2 s, at ~13 min each.) The command-line `scan` still builds a release with a different runtime separately, as a different cut; it does not use this rule.
 ```bash
 ./seekthumbs.py serve            # prints an address with a one-time token; open it in your browser (add --open to do that for you)
 ```

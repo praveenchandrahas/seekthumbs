@@ -41,6 +41,7 @@ try:
     lib, store = os.path.join(tmp, "lib"), os.path.join(tmp, "store")
     make_film(os.path.join(lib, "Tron.Ares.2025.2160p.Remux", "Tron.Ares.2025.2160p.Remux.mkv"), 60)
     make_film(os.path.join(lib, "Tron.Ares.2025.1080p.WEB-DL", "Tron.Ares.2025.1080p.WEB-DL.mkv"), 60.4, "640x360")
+    make_film(os.path.join(lib, "Tron.Ares.2025.IMAX.2160p.WEB-DL", "Tron.Ares.2025.IMAX.2160p.WEB-DL.mkv"), 65, "640x360")     # a different runtime: must not be read in full
     make_film(os.path.join(lib, "Arrival.2016.1080p.BluRay.mkv"), 40)
     make_film(os.path.join(lib, "Show.Name.S01E02.1080p.mkv"), 30)
     cfg = dict(st.DEFAULTS)
@@ -99,7 +100,7 @@ try:
     titles = sorted(f["title"] for f in L["films"])
     check("one row per film, releases grouped, TV left out", titles == ["Arrival", "Tron Ares"] and L["hidden"] == 1, (titles, L["hidden"]))
     tron = next(f for f in L["films"] if f["title"] == "Tron Ares")
-    check("a film shows its releases, smallest first, with quality tags", len(tron["releases"]) == 2 and "4K" in tron["releases"][0]["tags"] + tron["releases"][1]["tags"], tron["releases"])
+    check("a film shows its releases, smallest first, with quality tags", len(tron["releases"]) == 3 and "4K" in tron["releases"][0]["tags"] + tron["releases"][1]["tags"], tron["releases"])
     check("nothing is built yet", all(f["status"] == "new" for f in L["films"]) and L["store"]["bytes"] == 0)
 
     # ---- queue: only ids the server listed are accepted
@@ -119,12 +120,15 @@ try:
     s = wait(lambda s: s["state"] == "idle" and not s["queue"])
     check("the queue runs to the end and goes idle", s["state"] == "idle" and not s["queue"] and "finished" in s["note"], (s["state"], s["note"]))
     check("both films are built (the second Tron release shares)", s["totals"]["films"] == 2 and s["totals"]["aliases"] == 1, s["totals"])
-    check("the history says which was built and which shared", sorted(h["status"] for h in s["history"]) == ["built", "built", "shared"], [h["status"] for h in s["history"]])
+    check("the history says which was built and which shared", sorted(h["status"] for h in s["history"]) == ["built", "built", "shared", "skipped"], [h["status"] for h in s["history"]])
+    sk = [h for h in s["history"] if h["status"] == "skipped"][0]
+    check("the release with another runtime was left out, not read (no thumbnails, no failure mark)", sk["thumbs"] == 0 and sk["n"] == 0 and s["totals"]["failed"] == 0 and "IMAX" in sk["rel"], sk)
+    check("the log says why it was left out", any("left out" in l and "IMAX" in l for l in call("/api/log?n=200")[1]["lines"]))
     check("thumbnails and bytes are counted", s["totals"]["thumbs"] > 10 and s["totals"]["bytes"] > 1000, s["totals"])
     code, L = call("/api/library")
     check("the list now shows them done, with thumbnail counts", all(f["status"] == "done" and f["thumbs"] for f in L["films"]), [(f["title"], f["status"]) for f in L["films"]])
     check("the store size is reported", L["store"]["bytes"] > 1000 and L["store"]["real"] == 2 and L["store"]["alias"] == 1, L["store"])
-    check("the command line agrees nothing is left", st.scan_pass(dict(cfg), dry=True) == 0)
+    check("the command line still lists the left-out release (it builds a different cut separately; only the page leaves it out)", st.scan_pass(dict(cfg), dry=True) == 1)
 
     # ---- pause, resume, stop on a slower film
     slow_dir = os.path.join(tmp, "lib", "Slow.Film.2020.1080p.mkv")

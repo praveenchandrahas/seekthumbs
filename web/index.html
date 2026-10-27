@@ -326,7 +326,7 @@ function drawList() {
   const tot = sel.reduce((a, f) => a + f.size, 0);
   $("selTxt").textContent = sel.length ? sel.length + " selected · " + gb(tot) + " source" : "Nothing selected";
   $("bAdd").disabled = !sel.length; $("bAdd").textContent = sel.length ? "Add " + sel.length + " to queue" : "Add to queue";
-  $("libsub").textContent = lib.films.length + " films" + (lib.hidden ? " (" + lib.hidden + " files left out by skip_tv / exclude)" : "") + " · one row per film; the smallest release is read, the others share it.";
+  $("libsub").textContent = lib.films.length + " films" + (lib.hidden ? " (" + lib.hidden + " files left out by skip_tv / exclude)" : "") + " · one row per film; the smallest release is read; the others only get an alias if their runtime matches, otherwise they are left out until you play them.";
 }
 
 /* ---------- dashboard ---------- */
