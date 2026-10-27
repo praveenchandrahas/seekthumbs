@@ -858,6 +858,53 @@ try:
         st.scan_pass(cfg(lib7, store7, skip_tv=1, settle=0), dry=True)
     check("plan lists the film but not the episode, and says how many were left out", "Some.Film.2020.mkv" in out.getvalue() and "S01E02" not in out.getvalue(), out.getvalue())
 
+    # ---- cold files: wake read, probe timeout, skip-and-retry, no failure recorded
+    wf = os.path.join(lib7, "Some.Film.2020.mkv")
+    check("wake_file reads a file and returns the seconds it took", isinstance(st.wake_file(wf, 10), float))
+    fifo = os.path.join(tmp, "stuck.mkv")
+    os.mkfifo(fifo)                                              # opening a FIFO blocks until a writer appears: a file that never answers
+    try:
+        st.wake_file(fifo, 0.5)
+        stuck_raised = False
+    except st.ProbeTimeout:
+        stuck_raised = True
+    wr = os.open(fifo, os.O_WRONLY)                              # release the blocked reader thread
+    os.close(wr)
+    check("wake_file raises ProbeTimeout for a file that never answers", stuck_raised)
+    real_run = st.subprocess.run
+
+    def slow_run(*a, **kw):
+        raise subprocess.TimeoutExpired("ffprobe", kw.get("timeout", 0))
+    st.subprocess.run = slow_run
+    try:
+        st.ffprobe(wf, cfg("/x", "/y", probe_timeout=7))
+        probe_raised = False
+    except st.ProbeTimeout as ex:
+        probe_raised = "7 s" in str(ex)
+    finally:
+        st.subprocess.run = real_run
+    check("an ffprobe timeout becomes ProbeTimeout (with the configured limit in the message)", probe_raised)
+
+    lib8, store8 = os.path.join(tmp, "lib8"), os.path.join(tmp, "store8")
+    slow_film = os.path.join(lib8, "Slow.Film.2020.mkv"); make_film(slow_film, seconds=30, size="320x180")
+    fast_film = os.path.join(lib8, "Fast.Film.2021.mkv"); make_film(fast_film, seconds=40, size="320x180")
+    real_probe, calls = st.ffprobe, []
+
+    def flaky_probe(path, c):
+        calls.append(os.path.basename(path))
+        if path == slow_film and calls.count("Slow.Film.2020.mkv") == 1:
+            raise st.ProbeTimeout("simulated cold open")
+        return real_probe(path, c)
+    st.ffprobe = flaky_probe
+    try:
+        built = st.scan_pass(cfg(lib8, store8, settle=0, share=0, play_extractor="auto", extractor="auto"))
+    finally:
+        st.ffprobe = real_probe
+    st_state = st.State(store8)
+    check("a slow-to-open film is retried at the end of the pass and then built", built == 2 and os.path.isdir(st.entry_dir(store8, "Slow.Film.2020.mkv")), (built, calls))
+    check("the retry came after the other film (it was skipped, not waited for)", calls.index("Fast.Film.2021.mkv") < len(calls) - 1 and calls[-1] == "Slow.Film.2020.mkv", calls)
+    check("a slow open is not recorded as a failure", not st_state.d["fail"], st_state.d["fail"])
+
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 

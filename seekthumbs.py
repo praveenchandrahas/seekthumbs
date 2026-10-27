@@ -49,7 +49,8 @@ VIDEO_EXT = {".mkv", ".mp4", ".m4v", ".avi", ".mov", ".ts", ".m2ts", ".webm", ".
 DEFAULTS = dict(library="", store="", interval=20.0, width=240, workers=6, pause=0.0, film_pause=0.0, poll=1800.0, settle=600.0,
                 min_size_mb=300.0, max_films=0, budget_mb=10.0, safety=0.8, seek_timeout=90.0, probesize="1M", yield_to_playback=1,
                 breaker_hours=1.0, extractor="auto", rate_cooldown=30.0,
-                play_workers=2, play_pause=2.0, play_extractor="pyav", share=1, share_tolerance=2.0, encode_jobs=0, skip_tv=0, exclude="")
+                play_workers=2, play_pause=2.0, play_extractor="pyav", share=1, share_tolerance=2.0, encode_jobs=0, skip_tv=0, exclude="",
+                probe_timeout=300.0, wake_ahead=3)
 PLAYERS = ("mpv", "mpv-atmos", "mpv-object-audio", "vlc", "kodi", "kodi.bin")
 SUFFIX = ".seekthumbs"
 STOP = False
@@ -463,10 +464,69 @@ def have_filter(name):
         return False
 
 
+class ProbeTimeout(Exception):
+    """A file did not open (or probe) within probe_timeout. On a debrid mount the first touch of a cold file can take tens of seconds, so this is
+    'slow', not 'broken': the scan skips the file and tries it again at the end of the pass instead of recording a failure."""
+
+
+def wake_file(path, timeout):
+    """Reads 1 MB at the start and at the end of the file (where MKV keeps its header and its index) so the mount has the file ready before ffprobe and
+    PyAV need it. Returns the seconds it took; raises ProbeTimeout if the first touch is still not answered after `timeout` seconds."""
+    t0 = time.time()
+
+    def rd():
+        try:
+            with open(path, "rb") as f:
+                f.read(1 << 20)
+                end = f.seek(0, 2)
+                f.seek(max(0, end - (1 << 20)))
+                f.read(1 << 20)
+        except OSError:
+            pass                                   # ffprobe reports a real error; this read is only a nudge
+
+    th = threading.Thread(target=rd, daemon=True)
+    th.start()
+    th.join(timeout)
+    if th.is_alive():
+        raise ProbeTimeout(f"the file did not answer within {timeout:.0f} s (cold on the mount?)")
+    return time.time() - t0
+
+
+class WakeAhead:
+    """Wakes the next few files in the background while the current film is built, so their first-touch delays overlap instead of adding up."""
+
+    def __init__(self, n, timeout):
+        self.timeout = timeout
+        self.seen = set()
+        self.pool = ThreadPoolExecutor(max_workers=int(n)) if int(n) > 0 else None
+
+    def ahead(self, paths):
+        if not self.pool:
+            return
+        for p in paths:
+            if p not in self.seen:
+                self.seen.add(p)
+                self.pool.submit(self._one, p)
+
+    def _one(self, p):
+        try:
+            wake_file(p, self.timeout)
+        except Exception:                          # noqa: BLE001 - a nudge only; the real attempt reports problems
+            pass
+
+    def close(self):
+        if self.pool:
+            self.pool.shutdown(wait=False, cancel_futures=True)
+
+
 def ffprobe(path, cfg):
     cmd = ["ffprobe", "-v", "error", "-probesize", str(cfg["probesize"]), "-select_streams", "v:0",
            "-show_entries", "stream=codec_name,width,height,color_transfer:format=duration", "-of", "json", path]
-    r = subprocess.run(low_priority() + cmd, capture_output=True, text=True, timeout=120)
+    tmo = float(cfg.get("probe_timeout") or 300.0)
+    try:
+        r = subprocess.run(low_priority() + cmd, capture_output=True, text=True, timeout=tmo)
+    except subprocess.TimeoutExpired:
+        raise ProbeTimeout(f"ffprobe did not finish within {tmo:.0f} s") from None
     if r.returncode != 0:
         raise RuntimeError("ffprobe: " + (r.stderr.strip() or "failed")[:200])
     j = json.loads(r.stdout or "{}")
@@ -762,7 +822,10 @@ def choose_and_encode(frames, outdir, width0, budget_bytes, jobs):
 def build_entry(rel, src, size, cfg, gov, zscale_ok):
     """Returns True on success. All writes go to the local store; the source is only read."""
     t0 = time.time()
+    t_wake = wake_file(src, float(cfg.get("probe_timeout") or 300.0))
+    t1 = time.time()
     info = ffprobe(src, cfg)
+    t_probe = time.time() - t1
     if cfg.get("share", 1):
         sib = find_sibling(cfg["store"], rel, info["duration"], float(cfg.get("share_tolerance", 2.0)))
         if sib:
@@ -881,7 +944,8 @@ def build_entry(rel, src, size, cfg, gov, zscale_ok):
         os.rename(work, final)
         dt = time.time() - t0
         log(f"built {rel}: {n} thumbs ({len(frames)} read, {stats['fail']} failed reads, {ext.name}), {w}x{h} q{q}, {total / 1e6:.2f} MB "
-            f"(budget {allowed / 1e6:.2f}), {dt:.0f}s total, {n / max(0.1, t_read):.1f} reads/s; "
+            f"(budget {allowed / 1e6:.2f}), {dt:.0f}s total (wake {t_wake:.0f}s, probe {t_probe:.0f}s, read {t_read - t_wake - t_probe:.0f}s), "
+            f"{n / max(0.1, t_read - t_wake - t_probe):.1f} reads/s; "
             f"{stats['retried']} reads retried after decode errors, {stats['suspect']} near-constant grey/white frame(s) read again")
         return True
     finally:
@@ -973,12 +1037,17 @@ def scan_pass(cfg, dry=False):
     gov = Governor(cfg["workers"], cfg["rate_cooldown"])
     done = bad_streak = 0
     t_start = time.time()
-    for k, (mtime, rel, src, size) in enumerate(batch, 1):
+    queue, retried, k = list(batch), set(), 0           # a file that is slow to open goes to the back of the queue once
+    wk = WakeAhead(cfg.get("wake_ahead", 3), float(cfg.get("probe_timeout") or 300.0))
+    while k < len(queue):
+        mtime, rel, src, size = queue[k]
+        k += 1
         if STOP:
             break
         while cfg["yield_to_playback"] and player_running() and not STOP:
             log("a player is running; waiting 5 min")
             sleep_interruptible(300)
+        wk.ahead([q[2] for q in queue[k:k + max(0, int(cfg.get("wake_ahead", 3)))]])
         lk = film_lock(cfg["store"], rel)
         if lk is None:
             log(f"{rel} is being built by another seekthumbs; skipping")
@@ -989,9 +1058,17 @@ def scan_pass(cfg, dry=False):
                 done += 1
                 bad_streak = 0
                 per = (time.time() - t_start) / done
-                log(f"progress: {done}/{len(batch)} films, {per / 60:.1f} min per film so far, about {per * (len(batch) - k) / 60:.0f} min left")
+                log(f"progress: {done}/{len(batch)} films, {per / 60:.1f} min per film so far, about {per * (len(queue) - k) / 60:.0f} min left")
         except KeyboardInterrupt:
             break
+        except ProbeTimeout as ex:
+            if rel not in retried:
+                retried.add(rel)
+                queue.append((mtime, rel, src, size))
+                log(f"SLOW TO OPEN {rel}: {ex}; skipped for now, tried again at the end of this pass (not a failure)")
+            else:
+                log(f"FAILED {rel}: still not opening on the second try: {ex}")
+                state.failed(rel, size, str(ex))
         except Throttled as ex:
             log(f"STOPPING: {ex}")
             state.d["breaker_until"] = time.time() + cfg["breaker_hours"] * 3600
@@ -1012,6 +1089,7 @@ def scan_pass(cfg, dry=False):
             lk.close()
         if cfg["film_pause"]:
             sleep_interruptible(cfg["film_pause"])
+    wk.close()
     left = max(0, len(todo) - done)
     log(f"pass finished: {done} built, {left} still waiting; {gov.throttles} rate-limit signal(s), parallel reads ended at {gov.limit}/{gov.max}")
     return done
@@ -1090,6 +1168,9 @@ def cmd_build(cfg, path, own_process=True):
             log(f"STOPPING: {ex}")
             state.d["breaker_until"] = time.time() + cfg["breaker_hours"] * 3600
             state.save()
+            return 1
+        except ProbeTimeout as ex:
+            log(f"SLOW TO OPEN {rel}: {ex}; not recorded as a failure, it is tried again next time")
             return 1
         except Exception as ex:                # noqa: BLE001
             log(f"FAILED {rel}: {ex}")

@@ -106,6 +106,11 @@ DVD rips, documentaries and sample clips; such films never get thumbnails. Non-v
 `poll` (1800), `settle` (600), `min_size_mb` (300), `skip_tv` (0; 1 = leave out every file whose name has an `S01E02`-style episode tag), `exclude` (empty; a case-insensitive regular expression matched against the path relative to the library, `|` for several, e.g. `exclude = Game.of.Thrones|IMAX`; applies to `plan`/`scan`/`watch` and to `build FILE`, so nothing is built while it plays either; `prune`/`status` ignore it), `max_films` (0 = all), `budget_mb` (10), `safety` (0.8), `seek_timeout` (90 s), `yield_to_playback` (1),
 `breaker_hours` (1), and for the on-play build and sharing: `play_workers` (2, the parallel reads of the on-play build), `play_pause` (2 s rest after each read),
 `play_extractor` (`pyav`: PyAV only | `auto` | `ffmpeg`), `share` (1; 0 = one set per file), `share_tolerance` (2 s), `encode_jobs` (0 = all CPUs; the on-play build uses 2 unless set).
+
+Cold files: on a debrid mount the first touch of a file can take 20 s or more before any data arrives (with the network almost idle), then reads in the same file
+are fast. So before probing a film, seekthumbs reads 1 MB at the start and end of the file to wake it (`probe_timeout`, 300 s, is how long it waits), wakes
+the next `wake_ahead` (3) files in the background so those waits overlap, and a file that is still not answering is skipped, tried again at the end of the
+pass, and never recorded as a failure on the first timeout. The "built" log line shows the wake, probe and read seconds of each film.
 Every setting can also be given on the command line, before or after the subcommand (`./seekthumbs.py scan --max-films 1`).
 The viewer reads `library`, `store` and `min_size_mb` from the same file; `script-opts/seekthumbs.conf` can override them (also `overlay_id`, `ffmpeg`, `debug=yes`,
 `build=no`, `builder=` (set by `install-viewer`), `python=`, `recheck_s`).
