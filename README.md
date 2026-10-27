@@ -2,7 +2,7 @@
 
 ![seekthumbs: seek, preview, explore. Background seek-bar thumbnails for your film library: a read-only rclone film library, a background thumbnail generator (FFmpeg or PyAV), a local thumbnail pack and index, shown on the mpv + uosc seek bar](docs/img/banner.png)
 
-*Illustration, not a screenshot: the film frames are made up, and the viewer has so far been run only under a mocked mpv API, not in real mpv with uosc (see "Open items" below).*
+*Illustration, not a screenshot: the film frames are made up, and the hover preview has since been confirmed in real mpv with uosc on a finished film (2026-10-27); the on-play trigger has not (see "Open items" below).*
 
 > **Part of the [Software Defined Home Theatre](https://github.com/praveenchandrahas/Software-Defined-Home-Theatre) project.** The main repository holds the documentation, build log, results and the installer checks; this is one of its parts. Sibling repositories: [linux-theater-dsp](https://github.com/praveenchandrahas/linux-theater-dsp) (router and CamillaDSP configs) · [mpv-object-audio](https://github.com/praveenchandrahas/mpv-object-audio) (player and Atmos wrapper) · [Roomtone](https://github.com/praveenchandrahas/Roomtone) (measurement, autocal, status page, mpv overlay) · [mpv-shelf](https://github.com/praveenchandrahas/mpv-shelf) (film browser for mpv).
 
@@ -10,7 +10,7 @@ Netflix-style previews on the mpv seek bar (called *trickplay* or *seek thumbnai
 The thumbnails are made in the background and kept in a **local folder**; the library is only ever read.
 
 State (2026-10-27): generator (parallel, adaptive), on-play build, one set per film across releases, watcher, a local web page to pick and run films, cold-file handling, mpv viewer and tests are written and pass on synthetic
-films. **The viewer, and the on-play trigger in particular, have not been run in real mpv/uosc** (the sandbox has neither). The generator has been probed on the owner's
+films. **The hover preview works in real mpv with uosc** (owner, 2026-10-27, on a film whose thumbnails were already built); **the on-play trigger has not yet been reported from real mpv** (the sandbox has neither). The generator has been probed on the owner's
 debrid mount (numbers below). Open items are listed at the end.
 
 **Three ways to get thumbnails, use any of them:** (0) *the web page* (`./seekthumbs.py serve`): tick the films you want, press Start, watch the speed and the progress (see below); (1) *on play* (the default once `install-viewer` has run): the first time you play a film that has none, the viewer starts a
@@ -161,7 +161,7 @@ Limits: the frame check only runs on the PyAV path; PyAV log lines are process-w
    reads is caught only by the 90 s timeout. A hung read in a FUSE mount can block a PyAV worker thread (the ffmpeg command is killed by its timeout).
 3. **The settle check** uses the file's mtime, which on some rclone backends is the original date, not the upload time. A half-uploaded file is caught by
    ffprobe/read failures and the backoff instead.
-4. **The viewer has been run only under a mocked mpv API** (lupa), not in real mpv with uosc. The thumbfast message names are from the thumbfast/uosc sources as I know
+4. **Confirmed in real mpv with uosc (2026-10-27): hovering the seek bar of a film with a finished set shows the preview.** Everything else about the viewer (the on-play trigger, the late-appearing entry below) has been run only under a mocked mpv API (lupa). The thumbfast message names are from the thumbfast/uosc sources as I know
    them and are consistent with what the WebDAV-browser script sends (`script-message-to thumbfast clear`, overlay id 42), but are not checked against his uosc version.
    the `preflight` script of the [sdht](https://github.com/praveenchandrahas/Software-Defined-Home-Theatre) repository lists the mpv `scripts/` and `script-opts/` folders and any uosc/thumbfast versions.
 5. **The on-play trigger** uses mpv's detached `run` and a periodic timer, and tells uosc afterwards with a second `thumbfast-info` message; both are checked only against a
