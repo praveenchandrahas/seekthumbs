@@ -1,0 +1,469 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>seekthumbs</title>
+<style>
+:root{
+  color-scheme:light;
+  --page:#f9f9f7; --surface:#fcfcfb; --ink:#0b0b0b; --ink2:#52514e; --muted:#898781;
+  --grid:#e1e0d9; --axis:#c3c2b7; --ring:rgba(11,11,11,.10); --wash:rgba(11,11,11,.045);
+  --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a;
+  --good:#0ca30c; --goodtext:#006300; --warn:#fab219; --warntext:#8a5a00; --crit:#d03b3b; --crittext:#b02a2a;
+  --accent:#2a78d6; --accent-ink:#fff;
+}
+@media (prefers-color-scheme:dark){
+  :root:where(:not([data-theme="light"])){
+    color-scheme:dark;
+    --page:#0d0d0d; --surface:#1a1a19; --ink:#f0efec; --ink2:#c3c2b7; --muted:#898781;
+    --grid:#2c2c2a; --axis:#383835; --ring:rgba(255,255,255,.10); --wash:rgba(255,255,255,.06);
+    --s1:#3987e5; --s2:#d95926; --s3:#199e70; --goodtext:#0ca30c; --warntext:#fab219; --crittext:#ec6b6b; --accent:#3987e5;
+  }
+}
+:root[data-theme="dark"]{
+  color-scheme:dark;
+  --page:#0d0d0d; --surface:#1a1a19; --ink:#f0efec; --ink2:#c3c2b7; --muted:#898781;
+  --grid:#2c2c2a; --axis:#383835; --ring:rgba(255,255,255,.10); --wash:rgba(255,255,255,.06);
+  --s1:#3987e5; --s2:#d95926; --s3:#199e70; --goodtext:#0ca30c; --warntext:#fab219; --crittext:#ec6b6b; --accent:#3987e5;
+}
+*{box-sizing:border-box}
+html{background:var(--page)}
+body{margin:0;background:var(--page);color:var(--ink);font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
+button,input,select{font:inherit;color:inherit}
+.top{position:sticky;top:0;z-index:5;background:var(--page);border-bottom:1px solid var(--ring)}
+.top-in{max-width:1500px;margin:0 auto;padding:12px 16px;display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+.brand{display:flex;flex-direction:column;margin-right:8px}
+.brand b{font-size:17px;letter-spacing:.2px}
+.brand span{font-size:12px;color:var(--muted);max-width:34ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pill{display:inline-flex;align-items:center;gap:7px;padding:4px 11px;border-radius:999px;border:1px solid var(--ring);background:var(--surface);font-weight:600;font-size:13px}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--muted)}
+.pill.running .dot{background:var(--good);animation:pulse 1.4s ease-in-out infinite}
+.pill.paused .dot{background:var(--warn)}
+.pill.stopping .dot{background:var(--crit)}
+@keyframes pulse{50%{opacity:.35}}
+@media (prefers-reduced-motion:reduce){.pill.running .dot{animation:none}.fill{transition:none!important}}
+.ctl{display:flex;gap:8px;flex-wrap:wrap;margin-left:auto;align-items:center}
+.btn{border:1px solid var(--ring);background:var(--surface);border-radius:8px;padding:7px 13px;cursor:pointer;display:inline-flex;gap:7px;align-items:center;font-weight:600}
+.btn:hover:not(:disabled){background:var(--wash)}
+.btn:disabled{opacity:.45;cursor:default}
+.btn.primary{background:var(--accent);color:var(--accent-ink);border-color:transparent}
+.btn.primary:hover:not(:disabled){filter:brightness(1.08);background:var(--accent)}
+.btn.danger{color:var(--crittext)}
+.btn.on{outline:2px solid var(--accent);outline-offset:-2px}
+.btn.small{padding:4px 9px;font-weight:500;font-size:13px}
+.btn:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible,.row:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.note{max-width:1500px;margin:0 auto;padding:0 16px}
+.note div{margin-top:10px;padding:8px 12px;border-radius:8px;background:var(--surface);border:1px solid var(--ring);color:var(--ink2)}
+.note div.bad{border-color:var(--crit);color:var(--crittext)}
+.app{max-width:1500px;margin:0 auto;padding:16px;display:grid;grid-template-columns:minmax(360px,5fr) 7fr;gap:16px;align-items:start}
+@media (max-width:1000px){.app{grid-template-columns:1fr}.dash{order:-1}}
+.card{background:var(--surface);border:1px solid var(--ring);border-radius:12px;padding:16px}
+.card h2{margin:0 0 2px;font-size:14px;font-weight:650}
+.card .sub{color:var(--muted);font-size:12px;margin-bottom:10px}
+.dash{display:grid;gap:16px}
+/* films */
+.tools{display:grid;gap:8px;margin-bottom:10px}
+.tools .r1{display:flex;gap:8px;flex-wrap:wrap}
+.tools input[type=search]{flex:1 1 160px;min-width:0;padding:7px 10px;border-radius:8px;border:1px solid var(--ring);background:var(--page)}
+.tools select{padding:7px 8px;border-radius:8px;border:1px solid var(--ring);background:var(--page)}
+.tools .r2{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.sel{color:var(--ink2);font-size:13px;margin-right:auto}
+.list{max-height:calc(100vh - 290px);min-height:320px;overflow:auto;border-top:1px solid var(--grid);margin:0 -16px;padding:0 16px}
+.row{display:grid;grid-template-columns:22px 1fr auto;gap:10px;padding:9px 6px;border-bottom:1px solid var(--grid);cursor:pointer;border-radius:6px}
+.row:hover{background:var(--wash)}
+.row.sel{background:color-mix(in srgb,var(--accent) 9%,transparent)}
+.row input{margin-top:3px;width:16px;height:16px;accent-color:var(--accent)}
+.t{font-weight:600}
+.t small{color:var(--muted);font-weight:400;margin-left:6px}
+.tags{display:flex;gap:5px;flex-wrap:wrap;margin-top:3px}
+.tag{font-size:11px;padding:1px 6px;border-radius:5px;border:1px solid var(--ring);color:var(--ink2)}
+.meta{text-align:right;font-size:12px;color:var(--ink2);display:flex;flex-direction:column;align-items:flex-end;gap:4px;white-space:nowrap}
+.chip{display:inline-flex;align-items:center;gap:5px;font-size:12px;font-weight:600}
+.chip.done{color:var(--goodtext)}.chip.new{color:var(--muted)}.chip.q{color:var(--accent)}.chip.fail{color:var(--crittext)}.chip.part{color:var(--warntext)}
+.rel{grid-column:2 / 4;font-size:12px;color:var(--ink2);padding:4px 0 2px}
+.rel div{display:flex;gap:8px;justify-content:space-between;padding:2px 0}
+.rel span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.empty{color:var(--muted);padding:22px 4px;text-align:center}
+/* dashboard */
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
+.tile{background:var(--surface);border:1px solid var(--ring);border-radius:12px;padding:12px 14px}
+.tile .v{font-size:26px;font-weight:650;line-height:1.15}
+.tile .v small{font-size:13px;font-weight:500;color:var(--ink2);margin-left:3px}
+.tile .l{color:var(--ink2);font-size:12px;margin-top:2px}
+.now .title{font-size:19px;font-weight:650}
+.now .title small{color:var(--muted);font-weight:400;font-size:14px;margin-left:6px}
+.phases{display:flex;gap:6px;margin:12px 0 10px;flex-wrap:wrap}
+.ph{flex:1 1 90px;border:1px solid var(--ring);border-radius:8px;padding:6px 9px;color:var(--muted);font-size:12px}
+.ph b{display:block;font-size:13px;color:var(--muted)}
+.ph.cur{border-color:var(--accent);color:var(--ink)}.ph.cur b{color:var(--ink)}
+.ph.ok{color:var(--ink2)}.ph.ok b{color:var(--goodtext)}
+.bar{height:12px;border-radius:6px;background:var(--wash);overflow:hidden}
+.fill{height:100%;background:var(--accent);border-radius:6px;transition:width .6s ease}
+.bar.paused .fill{background:var(--warn)}
+.nums{display:flex;gap:18px;flex-wrap:wrap;margin-top:10px;color:var(--ink2)}
+.nums b{color:var(--ink);font-size:16px}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media (max-width:1250px){.two{grid-template-columns:1fr}}
+.chart{width:100%;display:block}
+.chart text{fill:var(--muted);font-size:11px}
+.chart .gl{stroke:var(--grid);stroke-width:1}
+.chart .ax{stroke:var(--axis);stroke-width:1}
+.chart .ln{fill:none;stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
+.chart .xh{stroke:var(--axis);stroke-width:1}
+.tip{position:fixed;z-index:20;pointer-events:none;background:var(--surface);border:1px solid var(--ring);box-shadow:0 4px 18px rgba(0,0,0,.18);border-radius:8px;padding:7px 10px;font-size:12px;max-width:260px}
+.tip b{font-size:14px;display:block}
+.tip i{display:inline-block;width:12px;height:3px;border-radius:2px;margin-right:6px;vertical-align:middle}
+.legend{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--ink2);margin:6px 0 2px}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px;vertical-align:-1px}
+.hbars{display:grid;gap:6px;margin-top:8px}
+.hb{display:grid;grid-template-columns:minmax(80px,150px) 1fr 62px;gap:10px;align-items:center;font-size:12px}
+.hb .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--ink2)}
+.hb .tr{display:flex;gap:2px;height:16px}
+.hb .seg{height:100%;min-width:2px}
+.hb .seg:last-child{border-radius:0 4px 4px 0}
+.hb .seg:first-child{border-radius:0}
+.hb .seg:hover{filter:brightness(1.15)}
+.hb .tot{text-align:right;color:var(--ink);font-variant-numeric:tabular-nums}
+.stack{display:flex;gap:2px;height:20px;margin:10px 0 6px}
+.stack div{height:100%;min-width:3px;border-radius:0}
+.stack div:last-child{border-radius:0 5px 5px 0}
+.q-list{display:grid;gap:2px;max-height:240px;overflow:auto}
+.qi{display:grid;grid-template-columns:24px 1fr auto auto auto;gap:8px;align-items:center;padding:5px 2px;border-bottom:1px solid var(--grid)}
+.qi .n{color:var(--muted);font-variant-numeric:tabular-nums}
+.ic{border:0;background:transparent;cursor:pointer;padding:3px 7px;border-radius:6px;color:var(--ink2)}
+.ic:hover{background:var(--wash)}
+table.dt{width:100%;border-collapse:collapse;font-size:12px;margin-top:8px}
+table.dt th,table.dt td{padding:3px 6px;border-bottom:1px solid var(--grid);text-align:right}
+table.dt th:first-child,table.dt td:first-child{text-align:left}
+table.dt th{color:var(--muted);font-weight:500}
+pre.log{margin:8px 0 0;max-height:260px;overflow:auto;background:var(--page);border:1px solid var(--grid);border-radius:8px;padding:8px 10px;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;word-break:break-all;color:var(--ink2)}
+details summary{cursor:pointer;font-weight:650;font-size:14px}
+.pop{position:absolute;right:16px;top:58px;z-index:10;width:300px;background:var(--surface);border:1px solid var(--ring);border-radius:12px;padding:14px;box-shadow:0 8px 28px rgba(0,0,0,.2)}
+.pop label{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center;margin:8px 0;color:var(--ink2)}
+.pop input[type=number]{width:70px;padding:5px 7px;border-radius:7px;border:1px solid var(--ring);background:var(--page)}
+.pop p{margin:8px 0 0;color:var(--muted);font-size:12px}
+[hidden]{display:none!important}
+</style>
+</head>
+<body>
+<header class="top"><div class="top-in">
+  <div class="brand"><b>seekthumbs</b><span id="libpath">…</span></div>
+  <span class="pill idle" id="pill"><span class="dot"></span><span id="pilltxt">Idle</span></span>
+  <div class="ctl">
+    <button class="btn primary" id="bStart">▶ Start</button>
+    <button class="btn" id="bPause">❚❚ Pause</button>
+    <button class="btn" id="bResume" hidden>▶ Resume</button>
+    <button class="btn danger" id="bStop" title="Stops now and throws away the film that is being read">■ Stop</button>
+    <button class="btn" id="bAfter" title="Finish the film that is being read, then stop">Stop after this film</button>
+    <button class="btn" id="bSet" aria-expanded="false" aria-controls="pop">⚙ Settings</button>
+    <button class="btn" id="bTheme" aria-label="Switch between light and dark" title="Light / dark">Theme</button>
+  </div>
+</div>
+<div class="pop" id="pop" hidden>
+  <b>Next film onwards</b>
+  <label>Parallel reads <input type="number" id="sWorkers" min="1" max="16"></label>
+  <label>Rest after each read (s) <input type="number" id="sPause" min="0" max="30" step="0.5"></label>
+  <label>Wait while a player runs <input type="checkbox" id="sYield"></label>
+  <p>Changes apply from the next film. They are not written to your config file.</p>
+</div></header>
+<div class="note" id="note"></div>
+
+<main class="app">
+<section class="card" aria-label="Films">
+  <h2>Films</h2>
+  <div class="sub" id="libsub">One row per film; its releases are grouped, and the smallest one is read.</div>
+  <div class="tools">
+    <div class="r1">
+      <input type="search" id="q" placeholder="Search a title" aria-label="Search a title">
+      <select id="flt" aria-label="Show">
+        <option value="all">All</option><option value="new">Not built</option><option value="done">Done</option>
+        <option value="queued">Queued</option><option value="failed">Failed</option>
+      </select>
+      <select id="srt" aria-label="Sort">
+        <option value="title">Title</option><option value="size">Size, largest first</option><option value="newest">Newest first</option>
+      </select>
+    </div>
+    <div class="r2">
+      <span class="sel" id="selTxt">Nothing selected</span>
+      <button class="btn small" id="bNew">Select not built</button>
+      <button class="btn small" id="bNone">Clear</button>
+      <button class="btn small primary" id="bAdd" disabled>Add to queue</button>
+    </div>
+  </div>
+  <div class="list" id="list" tabindex="-1"></div>
+</section>
+
+<div class="dash">
+  <section class="card now" aria-label="Now">
+    <h2>Now</h2>
+    <div id="now"></div>
+  </section>
+  <div class="tiles" id="tiles"></div>
+  <div class="two">
+    <section class="card"><h2>Speed</h2><div class="sub">thumbnails read per second</div><div id="cSpeed"></div>
+      <details><summary class="btn small" style="display:inline-flex;margin-top:6px">Table</summary><div id="tSpeed"></div></details></section>
+    <section class="card"><h2>Network</h2><div class="sub">MB/s received by this whole computer, so other downloads count too</div><div id="cNet"></div>
+      <details><summary class="btn small" style="display:inline-flex;margin-top:6px">Table</summary><div id="tNet"></div></details></section>
+  </div>
+  <div class="two">
+    <section class="card"><h2>Time per film</h2><div class="sub">this session, newest at the top</div>
+      <div class="legend"><span><i style="background:var(--s2)"></i>Wake</span><span><i style="background:var(--s3)"></i>Probe</span><span><i style="background:var(--s1)"></i>Read</span></div>
+      <div class="hbars" id="cTime"></div>
+      <details><summary class="btn small" style="display:inline-flex;margin-top:8px">Table</summary><div id="tTime"></div></details></section>
+    <section class="card"><h2>Coverage</h2><div class="sub" id="covSub">films with seek thumbnails</div>
+      <div class="stack" id="cov"></div><div class="legend" id="covLeg"></div></section>
+  </div>
+  <section class="card"><h2>Queue</h2><div class="sub" id="qsub">Tick films on the left, then Add to queue.</div>
+    <div class="q-list" id="queue"></div>
+    <div style="margin-top:10px;display:flex;gap:8px"><button class="btn small" id="bClear">Clear queue</button><button class="btn small" id="bRefresh" title="Read the library folder again">Rescan library</button></div></section>
+  <section class="card"><details id="logd"><summary>Log</summary><pre class="log" id="log">…</pre></details></section>
+</div>
+</main>
+<div class="tip" id="tip" hidden></div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const el = (tag, attrs, ...kids) => {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (k === "class") e.className = v; else if (k.startsWith("on")) e.addEventListener(k.slice(2), v); else if (v !== null && v !== undefined && v !== false) e.setAttribute(k, v === true ? "" : v);
+  }
+  for (const c of kids.flat()) if (c !== null && c !== undefined && c !== false) e.append(c.nodeType ? c : document.createTextNode(String(c)));
+  return e;
+};
+const store = { get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }, set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} } };
+
+/* token: taken from the address once, kept for this tab, removed from the address bar */
+let TOKEN = new URLSearchParams(location.search).get("t");
+try { if (TOKEN) sessionStorage.setItem("st-token", TOKEN); else TOKEN = sessionStorage.getItem("st-token"); } catch (e) {}
+if (new URLSearchParams(location.search).has("t")) history.replaceState(null, "", location.pathname);
+
+async function api(path, body) {
+  const opt = { headers: { "X-Token": TOKEN || "" } };
+  if (body !== undefined) { opt.method = "POST"; opt.headers["Content-Type"] = "application/json"; opt.body = JSON.stringify(body); }
+  const r = await fetch(path, opt);
+  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.statusText);
+  return r.json();
+}
+
+const gb = (b) => b < 1e8 ? (b / 1e6).toFixed(0) + " MB" : (b / 1e9 >= 10 ? (b / 1e9).toFixed(0) : (b / 1e9).toFixed(1)) + " GB";
+const mb = (b) => b >= 1e9 ? (b / 1e9).toFixed(2) + " GB" : (b / 1e6).toFixed(b < 1e7 ? 1 : 0) + " MB";
+const dur = (s) => { if (s === null || s === undefined || !isFinite(s)) return "–"; s = Math.round(s); if (s < 60) return s + " s"; const m = Math.round(s / 60); if (m < 60) return m + " min"; const h = Math.floor(m / 60); return h + " h " + String(m % 60).padStart(2, "0") + " min"; };
+
+let lib = null, status = null, rev = -1, selected = new Set(), expanded = new Set(), lastErr = 0;
+
+/* ---------- theme ---------- */
+(function () { const t = store.get("st-theme"); if (t === "light" || t === "dark") document.documentElement.dataset.theme = t; })();
+$("bTheme").onclick = () => {
+  const dark = matchMedia("(prefers-color-scheme:dark)").matches;
+  const cur = document.documentElement.dataset.theme || (dark ? "dark" : "light");
+  const nxt = cur === "dark" ? "light" : "dark";
+  document.documentElement.dataset.theme = nxt; store.set("st-theme", nxt); redraw();
+};
+
+/* ---------- controls ---------- */
+const ctl = (a) => api("/api/control", { action: a }).then(poll).catch(showErr);
+$("bStart").onclick = () => ctl("start");
+$("bPause").onclick = () => ctl("pause");
+$("bResume").onclick = () => ctl("resume");
+$("bStop").onclick = () => ctl("stop");
+$("bAfter").onclick = () => ctl("stop_after");
+$("bSet").onclick = () => { const p = $("pop"); p.hidden = !p.hidden; $("bSet").setAttribute("aria-expanded", String(!p.hidden)); };
+const saveSettings = () => api("/api/settings", { workers: +$("sWorkers").value, pause: +$("sPause").value, yield_to_playback: $("sYield").checked }).catch(showErr);
+["sWorkers", "sPause", "sYield"].forEach((i) => $(i).addEventListener("change", saveSettings));
+$("bClear").onclick = () => api("/api/queue", { clear: true }).then(poll).catch(showErr);
+$("bRefresh").onclick = () => api("/api/library?refresh=1").then((l) => { lib = l; drawList(); drawDash(); }).catch(showErr);
+$("bAdd").onclick = async () => {
+  const ids = visible().filter((f) => selected.has(f.id)).map((f) => f.id).concat([...selected].filter((i) => !visible().some((f) => f.id === i)));
+  try { await api("/api/queue", { add: ids }); selected.clear(); await poll(); } catch (e) { showErr(e); }
+};
+$("bNone").onclick = () => { selected.clear(); drawList(); };
+$("bNew").onclick = () => { visible().filter((f) => f.status !== "done" && !f.queued && !f.running && !f.failed).forEach((f) => selected.add(f.id)); drawList(); };
+["q", "flt", "srt"].forEach((i) => $(i).addEventListener("input", drawList));
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") { $("pop").hidden = true; $("bSet").setAttribute("aria-expanded", "false"); } });
+
+function showErr(e) { const n = $("note"); n.replaceChildren(el("div", { class: "bad", role: "alert" }, String(e.message || e))); lastErr = Date.now(); }
+
+/* ---------- film list ---------- */
+function visible() {
+  if (!lib) return [];
+  const q = $("q").value.trim().toLowerCase(), f = $("flt").value, s = $("srt").value;
+  let a = lib.films.filter((x) => (!q || (x.title + " " + (x.year || "")).toLowerCase().includes(q)) &&
+    (f === "all" || (f === "new" && x.status !== "done") || (f === "done" && x.status === "done") || (f === "queued" && (x.queued || x.running)) || (f === "failed" && x.failed)));
+  if (s === "size") a.sort((x, y) => y.size - x.size); else if (s === "newest") a.sort((x, y) => y.newest - x.newest);
+  return a;
+}
+function chipFor(f) {
+  if (f.running) return el("span", { class: "chip q" }, "● Building");
+  if (f.queued) return el("span", { class: "chip q" }, "◷ Queued #" + f.queued);
+  if (f.failed) return el("span", { class: "chip fail", title: f.failed }, "! Failed");
+  if (f.status === "done") return el("span", { class: "chip done" }, "✓ Done");
+  if (f.status === "partial") return el("span", { class: "chip part" }, "◐ Partly");
+  return el("span", { class: "chip new" }, "○ Not built");
+}
+function drawList() {
+  if (!lib) return;
+  const L = $("list"), keep = L.scrollTop, rows = visible();
+  L.replaceChildren(...(rows.length ? rows.map((f) => {
+    const tags = [...new Set(f.releases[0].tags)];
+    const row = el("div", { class: "row" + (selected.has(f.id) ? " sel" : ""), tabindex: "0", role: "checkbox", "aria-checked": String(selected.has(f.id)), "data-id": f.id },
+      el("input", { type: "checkbox", tabindex: "-1", "aria-hidden": "true" }),
+      el("div", {}, el("div", { class: "t" }, f.title, f.year ? el("small", {}, f.year) : null), el("div", { class: "tags" }, tags.map((t) => el("span", { class: "tag" }, t)))),
+      el("div", { class: "meta" }, chipFor(f), el("span", {}, gb(f.size) + (f.releases.length > 1 ? " · " + f.releases.length + " releases" : "")),
+        f.thumbs ? el("span", {}, f.thumbs.count + " thumbnails · " + mb(f.thumbs.kb * 1000) + (f.thumbs.shared ? " (shared)" : "")) : null,
+        f.releases.length > 1 ? el("button", { class: "ic", "aria-expanded": String(expanded.has(f.id)), onclick: (e) => { e.stopPropagation(); expanded.has(f.id) ? expanded.delete(f.id) : expanded.add(f.id); drawList(); } }, expanded.has(f.id) ? "hide" : "show") : null));
+    row.querySelector("input").checked = selected.has(f.id);
+    if (expanded.has(f.id)) row.append(el("div", { class: "rel" }, f.releases.map((r) => el("div", {}, el("span", { title: r.name }, (r.done ? "✓ " : "○ ") + r.name), el("span", {}, r.tags.join(" ") + " · " + gb(r.size))))));
+    const toggle = () => { selected.has(f.id) ? selected.delete(f.id) : selected.add(f.id); drawList(); };
+    row.addEventListener("click", toggle);
+    row.addEventListener("keydown", (e) => { if (e.key === " " || e.key === "Enter") { e.preventDefault(); toggle(); L.querySelector('[data-id="' + f.id + '"]').focus(); } });
+    return row;
+  }) : [el("div", { class: "empty" }, lib.films.length ? "No film matches." : "No films found. Check library= and min_size_mb in your config.")]));
+  L.scrollTop = keep;
+  const sel = lib.films.filter((f) => selected.has(f.id));
+  const tot = sel.reduce((a, f) => a + f.size, 0);
+  $("selTxt").textContent = sel.length ? sel.length + " selected · " + gb(tot) + " source" : "Nothing selected";
+  $("bAdd").disabled = !sel.length; $("bAdd").textContent = sel.length ? "Add " + sel.length + " to queue" : "Add to queue";
+  $("libsub").textContent = lib.films.length + " films" + (lib.hidden ? " (" + lib.hidden + " files left out by skip_tv / exclude)" : "") + " · one row per film; the smallest release is read, the others share it.";
+}
+
+/* ---------- dashboard ---------- */
+function drawNow() {
+  const s = status, c = s.current, box = $("now");
+  if (!c) {
+    box.replaceChildren(el("div", { style: "color:var(--ink2)" }, s.queue.length ? "Nothing is being built. " + s.queue.length + " film" + (s.queue.length > 1 ? "s" : "") + " in the queue; press Start." : "Nothing is being built. Tick films on the left and add them to the queue."));
+    return;
+  }
+  const order = ["waking", "probing", "reading", "encoding"], names = ["Wake", "Probe", "Read", "Save"];
+  const at = order.indexOf(c.phase);
+  const pct = c.n ? Math.min(100, c.ok / c.n * 100) : 0;
+  const detail = [c.wake ? dur(c.wake) : "", c.probe ? dur(c.probe) : "", c.read_elapsed !== null ? dur(c.read_elapsed) : "", ""];
+  box.replaceChildren(
+    el("div", { class: "title" }, c.title, c.paused ? el("small", {}, "paused") : null),
+    el("div", { class: "phases" }, names.map((n, i) => el("div", { class: "ph " + (i < at || c.phase === "shared" || c.phase === "done" ? "ok" : i === at ? "cur" : "") }, el("b", {}, (i < at ? "✓ " : "") + n), detail[i] || (i === at ? "working…" : "–")))),
+    el("div", { class: "bar" + (c.paused ? " paused" : ""), role: "progressbar", "aria-valuemin": "0", "aria-valuemax": String(c.n || 0), "aria-valuenow": String(c.ok) }, el("div", { class: "fill", style: "width:" + pct + "%" })),
+    el("div", { class: "nums" },
+      el("span", {}, el("b", {}, c.n ? c.ok + " / " + c.n : "–"), " thumbnails"),
+      el("span", {}, el("b", {}, c.rate !== null ? c.rate.toFixed(2) : "–"), " per second"),
+      el("span", {}, "about ", el("b", {}, c.left !== null ? dur(c.left) : "–"), " left"),
+      el("span", {}, "elapsed ", el("b", {}, dur(c.elapsed))),
+      c.fail ? el("span", { style: "color:var(--crittext)" }, "! " + c.fail + " failed reads") : null,
+      c.retried ? el("span", {}, c.retried + " retried after decode errors") : null));
+}
+function tile(v, unit, label) { return el("div", { class: "tile" }, el("div", { class: "v" }, v, unit ? el("small", {}, unit) : null), el("div", { class: "l" }, label)); }
+function drawTiles() {
+  const t = status.totals, f = lib ? lib.films : [], done = f.filter((x) => x.status === "done").length;
+  $("tiles").replaceChildren(
+    tile(String(t.films), "", "films built this session" + (t.aliases ? " (+" + t.aliases + " shared)" : "")),
+    tile(String(t.thumbs), "", "thumbnails written"),
+    tile(lib ? mb(lib.store.bytes) : "–", "", "size of the whole store"),
+    tile(done + " / " + f.length, "", "films with thumbnails"),
+    tile(t.src_bytes ? gb(t.src_bytes) : "–", "", "of film files covered"),
+    tile(t.avg_seconds ? dur(t.avg_seconds) : "–", "", "average per film"),
+    tile(t.eta_seconds ? dur(t.eta_seconds) : "–", "", "estimate for the queue (" + t.to_build + " to build)"));
+}
+function lineChart(host, xs, ys, color, unit, tableHost, label) {
+  host.replaceChildren();
+  const pts = xs.map((x, i) => [x, ys[i]]).filter((p) => p[1] !== null);
+  if (pts.length < 3) { host.append(el("div", { class: "empty" }, "Fills in once a film is being read.")); tableHost.replaceChildren(); return; }
+  const W = Math.max(260, host.clientWidth || 360), H = 150, m = { l: 38, r: 8, t: 8, b: 20 };
+  const raw = Math.max(...pts.map((p) => p[1]), 0);
+  if (raw <= 0) { host.append(el("div", { class: "empty" }, "Nothing yet. This fills in while a film is being read.")); tableHost.replaceChildren(); return; }
+  const ymax = [0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000].find((n) => n >= raw * 1.05) || raw * 1.1, x0 = pts[0][0], x1 = pts[pts.length - 1][0];
+  const fmt = (v) => v >= 10 ? v.toFixed(0) : v >= 1 ? v.toFixed(1) : v.toFixed(2);
+  const X = (x) => m.l + (x - x0) / Math.max(1, x1 - x0) * (W - m.l - m.r), Y = (y) => H - m.b - y / ymax * (H - m.t - m.b);
+  const ns = "http://www.w3.org/2000/svg", S = (t, a) => { const e = document.createElementNS(ns, t); for (const k in a) e.setAttribute(k, a[k]); return e; };
+  const svg = S("svg", { class: "chart", viewBox: "0 0 " + W + " " + H, role: "img", "aria-label": label });
+  for (let i = 0; i <= 2; i++) { const y = Y(ymax * i / 2); svg.append(S("line", { x1: m.l, x2: W - m.r, y1: y, y2: y, class: i ? "gl" : "ax" })); const tx = S("text", { x: m.l - 5, y: y + 4, "text-anchor": "end" }); tx.textContent = fmt(ymax * i / 2); svg.append(tx); }
+  const t0 = S("text", { x: m.l, y: H - 4 }); t0.textContent = dur(x1 - x0) + " ago"; svg.append(t0);
+  const t1 = S("text", { x: W - m.r, y: H - 4, "text-anchor": "end" }); t1.textContent = "now"; svg.append(t1);
+  svg.append(S("polyline", { class: "ln", stroke: color, points: pts.map((p) => X(p[0]).toFixed(1) + "," + Y(p[1]).toFixed(1)).join(" ") }));
+  const xh = S("line", { class: "xh", y1: m.t, y2: H - m.b, visibility: "hidden" }), dot = S("circle", { r: 4, fill: color, stroke: "var(--surface)", "stroke-width": 2, visibility: "hidden" });
+  svg.append(xh, dot);
+  const tip = $("tip");
+  const move = (ev) => {
+    const r = svg.getBoundingClientRect(), px = (ev.clientX - r.left) / r.width * W;
+    let best = 0; for (let i = 1; i < pts.length; i++) if (Math.abs(X(pts[i][0]) - px) < Math.abs(X(pts[best][0]) - px)) best = i;
+    const p = pts[best]; xh.setAttribute("x1", X(p[0])); xh.setAttribute("x2", X(p[0])); xh.setAttribute("visibility", "visible"); dot.setAttribute("cx", X(p[0])); dot.setAttribute("cy", Y(p[1])); dot.setAttribute("visibility", "visible");
+    tip.hidden = false; tip.replaceChildren(el("b", {}, fmt(p[1]) + " " + unit), el("span", { style: "color:var(--ink2)" }, new Date(p[0] * 1000).toLocaleTimeString()));
+    tip.style.left = Math.min(innerWidth - 240, ev.clientX + 14) + "px"; tip.style.top = (ev.clientY + 14) + "px";
+  };
+  svg.addEventListener("pointermove", move); svg.addEventListener("pointerleave", () => { tip.hidden = true; xh.setAttribute("visibility", "hidden"); dot.setAttribute("visibility", "hidden"); });
+  host.append(svg);
+  const step = Math.max(1, Math.floor(pts.length / 12)), rows = pts.filter((_, i) => i % step === 0).slice(-12);
+  tableHost.replaceChildren(el("table", { class: "dt" }, el("tr", {}, el("th", {}, "Time"), el("th", {}, unit)), rows.map((p) => el("tr", {}, el("td", {}, new Date(p[0] * 1000).toLocaleTimeString()), el("td", {}, fmt(p[1]))))));
+}
+function drawTime() {
+  const h = status.history.filter((x) => x.status === "built" || x.status === "failed" || x.status === "slow").slice().reverse().slice(0, 14), host = $("cTime");
+  if (!h.length) { host.replaceChildren(el("div", { class: "empty" }, "Shows up when the first film is done.")); $("tTime").replaceChildren(); return; }
+  const mx = Math.max(...h.map((x) => x.seconds));
+  const tip = $("tip");
+  host.replaceChildren(...h.map((x) => {
+    const read = Math.max(0, x.seconds - x.wake - x.probe), parts = [["Wake", x.wake, "var(--s2)"], ["Probe", x.probe, "var(--s3)"], ["Read", read, "var(--s1)"]];
+    const tr = el("div", { class: "tr", style: "width:" + Math.max(4, x.seconds / mx * 100) + "%" }, parts.filter((p) => p[1] > 0).map((p) => {
+      const s = el("div", { class: "seg", style: "flex:" + p[1] + " 1 0;background:" + p[2], tabindex: "0", "aria-label": p[0] + " " + dur(p[1]) });
+      const show = (ev) => { const r = s.getBoundingClientRect(); tip.hidden = false; tip.replaceChildren(el("b", {}, dur(p[1])), el("span", { style: "color:var(--ink2)" }, p[0] + " · " + x.title)); tip.style.left = Math.min(innerWidth - 240, (ev.clientX || r.left) + 12) + "px"; tip.style.top = ((ev.clientY || r.bottom) + 14) + "px"; };
+      s.addEventListener("pointermove", show); s.addEventListener("focus", show); s.addEventListener("pointerleave", () => tip.hidden = true); s.addEventListener("blur", () => tip.hidden = true);
+      return s;
+    }));
+    return el("div", { class: "hb" }, el("span", { class: "nm", title: x.title }, (x.status === "failed" ? "! " : "") + x.title), el("div", { style: "min-width:0" }, tr), el("span", { class: "tot" }, dur(x.seconds)));
+  }));
+  $("tTime").replaceChildren(el("table", { class: "dt" }, el("tr", {}, ["Film", "Wake", "Probe", "Read", "Total", "Thumbs", "Failed"].map((t) => el("th", {}, t))),
+    h.map((x) => el("tr", {}, el("td", {}, x.title), el("td", {}, dur(x.wake)), el("td", {}, dur(x.probe)), el("td", {}, dur(Math.max(0, x.seconds - x.wake - x.probe))), el("td", {}, dur(x.seconds)), el("td", {}, x.thumbs + "/" + x.n), el("td", {}, String(x.fail))))));
+}
+function drawCoverage() {
+  if (!lib) return;
+  const f = lib.films, n = f.length || 1;
+  const done = f.filter((x) => x.status === "done").length, failed = f.filter((x) => x.failed && x.status !== "done").length,
+    queued = f.filter((x) => (x.queued || x.running) && x.status !== "done").length, rest = f.length - done - failed - queued;
+  const parts = [["✓ Done", done, "var(--good)"], ["◷ Queued", queued, "var(--s1)"], ["○ Not built", rest, "var(--muted)"], ["! Failed", failed, "var(--crit)"]];
+  $("cov").replaceChildren(...parts.filter((p) => p[1] > 0).map((p) => el("div", { style: "flex:" + p[1] + " 1 0;background:" + p[2], title: p[0] + ": " + p[1] })));
+  $("covLeg").replaceChildren(...parts.map((p) => el("span", {}, el("i", { style: "background:" + p[2] }), p[0] + " " + p[1])));
+  $("covSub").textContent = done + " of " + f.length + " films (" + Math.round(done / n * 100) + " %) have seek thumbnails";
+}
+function drawQueue() {
+  const q = status.queue, host = $("queue");
+  $("qsub").textContent = q.length ? q.length + " in the queue, read from the top" : "Tick films on the left, then Add to queue.";
+  host.replaceChildren(...q.map((x, i) => el("div", { class: "qi" }, el("span", { class: "n" }, i + 1), el("span", {}, x.title, x.year ? " (" + x.year + ")" : ""), el("span", { style: "color:var(--muted)" }, gb(x.size)),
+    el("button", { class: "ic", title: "Move to the top", "aria-label": "Move " + x.title + " to the top", onclick: () => api("/api/queue", { top_ids: [x.id] }).then(poll) }, "↑"),
+    el("button", { class: "ic", title: "Remove", "aria-label": "Remove " + x.title, onclick: () => api("/api/queue", { remove: [x.id] }).then(poll) }, "×"))));
+}
+function drawChrome() {
+  const s = status, st = s.state, running = st === "running", paused = st === "paused";
+  const label = { idle: "Idle", running: "Running", paused: "Paused", stopping: "Stopping…" }[st] || st;
+  $("pill").className = "pill " + st; $("pilltxt").textContent = label + (s.stop_after ? " · stops after this film" : "");
+  $("bStart").hidden = running || paused || st === "stopping"; $("bPause").hidden = !running; $("bResume").hidden = !paused;
+  $("bStart").disabled = !s.queue.length; $("bStop").disabled = !(running || paused); $("bAfter").disabled = !(running || paused);
+  $("bAfter").classList.toggle("on", s.stop_after);
+  const a = document.activeElement; if (!["sWorkers", "sPause"].includes(a && a.id)) { $("sWorkers").value = s.settings.workers; $("sPause").value = s.settings.pause; }
+  $("sYield").checked = s.settings.yield_to_playback;
+  if (Date.now() - lastErr > 6000) $("note").replaceChildren(...(s.note ? [el("div", {}, s.note)] : []));
+}
+function drawDash() {
+  if (!status) return;
+  drawChrome(); drawNow(); drawTiles(); drawQueue(); drawTime(); drawCoverage();
+  const se = status.series;
+  lineChart($("cSpeed"), se.t, se.rate, "var(--s1)", "thumbnails/s", $("tSpeed"), "Thumbnails read per second over time");
+  lineChart($("cNet"), se.t, se.net, "var(--s2)", "MB/s", $("tNet"), "Network received by this computer, MB per second");
+}
+function redraw() { drawList(); drawDash(); }
+
+/* ---------- polling ---------- */
+let busy = false;
+async function poll() {
+  if (busy) return; busy = true;
+  try {
+    status = await api("/api/status");
+    if (status.rev !== rev || !lib) { lib = await api("/api/library"); rev = status.rev; $("libpath").textContent = lib.library; $("libpath").title = lib.library; drawList(); }
+    drawDash();
+  } catch (e) { if (!TOKEN) showErr(new Error("Open the address that `seekthumbs.py serve` printed (it includes the token).")); else showErr(e); }
+  finally { busy = false; }
+}
+async function pollLog() { if (!$("logd").open) return; try { const r = await api("/api/log?n=60"); const p = $("log"), stick = p.scrollTop + p.clientHeight >= p.scrollHeight - 20; p.textContent = r.lines.join("\n") || "(nothing yet)"; if (stick) p.scrollTop = p.scrollHeight; } catch (e) {} }
+poll(); setInterval(poll, 1000); setInterval(pollLog, 2500); $("logd").addEventListener("toggle", pollLog);
+let rz; addEventListener("resize", () => { clearTimeout(rz); rz = setTimeout(drawDash, 150); });
+</script>
+</body>
+</html>

@@ -41,6 +41,27 @@ cd seekthumbs      # this repository
 and by the viewer's on-play check alike** (the viewer reads the same `config.ini` value and passes it to the build). At 20000 that excludes all 1080p encodes under 20 GB,
 DVD rips, documentaries and sample clips; such films never get thumbnails. Non-video files (`.iso`, `.rar`, `.nfo`, ...) are never considered whatever their size.
 
+## The web page: pick the films yourself
+
+```bash
+./seekthumbs.py serve            # prints an address with a one-time token; open it in your browser (add --open to do that for you)
+```
+
+![The seekthumbs page while it works: the film list with checkboxes on the left; on the right the film being read, its phases, speed and network charts, time per film, coverage and the queue](docs/img/web-dark.png)
+
+*Screenshot of the page running on a small library of synthetic films (so the sizes and times are tiny).*
+
+One row per film (its releases are grouped, and the smallest one is read); tick the ones you want, press **Add to queue**, then **Start**. The buttons:
+**Pause** freezes the reads where they are and **Resume** carries on from the same thumbnail; **Stop** ends now and throws away the film being read (it goes back to the
+top of the queue); **Stop after this film** finishes the current film and then stops. The settings pop-over changes the parallel reads, the rest after each read and
+whether it waits while a player runs, from the next film on (nothing is written to your config). The panels show the phase of the film being read (wake, probe, read, save),
+thumbnails per second, the network speed of the whole computer (so other downloads count), how long each finished film took and where the time went, the size of the
+store, and how much of the library is covered. Every chart has a Table view, and the log is at the bottom.
+
+It listens on 127.0.0.1 only and every request needs the token; the Host header must be this computer; the page cannot name a file, only pick films that seekthumbs itself
+listed. It reads the library and writes the thumbnail store, nothing else. The queue is saved in the store (`.web-queue.json`), so closing the page keeps it. Do not run
+`scan` or `watch` at the same time as a Start from the page (one film is never built twice, but the two would compete for the mount).
+
 ## How it works
 
 - **Extraction:** one `ffprobe` per film, then one `ffmpeg` per thumbnail: `-ss <t> -i FILE -noaccurate_seek -frames:v 1`, so ffmpeg jumps to the

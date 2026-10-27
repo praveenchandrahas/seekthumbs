@@ -469,6 +469,48 @@ class ProbeTimeout(Exception):
     'slow', not 'broken': the scan skips the file and tries it again at the end of the pass instead of recording a failure."""
 
 
+class JobStopped(Exception):
+    """The owner stopped the build from the web page; the partial work is thrown away."""
+
+
+class Job:
+    """Live state of one build, shared with the web page: phase, counts, pause and stop. Only the web page creates one; the command line never does."""
+
+    def __init__(self, rel, title=""):
+        self.rel, self.title = rel, title
+        self.phase = "starting"                      # waking, probing, reading, encoding
+        self.n, self.stats = 0, dict(ok=0, fail=0, retried=0, suspect=0)
+        self.t0 = time.time()
+        self.t_wake = self.t_probe = 0.0
+        self.t_read0 = None
+        self.shared = False
+        self.bytes = 0
+        self.stopped = False
+        self._go = threading.Event()
+        self._go.set()
+
+    def pause(self):
+        self._go.clear()
+
+    def resume(self):
+        self._go.set()
+
+    @property
+    def paused(self):
+        return not self._go.is_set()
+
+    def stop(self):
+        self.stopped = True
+        self._go.set()
+
+    def checkpoint(self):
+        """Blocks while paused. False when the build should end (stopped, or the program is shutting down)."""
+        while not self._go.wait(0.5):
+            if STOP or self.stopped:
+                break
+        return not (self.stopped or STOP)
+
+
 def wake_file(path, timeout):
     """Reads 1 MB at the start and at the end of the file (where MKV keeps its header and its index) so the mount has the file ready before ffprobe and
     PyAV need it. Returns the seconds it took; raises ProbeTimeout if the first touch is still not answered after `timeout` seconds."""
@@ -822,14 +864,25 @@ def choose_and_encode(frames, outdir, width0, budget_bytes, jobs):
 def build_entry(rel, src, size, cfg, gov, zscale_ok):
     """Returns True on success. All writes go to the local store; the source is only read."""
     t0 = time.time()
+    job = cfg.get("_job")
+    if job:
+        job.phase = "waking"
     t_wake = wake_file(src, float(cfg.get("probe_timeout") or 300.0))
     t1 = time.time()
+    if job:
+        job.t_wake, job.phase = t_wake, "probing"
+        if job.stopped:
+            raise JobStopped()
     info = ffprobe(src, cfg)
     t_probe = time.time() - t1
+    if job:
+        job.t_probe = t_probe
     if cfg.get("share", 1):
         sib = find_sibling(cfg["store"], rel, info["duration"], float(cfg.get("share_tolerance", 2.0)))
         if sib:
             write_alias(cfg["store"], rel, size, info["duration"], sib[2], sib[1])
+            if job:
+                job.shared, job.phase = True, "shared"
             log(f"shared {rel}: same film as {sib[2]} (runtimes {sib[0]:.1f} s apart); no thumbnails built")
             return True
     n = max(1, int(info["duration"] // cfg["interval"]))
@@ -840,15 +893,19 @@ def build_entry(rel, src, size, cfg, gov, zscale_ok):
     work = tempfile.mkdtemp(prefix=".work-", dir=os.path.dirname(final))
     try:
         frames, stats, lock, abort = {}, dict(ok=0, fail=0, retried=0, suspect=0), threading.Lock(), []
-        times = [min((i + 0.5) * cfg["interval"], max(0.0, info["duration"] - 1.0)) for i in range(n)]
+        if job:
+            job.n, job.stats, job.phase, job.t_read0 = n, stats, "reading", time.time()
+        times =[min((i + 0.5) * cfg["interval"], max(0.0, info["duration"] - 1.0)) for i in range(n)]
         ext_of_frame = "ppm" if ext.name == "pyav" or (isinstance(ext, AutoExtractor) and ext.name == "pyav") else "png"
 
         def work_one(i):
-            if abort or STOP:
+            if abort or STOP or (job and job.stopped):
                 return
             decode_retried = suspect_seen = False
             for attempt in range(12):
                 if abort or STOP:
+                    return
+                if job and not job.checkpoint():                          # paused here (before taking a read slot); False = stopped
                     return
                 if not gov.acquire():
                     return
@@ -921,6 +978,8 @@ def build_entry(rel, src, size, cfg, gov, zscale_ok):
         finally:
             halt.set()
         ext.close()
+        if job and job.stopped:
+            raise JobStopped()
         if STOP:
             raise KeyboardInterrupt
         if abort:
@@ -931,6 +990,8 @@ def build_entry(rel, src, size, cfg, gov, zscale_ok):
         if len(frames) < max(1, int(n * 0.8)):
             raise ReadFailures(f"only {len(frames)} of {n} thumbnails could be read")
         t_read = time.time() - t0
+        if job:
+            job.phase = "encoding"
         enc = os.path.join(work, "jpg")
         os.makedirs(enc)
         sizes, w, q = choose_and_encode(frames, enc, cfg["width"], allowed, int(cfg.get("encode_jobs") or 0) or (os.cpu_count() or 2))
@@ -962,6 +1023,8 @@ def build_entry(rel, src, size, cfg, gov, zscale_ok):
         if os.path.isdir(final):
             shutil.rmtree(final)
         os.rename(work, final)
+        if job:
+            job.bytes, job.phase = total, "done"
         dt = time.time() - t0
         log(f"built {rel}: {n} thumbs ({len(frames)} read, {stats['fail']} failed reads, {ext.name}), {w}x{h} q{q}, {total / 1e6:.2f} MB "
             f"(budget {allowed / 1e6:.2f}), {dt:.0f}s total (wake {t_wake:.0f}s, probe {t_probe:.0f}s, read {t_read - t_wake - t_probe:.0f}s), "
@@ -1492,6 +1555,9 @@ def main(argv):
     p.add_argument("--yes", action="store_true")
     p = sub.add_parser("install-service", parents=[common])
     p.add_argument("--enable", action="store_true")
+    p = sub.add_parser("serve", parents=[common], help="a local web page: pick films, queue them, start/pause/stop, watch the progress")
+    p.add_argument("--port", type=int, default=8781)
+    p.add_argument("--open", action="store_true", help="also open the page in your browser")
     p = sub.add_parser("install-viewer", parents=[common])
     p.add_argument("--mpv-config-dir", default="~/.config/mpv-object-audio")
     args = ap.parse_args(argv)
@@ -1515,6 +1581,12 @@ def main(argv):
         return cmd_verify(cfg, deep=args.deep)
     elif args.cmd == "prune":
         cmd_prune(cfg, args.yes)
+    elif args.cmd == "serve":
+        need_paths(cfg)
+        signal.signal(signal.SIGINT, on_signal)
+        signal.signal(signal.SIGTERM, on_signal)
+        import seekthumbs_web
+        return seekthumbs_web.serve(sys.modules[__name__], cfg, args.port, args.open)
     elif args.cmd == "install-viewer":
         cmd_install_viewer(args.mpv_config_dir)
     elif args.cmd == "install-service":
