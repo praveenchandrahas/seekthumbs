@@ -4,16 +4,16 @@
 
 *Illustration, not a screenshot: the film frames are made up, and the viewer has so far been run only under a mocked mpv API, not in real mpv with uosc (see "Open items" below).*
 
-> **Part of the [Software Defined Home Theatre](https://github.com/praveenchandrahas/Software-Defined-Home-Theatre) project.** The main repository holds the documentation, build log, results and the installer checks; this is one of its parts. Sibling repositories: [linux-theater-dsp](https://github.com/praveenchandrahas/linux-theater-dsp) · [mpv-object-audio](https://github.com/praveenchandrahas/mpv-object-audio) · [theater-measurement](https://github.com/praveenchandrahas/theater-measurement).
+> **Part of the [Software Defined Home Theatre](https://github.com/praveenchandrahas/Software-Defined-Home-Theatre) project.** The main repository holds the documentation, build log, results and the installer checks; this is one of its parts. Sibling repositories: [linux-theater-dsp](https://github.com/praveenchandrahas/linux-theater-dsp) (router and CamillaDSP configs) · [mpv-object-audio](https://github.com/praveenchandrahas/mpv-object-audio) (player and Atmos wrapper) · [Roomtone](https://github.com/praveenchandrahas/Roomtone) (measurement, autocal, status page, mpv overlay) · [mpv-shelf](https://github.com/praveenchandrahas/mpv-shelf) (film browser for mpv).
 
 Netflix-style previews on the mpv seek bar (called *trickplay* or *seek thumbnails*), for a film library on a **read-only rclone mount**.
 The thumbnails are made in the background and kept in a **local folder**; the library is only ever read.
 
-State (2026-10-26): generator (parallel, adaptive), on-play build, one set per film across releases, watcher, mpv viewer and tests are written and pass on synthetic
+State (2026-10-27): generator (parallel, adaptive), on-play build, one set per film across releases, watcher, a local web page to pick and run films, cold-file handling, mpv viewer and tests are written and pass on synthetic
 films. **The viewer, and the on-play trigger in particular, have not been run in real mpv/uosc** (the sandbox has neither). The generator has been probed on the owner's
 debrid mount (numbers below). Open items are listed at the end.
 
-**Two ways to get thumbnails, use either or both:** (1) *on play* (the default once `install-viewer` has run): the first time you play a film that has none, the viewer starts a
+**Three ways to get thumbnails, use any of them:** (0) *the web page* (`./seekthumbs.py serve`): tick the films you want, press Start, watch the speed and the progress (see below); (1) *on play* (the default once `install-viewer` has run): the first time you play a film that has none, the viewer starts a
 gentle background build of that one film; (2) *batch*: `scan` / `watch` build the whole library ahead of time. In both, releases of the same film share one set (see below).
 
 ## Setup (once the paths are known)
@@ -109,7 +109,13 @@ listed. It reads the library and writes the thumbnail store, nothing else. The q
   before its first success). HDR frames are scaled to thumbnail size *before* tone-mapping, which makes the tone-map almost free. The JPEG encoding at the end runs in
   parallel. Measured on a local 30 min 1080p test file with 2 cores (no network, so no round-trip cost at all): ffmpeg command 2.8 reads/s, PyAV 100+ reads/s;
   a 4K 10-bit HDR thumbnail through the ffmpeg command took 0.7 s (software decode). **These are not numbers for your mount.**
-- **How long for 100 films:** 100 films of 2 h = 36,000 thumbnails. One night (8 h) needs 1.3 reads/s. Rough guess for a network mount: 0.3-1 s per read per
+- **What one real mount measured (the owner's debrid mount, 2026-10-27; one library, one evening, do not generalise):** the mount is decypharr's own FUSE mount (`max_read=1048576`, so at most 1 MB per read request; there are no rclone flags to tune).
+  The first touch of one cold file took 24 s for 1 MB in a test, and 240 s the next time, in the first full build of that film; reads at other places in the same file then took about 1.5 s each for 4 MB (the network sat under 100 Kbps while waiting: latency, not bandwidth).
+  Streaming 1 GB ran at 11.6 MB/s (93 Mbps on a 200 Mbps line). Eight 4 MB reads at once took 6-12 s against about 13 s one after another (a gain of 1.1-2x, not 8x), and a single read now and then took 10 s: the mount is uneven.
+  One 4K Hybrid remux (358 thumbnails) built in 18.3 min in a batch pass: wake 240 s, probe 118 s, read 734 s (0.5 reads/s, 6 workers), 8 reads retried after decode errors and 8 thumbnails missing.
+  **`probe` was far too optimistic there** (it reads only 6 thumbnails, and projected under a minute per film): trust a real build. At that film's rate 191 films would take about 58 hours, which is why the web page lets you pick a smaller set first.
+  The cost of a film follows the **number of reads**, not the bytes, so a coarser interval (`interval = 40`) halves it; a coarse-first build that is refined later is a possible design, not built.
+- **How long for 100 films (a guess made before any real measurement, kept for the arithmetic):** 100 films of 2 h = 36,000 thumbnails. One night (8 h) needs 1.3 reads/s. Rough guess for a network mount: 0.3-1 s per read per
   worker with PyAV, 1.5-3 s with the ffmpeg command, times 6 workers: about 1-2 h with PyAV, 3-5 h with the command, if the mount tolerates 6 parallel streams.
   `probe` prints the projection from your own measurement; trust it over this paragraph.
 - **Linking the playing film to its thumbnails (mpv):** by path. `thumbfast.lua` takes mpv's `path`, removes the `library` prefix and looks for
@@ -126,7 +132,7 @@ listed. It reads the library and writes the thumbnail store, nothing else. The q
 `library`, `store`, `interval` (20), `width` (240), `workers` (6), `extractor` (auto | pyav | ffmpeg), `rate_cooldown` (30 s), `pause` (0), `film_pause` (0),
 `poll` (1800), `settle` (600), `min_size_mb` (300), `skip_tv` (0; 1 = leave out every file whose name has an `S01E02`-style episode tag), `exclude` (empty; a case-insensitive regular expression matched against the path relative to the library, `|` for several, e.g. `exclude = Game.of.Thrones|IMAX`; applies to `plan`/`scan`/`watch` and to `build FILE`, so nothing is built while it plays either; `prune`/`status` ignore it), `max_films` (0 = all), `budget_mb` (10), `safety` (0.8), `seek_timeout` (90 s), `yield_to_playback` (1),
 `breaker_hours` (1), and for the on-play build and sharing: `play_workers` (2, the parallel reads of the on-play build), `play_pause` (2 s rest after each read),
-`play_extractor` (`pyav`: PyAV only | `auto` | `ffmpeg`), `share` (1; 0 = one set per file), `share_tolerance` (2 s), `encode_jobs` (0 = all CPUs; the on-play build uses 2 unless set).
+`play_extractor` (`pyav`: PyAV only | `auto` | `ffmpeg`), `share` (1; 0 = one set per file), `share_tolerance` (2 s), `encode_jobs` (0 = all CPUs; the on-play build uses 2 unless set), and for cold files `probe_timeout` (300 s), `wake_ahead` (3 films) and `progress_every` (60 s).
 
 Cold files: on a debrid mount the first touch of a file can take 20 s or more before any data arrives (with the network almost idle), then reads in the same file
 are fast. So before probing a film, seekthumbs reads 1 MB at the start and end of the file to wake it (`probe_timeout`, 300 s, is how long it waits), wakes
@@ -146,7 +152,7 @@ Limits: the frame check only runs on the PyAV path; PyAV log lines are process-w
 
 ## Not verified yet / known weak spots
 
-1. **Bytes read per seek on the real mount.** rclone read-ahead, chunk size and VFS cache mode decide it. `probe` now prints the bytes this machine received per
+1. **Bytes read per seek on the real mount.** (On the owner's mount, which is not rclone, see the measurements above; the rest of this item applies to rclone mounts.) rclone read-ahead, chunk size and VFS cache mode decide it. `probe` now prints the bytes this machine received per
    thumbnail (all interfaces, so quiet the machine first). If it is large, a *separate* read-only mount for the overnight run with a small read-ahead
    (`--buffer-size 0 --vfs-read-chunk-size 1M --vfs-cache-mode off` as a starting point; check the rclone docs for your version) would cut the bytes; `preflight` (sdht repository) prints
    your current mount flags.
@@ -164,10 +170,11 @@ Limits: the frame check only runs on the PyAV path; PyAV log lines are process-w
 7. Dolby Vision profile 5, and HDR through PyAV on a real HDR file, are untested; the circuit breaker across films and `install-service` are not covered by tests.
 8. 6 parallel streams may exceed what your backend allows (some debrid/cloud services limit concurrent streams per link or per IP). If `probe`/the first film show
    throttling, lower `--workers`.
+9. **The web page** was tested against a synthetic library in a headless browser (light, dark and phone width, no console errors) and with unit tests; the owner ran it on the real mount on 2026-10-27 (it ran; no numbers recorded yet). Not covered: a real mpv running while it waits (the "wait while a player runs" setting), and very long runs.
 
 ## Tests
 
-`python3 tests/test_seekthumbs.py` (needs ffmpeg; `pip install lupa av` adds the viewer and PyAV tests).
+`bash tests/run.sh` runs `tests/test_seekthumbs.py` (generator, viewer under a mocked mpv) and `tests/test_web.py` (the web page: its token and Host checks, the film list, queue, start, pause, resume, stop, and what ends up in the store). Needs ffmpeg; `pip install lupa av` adds the viewer and PyAV tests.
 
 ## Adapting it to your system
 
