@@ -23,4 +23,4 @@ for rep in $(seq "$rounds"); do
 done
 skip=$(( size / 8 / 4 * 4 ))
 s=$(now); dd if="$f" of=/dev/null bs=4M skip=$(( skip / 4 )) count=$(( stream / 4 )) 2>/dev/null; e=$(now)
-awk -v m="$stream" -v t="$(span "$s" "$e")" 'BEGIN{printf "streaming %d MiB: %.1f s = %.1f MB/s\n", m, t, m*1.048576/t}'
+awk -v m="$stream" -v t="$(span "$s" "$e")" 'BEGIN{printf "streaming %d MiB: %.1f s = %.1f MB/s\n", m, t, m*1.048576/(t>0.05?t:0.05)}'
