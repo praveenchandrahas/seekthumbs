@@ -114,6 +114,7 @@ listed. It reads the library and writes the thumbnail store, nothing else. The q
   Streaming 1 GB ran at 11.6 MB/s (93 Mbps on a 200 Mbps line). Eight 4 MB reads at once took 6-12 s against about 13 s one after another (a gain of 1.1-2x, not 8x), and a single read now and then took 10 s: the mount is uneven.
   One 4K Hybrid remux (358 thumbnails) built in 18.3 min in a batch pass: wake 240 s, probe 118 s, read 734 s (0.5 reads/s, 6 workers), 8 reads retried after decode errors and 8 thumbnails missing.
   **`probe` was far too optimistic there** (it reads only 6 thumbnails, and projected under a minute per film): trust a real build. At that film's rate 191 films would take about 58 hours, which is why the web page lets you pick a smaller set first.
+  `tools/mount-test.sh FILE` repeats these tests (first touch, 4 MB reads 1/2/4/8 at a time, streaming) on any file; read-only.
   The cost of a film follows the **number of reads**, not the bytes, so a coarser interval (`interval = 40`) halves it; a coarse-first build that is refined later is a possible design, not built.
 - **How long for 100 films (a guess made before any real measurement, kept for the arithmetic):** 100 films of 2 h = 36,000 thumbnails. One night (8 h) needs 1.3 reads/s. Rough guess for a network mount: 0.3-1 s per read per
   worker with PyAV, 1.5-3 s with the ffmpeg command, times 6 workers: about 1-2 h with PyAV, 3-5 h with the command, if the mount tolerates 6 parallel streams.
