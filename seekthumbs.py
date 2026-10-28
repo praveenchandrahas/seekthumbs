@@ -1078,11 +1078,13 @@ def build_entry(rel, src, size, cfg, gov, zscale_ok):
 
         tk = threading.Thread(target=ticker, daemon=True)
         tk.start()
+        rx0 = net_rx_bytes()
         try:
             with ThreadPoolExecutor(max_workers=n_workers) as pool:
                 list(pool.map(work_one, todo_ix))
         finally:
             halt.set()
+        rx1 = net_rx_bytes()
         ext.close()
         if job and job.stopped:
             raise JobStopped()
@@ -1140,6 +1142,8 @@ def build_entry(rel, src, size, cfg, gov, zscale_ok):
         log(f"{'refined' if refine else 'built'} {rel}: {n} thumbs ({stats['ok']} read, {stats['fail']} failed reads, {ext.name}), {w}x{h} q{q}, {total / 1e6:.2f} MB "
             f"(budget {allowed / 1e6:.2f}), {dt:.0f}s total (wake {t_wake:.0f}s, probe {t_probe:.0f}s, read {t_read - t_wake - t_probe:.0f}s), "
             f"{n_read / max(0.1, t_read - t_wake - t_probe):.1f} reads/s; "
+            + (f"network {(rx1 - rx0) / 1e6:.0f} MB received during the read = {(rx1 - rx0) / 1e6 / max(1, stats['ok']):.1f} MB per thumbnail (counts everything this computer received); "
+               if rx0 is not None and rx1 is not None and rx1 >= rx0 else "") +
             f"{stats['retried']} reads retried after decode errors, {stats['suspect']} near-constant grey/white frame(s) read again")
         return True
     finally:

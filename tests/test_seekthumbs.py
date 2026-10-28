@@ -1029,6 +1029,7 @@ try:
     ix14 = st.read_index(st.entry_dir(store14, "Http.Film.2021.mkv"))
     check("a film is built by reading over HTTP", n14 == 1 and ix14 and ix14["count"] == 12 and all(x > 0 for x in ix14["lengths"]), out14.getvalue()[-500:])
     check("the server saw range requests, and the log says HTTP", any(r for _, r in hits14) and "over HTTP" in out14.getvalue(), (len(hits14), out14.getvalue()[-300:]))
+    check("the built line reports the network used per thumbnail", "MB per thumbnail" in out14.getvalue() or st.net_rx_bytes() is None, out14.getvalue()[-400:])
     check("the password is not written to the log", "secret" not in out14.getvalue() and st.mask_url("http://u:p@h/x") == "http://h/x" and st.mask_url("http://h/x") == "http://h/x")
     check("the address is the base plus the film's path, percent-encoded", st.read_source({"read_url_base": "http://h:1/w/"}, "A B/c+d.mkv", "/m/A B/c+d.mkv") == "http://h:1/w/A%20B/c%2Bd.mkv")
     check("without read_url_base the mount path is used", st.read_source({}, "a/b.mkv", "/m/a/b.mkv") == "/m/a/b.mkv")
