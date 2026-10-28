@@ -916,6 +916,45 @@ try:
     check("the scan says which film it is reading and how many thumbnails", "reading 6 thumbnails of Progress.Film.2022.mkv" in out9.getvalue(), out9.getvalue()[-400:])
     check("periodic counts appear while a film is read", "thumbnails read," in out9.getvalue(), out9.getvalue()[-400:])
 
+    # ---- refine: a set built at 30 s is filled in to 10 s by reading only the missing thumbnails
+    lib11, store11 = os.path.join(tmp, "lib11"), os.path.join(tmp, "store11")
+    f11 = os.path.join(lib11, "Refine.Film.2021.mkv")
+    make_film(f11, seconds=180, size="320x180", gop=24)
+    rel11 = os.path.relpath(f11, lib11)
+    check("a coarse build at 30 s", st.scan_pass(cfg(lib11, store11, interval=30.0, workers=2)) == 1)
+    ix_a = st.read_index(st.entry_dir(store11, rel11))
+    check("the coarse set has 6 thumbnails at 30 s", ix_a and ix_a["count"] == 6 and ix_a["interval"] == 30.0, ix_a and (ix_a["count"], ix_a["interval"]))
+    check("nothing to refine while the interval stays 30 s", st.refine_pass(cfg(lib11, store11, interval=30.0), dry=True) == 0)
+    check("a dry run finds the film for 10 s and reads nothing", st.refine_pass(cfg(lib11, store11, interval=10.0), dry=True) == 1)
+    out11 = io.StringIO()
+    with contextlib.redirect_stderr(out11), contextlib.redirect_stdout(out11):
+        done11 = st.refine_pass(cfg(lib11, store11, interval=10.0, workers=2))
+    ix_b = st.read_index(st.entry_dir(store11, rel11))
+    check("refine reports one film done", done11 == 1, out11.getvalue()[-500:])
+    check("the refined set has 18 thumbnails at 10 s, all present", ix_b and ix_b["count"] == 18 and ix_b["interval"] == 10.0 and all(x > 0 for x in ix_b["lengths"]), ix_b and (ix_b["count"], ix_b["interval"], ix_b["lengths"]))
+    check("it kept the made stamp (aliases stay valid) and marks the refinement", ix_b and ix_b["made"] == ix_a["made"] and "refined" in ix_b)
+    check("only the 12 missing thumbnails were read, 6 kept", "reading 12 thumbnails of Refine.Film.2021.mkv (6 of the 18 already exist at 30 s and are kept)" in out11.getvalue(), out11.getvalue()[-600:])
+    check("the pack is consistent and the film is still current", st.entry_current(store11, rel11, os.path.getsize(f11)))
+    check("a second refine finds nothing to do", st.refine_pass(cfg(lib11, store11, interval=10.0), dry=True) == 0)
+    # a failing refine keeps the coarse set
+    lib12, store12 = os.path.join(tmp, "lib12"), os.path.join(tmp, "store12")
+    f12 = os.path.join(lib12, "Keep.Film.2021.mkv")
+    make_film(f12, seconds=180, size="320x180", gop=24)
+    st.scan_pass(cfg(lib12, store12, interval=30.0, workers=2))
+    ix_k = st.read_index(st.entry_dir(store12, os.path.relpath(f12, lib12)))
+    real_ext = st.make_extractor
+    def broken_extractor(*a, **k):
+        raise RuntimeError("simulated read failure")
+    st.make_extractor = broken_extractor
+    try:
+        out12 = io.StringIO()
+        with contextlib.redirect_stderr(out12), contextlib.redirect_stdout(out12):
+            st.refine_pass(cfg(lib12, store12, interval=10.0, workers=2))
+    finally:
+        st.make_extractor = real_ext
+    ix_k2 = st.read_index(st.entry_dir(store12, os.path.relpath(f12, lib12)))
+    check("a refine that fails keeps the coarse set unchanged", ix_k2 == ix_k and "REFINE FAILED" in out12.getvalue() and "is kept" in out12.getvalue(), out12.getvalue()[-400:])
+
     # ---- memory guard: the number of parallel reads follows the free memory
     real_mem, real_cg = st.mem_available_mb, st.cgroup_headroom_mb
     st.cgroup_headroom_mb = lambda: None

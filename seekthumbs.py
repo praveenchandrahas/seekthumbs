@@ -11,6 +11,7 @@ grows back one step per 40 clean reads. Standard library plus ffmpeg/ffprobe; Py
     seekthumbs.py build FILE        build the thumbnails of ONE film now, gently (this is what the mpv viewer starts when you play a film that has none)
     seekthumbs.py scan              one pass: build thumbnails for every film that lacks them (--max-films N to limit)
     seekthumbs.py watch             scan, sleep --poll seconds, repeat (this is what the systemd service runs)
+    seekthumbs.py refine [--dry-run]   fill in a finer interval for films built coarse (interval=30 first, then --interval 10): reads only what is missing
     seekthumbs.py status            store size, entry count, the largest entries against the size budget
     seekthumbs.py verify [--deep]   check every store entry against its index and the size budget; --deep also decodes every thumbnail and lists likely corrupt ones
     seekthumbs.py prune [--yes]     list (or delete, with --yes) store entries whose film no longer exists; refuses if the library looks unmounted
@@ -883,7 +884,8 @@ def build_entry(rel, src, size, cfg, gov, zscale_ok):
     t_probe = time.time() - t1
     if job:
         job.t_probe = t_probe
-    if cfg.get("share", 1):
+    refine = cfg.get("_refine")                 # (index, folder) of the coarser set this build refines, or None
+    if cfg.get("share", 1) and not refine:
         sib = find_sibling(cfg["store"], rel, info["duration"], float(cfg.get("share_tolerance", 2.0)))
         if sib:
             write_alias(cfg["store"], rel, size, info["duration"], sib[2], sib[1])
@@ -904,6 +906,32 @@ def build_entry(rel, src, size, cfg, gov, zscale_ok):
         if job:
             job.n, job.stats, job.phase, job.t_read0 = n, stats, "reading", time.time()
         times =[min((i + 0.5) * cfg["interval"], max(0.0, info["duration"] - 1.0)) for i in range(n)]
+        reuse = {}
+        if refine:
+            # thumbnails of the existing set that sit exactly on the new grid (a 30 s set holds every third thumbnail of a 10 s set): taken from its pack
+            oix, oedir = refine
+            old_at = {}
+            for oi in range(oix["count"]):
+                if oix["lengths"][oi] > 0:
+                    old_at[round(min((oi + 0.5) * oix["interval"], max(0.0, oix["duration"] - 1.0)), 2)] = oi
+            olddir = os.path.join(work, "old")
+            os.makedirs(olddir)
+            with open(os.path.join(oedir, "thumbs.pack"), "rb") as pk_old:
+                for j in range(n):
+                    oi = old_at.get(round(times[j], 2))
+                    if oi is not None:
+                        pk_old.seek(oix["offsets"][oi])
+                        data = pk_old.read(oix["lengths"][oi])
+                        if len(data) == oix["lengths"][oi]:
+                            p_old = os.path.join(olddir, f"{j:06d}.jpg")
+                            with open(p_old, "wb") as fo:
+                                fo.write(data)
+                            reuse[j] = p_old
+            frames.update(reuse)
+        todo_ix = [j for j in range(n) if j not in reuse]
+        n_read = len(todo_ix)
+        if job:
+            job.n = n_read
         ext_of_frame = "ppm" if ext.name == "pyav" or (isinstance(ext, AutoExtractor) and ext.name == "pyav") else "png"
 
         def work_one(i):
@@ -966,7 +994,7 @@ def build_entry(rel, src, size, cfg, gov, zscale_ok):
         n_workers, mem_note = memory_limited_workers(cfg["workers"], cfg)
         if mem_note:
             log("MEMORY: " + mem_note)
-        log(f"reading {n} thumbnails of {rel} with {n_workers} parallel read(s) (wake {t_wake:.0f} s, probe {t_probe:.0f} s)")
+        log(f"reading {n_read} thumbnails of {rel}" + (f" ({len(reuse)} of the {n} already exist at {refine[0]['interval']:g} s and are kept)" if refine else "") + f" with {n_workers} parallel read(s) (wake {t_wake:.0f} s, probe {t_probe:.0f} s)")
         every = float(cfg.get("progress_every", 60.0) or 0)
         halt = threading.Event()
 
@@ -977,15 +1005,15 @@ def build_entry(rel, src, size, cfg, gov, zscale_ok):
                     ok = stats["ok"]
                 now = time.time()
                 rate = (ok - last) / max(0.001, now - t_last)
-                left = (n - ok) / rate / 60 if rate > 0 else float("inf")
-                log(f"  {ok}/{n} thumbnails read, {rate:.2f}/s in the last {now - t_last:.0f} s" + (f", about {left:.0f} min left" if left != float("inf") else ", no progress") + (f", memory {self_rss_mb():.0f} MB" if self_rss_mb() else ""))
+                left = (n_read - ok) / rate / 60 if rate > 0 else float("inf")
+                log(f"  {ok}/{n_read} thumbnails read, {rate:.2f}/s in the last {now - t_last:.0f} s" + (f", about {left:.0f} min left" if left != float("inf") else ", no progress") + (f", memory {self_rss_mb():.0f} MB" if self_rss_mb() else ""))
                 last, t_last = ok, now
 
         tk = threading.Thread(target=ticker, daemon=True)
         tk.start()
         try:
             with ThreadPoolExecutor(max_workers=n_workers) as pool:
-                list(pool.map(work_one, range(n)))
+                list(pool.map(work_one, todo_ix))
         finally:
             halt.set()
         ext.close()
@@ -1022,11 +1050,16 @@ def build_entry(rel, src, size, cfg, gov, zscale_ok):
                     offsets.append(pos)
                     lengths.append(0)
         h = int(round(w * info["height"] / info["width"] / 2) * 2)
+        now_iso = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+        # a refined set keeps the `made` stamp of the set it grew from, so aliases of other releases that point at it stay valid
         ix = dict(v=1, src=rel, size=size, duration=round(info["duration"], 2), interval=cfg["interval"], w=w, h=h, count=n,
-                  offsets=offsets, lengths=lengths, q=q, made=datetime.now(timezone.utc).isoformat(timespec="milliseconds"))
+                  offsets=offsets, lengths=lengths, q=q, made=refine[0]["made"] if refine else now_iso)
+        if refine:
+            ix["refined"] = now_iso
         with open(os.path.join(work, "index.json"), "w") as f:
             json.dump(ix, f, separators=(",", ":"))
         shutil.rmtree(enc, ignore_errors=True)
+        shutil.rmtree(os.path.join(work, "old"), ignore_errors=True)
         for fn in os.listdir(work):
             if fn.endswith((".png", ".ppm")):
                 os.remove(os.path.join(work, fn))
@@ -1037,9 +1070,9 @@ def build_entry(rel, src, size, cfg, gov, zscale_ok):
         if job:
             job.bytes, job.phase = total, "done"
         dt = time.time() - t0
-        log(f"built {rel}: {n} thumbs ({len(frames)} read, {stats['fail']} failed reads, {ext.name}), {w}x{h} q{q}, {total / 1e6:.2f} MB "
+        log(f"{'refined' if refine else 'built'} {rel}: {n} thumbs ({stats['ok']} read, {stats['fail']} failed reads, {ext.name}), {w}x{h} q{q}, {total / 1e6:.2f} MB "
             f"(budget {allowed / 1e6:.2f}), {dt:.0f}s total (wake {t_wake:.0f}s, probe {t_probe:.0f}s, read {t_read - t_wake - t_probe:.0f}s), "
-            f"{n / max(0.1, t_read - t_wake - t_probe):.1f} reads/s; "
+            f"{n_read / max(0.1, t_read - t_wake - t_probe):.1f} reads/s; "
             f"{stats['retried']} reads retried after decode errors, {stats['suspect']} near-constant grey/white frame(s) read again")
         return True
     finally:
@@ -1186,6 +1219,75 @@ def scan_pass(cfg, dry=False):
     wk.close()
     left = max(0, len(todo) - done)
     log(f"pass finished: {done} built, {left} still waiting; {gov.throttles} rate-limit signal(s), parallel reads ended at {gov.limit}/{gov.max}")
+    return done
+
+
+def refine_pass(cfg, dry=False):
+    """Fills in a finer interval for films that were built coarse (for example 30 s first, then `interval = 10`): only the thumbnails that do not exist yet are
+    read; those that sit on the new grid are kept. Films whose interval is already as fine as `interval` are left alone. Returns the number of films."""
+    need_paths(cfg)
+    os.makedirs(cfg["store"], exist_ok=True)
+    lock = open(os.path.join(cfg["store"], ".lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        log("another seekthumbs is running; skipping")
+        return 0
+    if not library_ready(cfg):
+        log("library folder is missing or empty (mount down?); nothing done")
+        return 0
+    state = State(cfg["store"])
+    todo = []
+    for rel, src, size, mtime in walk_library(cfg["library"], cfg["min_size_mb"] * 1e6):
+        if excluded(cfg, rel):
+            continue
+        edir = entry_dir(cfg["store"], rel)
+        ix = read_index(edir)
+        if ix is None or ix.get("size") != size or not ix.get("interval") or ix["interval"] <= cfg["interval"] * 1.01:
+            continue                                   # no set of its own (an alias, or not built), not this file, or already fine enough
+        if state.blocked(rel, size):
+            continue
+        n_new = max(1, int(ix["duration"] // cfg["interval"]))
+        keep = len({round(min((i + 0.5) * ix["interval"], max(0.0, ix["duration"] - 1.0)), 2) for i in range(ix["count"]) if ix["lengths"][i] > 0}
+                   & {round(min((j + 0.5) * cfg["interval"], max(0.0, ix["duration"] - 1.0)), 2) for j in range(n_new)})
+        todo.append((rel, src, size, ix, edir, n_new, keep))
+    todo.sort(key=lambda t: t[2])                      # the smallest files first, as for the first build
+    if dry:
+        for rel, src, size, ix, edir, n_new, keep in todo:
+            print(f"{size / 1e9:6.1f} GB  {rel}   {ix['interval']:g} s -> {cfg['interval']:g} s: {n_new - keep} to read, {keep} kept")
+        log(f"{len(todo)} film(s) could be refined to {cfg['interval']:g} s; {sum(t[5] - t[6] for t in todo)} thumbnails to read")
+        return len(todo)
+    batch = todo if int(cfg["max_films"]) <= 0 else todo[: int(cfg["max_films"])]
+    zs = have_filter("zscale")
+    gov = Governor(cfg["workers"], cfg["rate_cooldown"])
+    done = 0
+    for rel, src, size, ix, edir, n_new, keep in batch:
+        if STOP:
+            break
+        while cfg["yield_to_playback"] and player_running() and not STOP:
+            log("a player is running; waiting 5 min")
+            sleep_interruptible(300)
+        lk = film_lock(cfg["store"], rel)
+        if lk is None:
+            log(f"{rel} is being built by another seekthumbs; skipping")
+            continue
+        try:
+            c = dict(cfg, _refine=(ix, edir))
+            if build_entry(rel, src, size, c, gov, zs):
+                state.ok(rel)
+                done += 1
+        except KeyboardInterrupt:
+            break
+        except Throttled as ex:
+            log(f"STOPPING: {ex}")
+            state.d["breaker_until"] = time.time() + cfg["breaker_hours"] * 3600
+            state.save()
+            break
+        except Exception as ex:                # noqa: BLE001 - the coarse set stays in place and keeps working
+            log(f"REFINE FAILED {rel}: {ex}; the {ix['interval']:g} s set is kept")
+        finally:
+            lk.close()
+    log(f"refine finished: {done} of {len(batch)} film(s) refined")
     return done
 
 
@@ -1656,6 +1758,8 @@ def main(argv):
     p.add_argument("file")
     for c in ("plan", "scan", "watch", "status"):
         sub.add_parser(c, parents=[common])
+    p = sub.add_parser("refine", parents=[common], help="fill in a finer interval for films built coarse (reads only the missing thumbnails)")
+    p.add_argument("--dry-run", action="store_true", help="list the films and how many thumbnails each needs, read nothing")
     p = sub.add_parser("verify", parents=[common])
     p.add_argument("--deep", action="store_true", help="also decode every thumbnail and list the ones that look corrupt (flat grey/white, undecodable)")
     p = sub.add_parser("prune", parents=[common])
@@ -1669,7 +1773,7 @@ def main(argv):
     p.add_argument("--mpv-config-dir", default="~/.config/mpv-object-audio")
     args = ap.parse_args(argv)
     cfg = load_config(args)
-    if args.cmd in ("build", "scan", "watch", "serve", "probe"):
+    if args.cmd in ("build", "scan", "watch", "serve", "probe", "refine"):
         prefer_to_be_killed_first()
     if args.cmd == "probe":
         cmd_probe(cfg, args.file)
@@ -1681,6 +1785,10 @@ def main(argv):
         signal.signal(signal.SIGINT, on_signal)
         signal.signal(signal.SIGTERM, on_signal)
         scan_pass(cfg)
+    elif args.cmd == "refine":
+        signal.signal(signal.SIGINT, on_signal)
+        signal.signal(signal.SIGTERM, on_signal)
+        refine_pass(cfg, dry=args.dry_run)
     elif args.cmd == "watch":
         need_paths(cfg)
         cmd_watch(cfg)
