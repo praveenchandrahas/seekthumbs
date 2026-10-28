@@ -132,7 +132,7 @@ listed. It reads the library and writes the thumbnail store, nothing else. The q
 
 ## Settings (`config.ini` `[seekthumbs]` or `--option`)
 
-`library`, `store`, `interval` (20), `width` (240), `workers` (6), `extractor` (auto | pyav | ffmpeg), `rate_cooldown` (30 s), `pause` (0), `film_pause` (0),
+`library`, `store`, `interval` (20), `width` (400; was 240 until 2026-10-28), `workers` (6), `extractor` (auto | pyav | ffmpeg), `rate_cooldown` (30 s), `pause` (0), `film_pause` (0),
 `poll` (1800), `settle` (600), `min_size_mb` (300), `skip_tv` (0; 1 = leave out every file whose name has an `S01E02`-style episode tag), `exclude` (empty; a case-insensitive regular expression matched against the path relative to the library, `|` for several, e.g. `exclude = Game.of.Thrones|IMAX`; applies to `plan`/`scan`/`watch` and to `build FILE`, so nothing is built while it plays either; `prune`/`status` ignore it), `max_films` (0 = all), `budget_mb` (10), `safety` (0.8), `seek_timeout` (90 s), `yield_to_playback` (1),
 `breaker_hours` (1), and for the on-play build and sharing: `play_workers` (2, the parallel reads of the on-play build), `play_pause` (2 s rest after each read),
 `play_extractor` (`pyav`: PyAV only | `auto` | `ffmpeg`), `share` (1; 0 = one set per file), `share_tolerance` (2 s), `encode_jobs` (0 = all CPUs; the on-play build uses 2 unless set), `worker_mem_mb` (600) and `mem_reserve_mb` (3000), the memory guard below, and for cold files `probe_timeout` (300 s), `wake_ahead` (3 films) and `progress_every` (60 s).
@@ -141,6 +141,8 @@ Cold files: on a debrid mount the first touch of a file can take 20 s or more be
 are fast. So before probing a film, seekthumbs reads 1 MB at the start and end of the file to wake it (`probe_timeout`, 300 s, is how long it waits), wakes
 the next `wake_ahead` (3) files in the background so those waits overlap, and a file that is still not answering is skipped, tried again at the end of the
 pass, and never recorded as a failure on the first timeout. The "built" log line shows the wake, probe and read seconds of each film; while a film is read, a line every `progress_every` (60) seconds shows the count, the rate and the time left.
+
+**Thumbnail width.** Default 400 px (a 2.4:1 film is 400x168; it was 240 until 2026-10-28). A 4K film at 240 px used 0.6 to 1.3 MB of its roughly 8 to 11 MB budget; 400 px is about 2.8 times the pixels, so roughly 1.7 to 3.6 MB (estimated, not yet measured on a real film). The budget still lowers quality, then width, if a film would not fit. Sets already built keep their width; `width` applies to films built from now on. `refine` reads every thumbnail again when the existing set is narrower than the width now set, instead of stretching old ones.
 
 **Coarse first, finer later (`refine`).** Build every film at a coarse interval now (`serve --interval 30`, or `interval = 30` in the config) and fill in the finer one later:
 

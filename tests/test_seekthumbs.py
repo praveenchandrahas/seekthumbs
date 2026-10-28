@@ -937,6 +937,18 @@ try:
     check("only the 12 missing thumbnails were read, 6 kept", "reading 12 thumbnails of Refine.Film.2021.mkv (6 of the 18 already exist at 30 s and are kept)" in out11.getvalue(), out11.getvalue()[-600:])
     check("the pack is consistent and the film is still current", st.entry_current(store11, rel11, os.path.getsize(f11)))
     check("a second refine finds nothing to do", st.refine_pass(cfg(lib11, store11, interval=10.0), dry=True) == 0)
+    # a refine to a wider width reads everything again instead of stretching narrow thumbnails
+    lib13, store13 = os.path.join(tmp, "lib13"), os.path.join(tmp, "store13")
+    f13 = os.path.join(lib13, "Narrow.Film.2021.mkv")
+    make_film(f13, seconds=180, size="640x360", gop=24)
+    rel13 = os.path.relpath(f13, lib13)
+    st.scan_pass(cfg(lib13, store13, interval=30.0, width=200, workers=2))
+    ix13a = st.read_index(st.entry_dir(store13, rel13))
+    out13 = io.StringIO()
+    with contextlib.redirect_stdout(out13), contextlib.redirect_stderr(out13):
+        st.refine_pass(cfg(lib13, store13, interval=10.0, width=300, workers=2))
+    ix13b = st.read_index(st.entry_dir(store13, rel13))
+    check("a refine to a wider width reads all 18 thumbnails and ends at the new width", ix13a and ix13b and ix13a["w"] == 200 and ix13b["w"] == 300 and ix13b["count"] == 18 and "(0 of the 18 already exist" in out13.getvalue(), (ix13a and ix13a["w"], ix13b and ix13b["w"], out13.getvalue()[-300:]))
     # a failing refine keeps the coarse set
     lib12, store12 = os.path.join(tmp, "lib12"), os.path.join(tmp, "store12")
     f12 = os.path.join(lib12, "Keep.Film.2021.mkv")

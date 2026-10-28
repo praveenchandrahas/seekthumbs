@@ -47,7 +47,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 VIDEO_EXT = {".mkv", ".mp4", ".m4v", ".avi", ".mov", ".ts", ".m2ts", ".webm", ".wmv"}
-DEFAULTS = dict(library="", store="", interval=20.0, width=240, workers=6, pause=0.0, film_pause=0.0, poll=1800.0, settle=600.0,
+DEFAULTS = dict(library="", store="", interval=20.0, width=400, workers=6, pause=0.0, film_pause=0.0, poll=1800.0, settle=600.0,
                 min_size_mb=300.0, max_films=0, budget_mb=10.0, safety=0.8, seek_timeout=90.0, probesize="1M", yield_to_playback=1,
                 breaker_hours=1.0, extractor="auto", rate_cooldown=30.0,
                 play_workers=2, play_pause=2.0, worker_mem_mb=1000, read_url_base="", mem_reserve_mb=3000, play_extractor="pyav", share=1, share_tolerance=2.0, encode_jobs=0, skip_tv=0, exclude="",
@@ -999,7 +999,7 @@ def build_entry(rel, src, size, cfg, gov, zscale_ok):
             with open(os.path.join(oedir, "thumbs.pack"), "rb") as pk_old:
                 for j in range(n):
                     oi = old_at.get(round(times[j], 2))
-                    if oi is not None:
+                    if oi is not None and int(oix.get("w") or 0) >= int(cfg["width"]):   # never stretch narrow old thumbnails into a wider set
                         pk_old.seek(oix["offsets"][oi])
                         data = pk_old.read(oix["lengths"][oi])
                         if len(data) == oix["lengths"][oi]:
@@ -1334,6 +1334,8 @@ def refine_pass(cfg, dry=False):
         n_new = max(1, int(ix["duration"] // cfg["interval"]))
         keep = len({round(min((i + 0.5) * ix["interval"], max(0.0, ix["duration"] - 1.0)), 2) for i in range(ix["count"]) if ix["lengths"][i] > 0}
                    & {round(min((j + 0.5) * cfg["interval"], max(0.0, ix["duration"] - 1.0)), 2) for j in range(n_new)})
+        if int(ix.get("w") or 0) < int(cfg["width"]):
+            keep = 0                                   # its thumbnails are narrower than the width now asked for: all are read again
         todo.append((rel, src, size, ix, edir, n_new, keep))
     todo.sort(key=lambda t: t[2])                      # the smallest files first, as for the first build
     if dry:
