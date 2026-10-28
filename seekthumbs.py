@@ -50,7 +50,7 @@ VIDEO_EXT = {".mkv", ".mp4", ".m4v", ".avi", ".mov", ".ts", ".m2ts", ".webm", ".
 DEFAULTS = dict(library="", store="", interval=20.0, width=240, workers=6, pause=0.0, film_pause=0.0, poll=1800.0, settle=600.0,
                 min_size_mb=300.0, max_films=0, budget_mb=10.0, safety=0.8, seek_timeout=90.0, probesize="1M", yield_to_playback=1,
                 breaker_hours=1.0, extractor="auto", rate_cooldown=30.0,
-                play_workers=2, play_pause=2.0, worker_mem_mb=1000, mem_reserve_mb=3000, play_extractor="pyav", share=1, share_tolerance=2.0, encode_jobs=0, skip_tv=0, exclude="",
+                play_workers=2, play_pause=2.0, worker_mem_mb=1000, read_url_base="", mem_reserve_mb=3000, play_extractor="pyav", share=1, share_tolerance=2.0, encode_jobs=0, skip_tv=0, exclude="",
                 probe_timeout=300.0, wake_ahead=3, progress_every=60.0)
 PLAYERS = ("mpv", "mpv-atmos", "mpv-object-audio", "vlc", "kodi", "kodi.bin")
 SUFFIX = ".seekthumbs"
@@ -516,12 +516,48 @@ class Job:
         return not (self.stopped or STOP)
 
 
+def read_source(cfg, rel, src):
+    """Where the pictures are read from. By default the file on the mount (`src`). With `read_url_base` set (for example the WebDAV address of the same
+    folder, http://127.0.0.1:8282/webdav/.../__all__/) the film is read over HTTP with range requests instead: `base + the path of the film relative to the
+    library`, each part percent-encoded. The mount stays the library listing and the fallback."""
+    base = (cfg.get("read_url_base") or "").strip()
+    if not base:
+        return src
+    import urllib.parse
+    return base.rstrip("/") + "/" + "/".join(urllib.parse.quote(p, safe="") for p in rel.split("/"))
+
+
+def mask_url(u):
+    """The URL without a user:password@ part, for the log."""
+    return re.sub(r"^(https?://)[^/@]*@", r"\1", u)
+
+
+def http_wake(url, timeout):
+    """The HTTP counterpart of wake_file: 1 MB at the start and at the end of the file, as range requests. Errors are ignored (ffprobe reports real ones)."""
+    import urllib.request
+    try:
+        def rng(spec):
+            rq = urllib.request.Request(url, headers={"Range": spec})
+            with urllib.request.urlopen(rq, timeout=timeout) as r:
+                r.read(1 << 20)
+                return r.headers.get("Content-Range", "")
+        cr = rng("bytes=0-1048575")                   # "bytes 0-1048575/12345" -> the size
+        total = int(cr.rsplit("/", 1)[1]) if "/" in cr and cr.rsplit("/", 1)[1].isdigit() else 0
+        if total > (2 << 20):
+            rng(f"bytes={total - (1 << 20)}-{total - 1}")
+    except Exception:                                 # noqa: BLE001
+        pass
+
+
 def wake_file(path, timeout):
     """Reads 1 MB at the start and at the end of the file (where MKV keeps its header and its index) so the mount has the file ready before ffprobe and
     PyAV need it. Returns the seconds it took; raises ProbeTimeout if the first touch is still not answered after `timeout` seconds."""
     t0 = time.time()
 
     def rd():
+        if path.startswith(("http://", "https://")):
+            http_wake(path, timeout)
+            return
         try:
             with open(path, "rb") as f:
                 f.read(1 << 20)
@@ -893,13 +929,25 @@ def build_entry(rel, src, size, cfg, gov, zscale_ok):
     job = cfg.get("_job")
     if job:
         job.phase = "waking"
-    t_wake = wake_file(src, float(cfg.get("probe_timeout") or 300.0))
+    rsrc = read_source(cfg, rel, src)             # the mount path, or the HTTP address of the same file
+    if rsrc != src:
+        log(f"reading {rel} over HTTP: {mask_url(rsrc)}")
+    t_wake = wake_file(rsrc, float(cfg.get("probe_timeout") or 300.0))
     t1 = time.time()
     if job:
         job.t_wake, job.phase = t_wake, "probing"
         if job.stopped:
             raise JobStopped()
-    info = ffprobe(src, cfg)
+    try:
+        info = ffprobe(rsrc, cfg)
+    except ProbeTimeout:
+        raise
+    except RuntimeError as ex:
+        if rsrc == src:
+            raise
+        log(f"HTTP read failed ({str(ex)[:160]}); using the mount path for {rel}")
+        rsrc = src
+        info = ffprobe(src, cfg)
     t_probe = time.time() - t1
     if job:
         job.t_probe = t_probe
@@ -916,7 +964,7 @@ def build_entry(rel, src, size, cfg, gov, zscale_ok):
             raise NoMatchingRelease(f"runtime {info['duration']:.1f} s matches no release already built (tolerance {float(cfg.get('share_tolerance', 2.0)):g} s)")
     n = max(1, int(info["duration"] // cfg["interval"]))
     allowed = cfg["budget_mb"] * 1e6 * (info["duration"] / 7200.0) * cfg["safety"]
-    ext = make_extractor(cfg, src, info, zscale_ok)
+    ext = make_extractor(cfg, rsrc, info, zscale_ok)
     final = entry_dir(cfg["store"], rel)
     os.makedirs(os.path.dirname(final), exist_ok=True)
     work = tempfile.mkdtemp(prefix=".work-", dir=os.path.dirname(final))

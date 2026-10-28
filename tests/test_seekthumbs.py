@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -970,6 +971,75 @@ try:
     check(f"40 drop-and-reopen cycles leave no memory behind ({grown13:.0f} MB; it was 52 MB before the fix)", grown13 < 25, grown13)
     check("the closed containers are not kept in the open list", len(ext13.opened) <= 1, len(ext13.opened))
     ext13.close()
+
+    # ---- reading over HTTP (read_url_base): range requests to a local server; a dead address falls back to the mount path
+    import http.server
+    import socketserver
+    lib14, store14 = os.path.join(tmp, "lib14"), os.path.join(tmp, "store14")
+    f14 = os.path.join(lib14, "Http.Film.2021.mkv")
+    make_film(f14, seconds=120, size="320x180", gop=24)
+    hits14 = []
+
+    class RangeHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _serve(self, head):
+            path = os.path.join(lib14, os.path.basename(self.path.split("?")[0]))
+            if not os.path.isfile(path):
+                self.send_error(404)
+                return
+            size = os.path.getsize(path)
+            rng = self.headers.get("Range")
+            lo, hi = 0, size - 1
+            if rng and rng.startswith("bytes="):
+                a, _, b = rng[6:].partition("-")
+                lo = int(a) if a else max(0, size - int(b))
+                hi = min(size - 1, int(b)) if (a and b) else size - 1
+            hits14.append((self.command, rng))
+            self.send_response(206 if rng else 200)
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(hi - lo + 1))
+            if rng:
+                self.send_header("Content-Range", f"bytes {lo}-{hi}/{size}")
+            self.end_headers()
+            if not head:
+                with open(path, "rb") as fh:
+                    fh.seek(lo)
+                    try:
+                        self.wfile.write(fh.read(hi - lo + 1))
+                    except OSError:
+                        pass
+
+        def do_GET(self):
+            self._serve(False)
+
+        def do_HEAD(self):
+            self._serve(True)
+
+    class QuietServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+        daemon_threads = True
+
+    srv14 = QuietServer(("127.0.0.1", 0), RangeHandler)
+    threading.Thread(target=srv14.serve_forever, daemon=True).start()
+    port14 = srv14.server_address[1]
+    out14 = io.StringIO()
+    with contextlib.redirect_stderr(out14), contextlib.redirect_stdout(out14):
+        n14 = st.scan_pass(cfg(lib14, store14, interval=10.0, workers=2, read_url_base=f"http://u:secret@127.0.0.1:{port14}/"))
+    ix14 = st.read_index(st.entry_dir(store14, "Http.Film.2021.mkv"))
+    check("a film is built by reading over HTTP", n14 == 1 and ix14 and ix14["count"] == 12 and all(x > 0 for x in ix14["lengths"]), out14.getvalue()[-500:])
+    check("the server saw range requests, and the log says HTTP", any(r for _, r in hits14) and "over HTTP" in out14.getvalue(), (len(hits14), out14.getvalue()[-300:]))
+    check("the password is not written to the log", "secret" not in out14.getvalue() and st.mask_url("http://u:p@h/x") == "http://h/x" and st.mask_url("http://h/x") == "http://h/x")
+    check("the address is the base plus the film's path, percent-encoded", st.read_source({"read_url_base": "http://h:1/w/"}, "A B/c+d.mkv", "/m/A B/c+d.mkv") == "http://h:1/w/A%20B/c%2Bd.mkv")
+    check("without read_url_base the mount path is used", st.read_source({}, "a/b.mkv", "/m/a/b.mkv") == "/m/a/b.mkv")
+    srv14.shutdown()
+    srv14.server_close()
+    lib15, store15 = os.path.join(tmp, "lib15"), os.path.join(tmp, "store15")
+    make_film(os.path.join(lib15, "Fall.Back.2021.mkv"), seconds=60, size="320x180", gop=24)
+    out15 = io.StringIO()
+    with contextlib.redirect_stderr(out15), contextlib.redirect_stdout(out15):
+        n15 = st.scan_pass(cfg(lib15, store15, interval=10.0, workers=2, read_url_base=f"http://127.0.0.1:{port14}/"))     # nothing listens there any more
+    check("a dead HTTP address falls back to the mount path and still builds the film", n15 == 1 and "using the mount path" in out15.getvalue() and st.entry_current(store15, "Fall.Back.2021.mkv", os.path.getsize(os.path.join(lib15, "Fall.Back.2021.mkv"))), out15.getvalue()[-500:])
 
     # ---- memory guard: the number of parallel reads follows the free memory
     real_mem, real_cg = st.mem_available_mb, st.cgroup_headroom_mb
