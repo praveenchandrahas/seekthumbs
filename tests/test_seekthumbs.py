@@ -955,6 +955,22 @@ try:
     ix_k2 = st.read_index(st.entry_dir(store12, os.path.relpath(f12, lib12)))
     check("a refine that fails keeps the coarse set unchanged", ix_k2 == ix_k and "REFINE FAILED" in out12.getvalue() and "is kept" in out12.getvalue(), out12.getvalue()[-400:])
 
+    # ---- a failed read drops the open decoder; that must give its memory back (it used to leave ~20 MB each on a 4K HDR film)
+    lib13 = os.path.join(tmp, "lib13")
+    f13 = os.path.join(lib13, "Drop.Film.2021.mkv")
+    make_film(f13, seconds=12, size="3840x2160", gop=24)
+    ext13 = st.AvExtractor(f13, st.vf_chain(dict(transfer="bt709"), 240, False), dict(st.DEFAULTS))
+    out13 = os.path.join(tmp, "drop.ppm")
+    check("a read works before the drop test", ext13.grab(3.0, out13)[0])
+    base13 = st.self_rss_mb()
+    for k13 in range(40):
+        ext13._drop()
+        ext13.grab(3.0 + (k13 % 5), out13)
+    grown13 = st.self_rss_mb() - base13
+    check(f"40 drop-and-reopen cycles leave no memory behind ({grown13:.0f} MB; it was 52 MB before the fix)", grown13 < 25, grown13)
+    check("the closed containers are not kept in the open list", len(ext13.opened) <= 1, len(ext13.opened))
+    ext13.close()
+
     # ---- memory guard: the number of parallel reads follows the free memory
     real_mem, real_cg = st.mem_available_mb, st.cgroup_headroom_mb
     st.cgroup_headroom_mb = lambda: None

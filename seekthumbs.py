@@ -645,6 +645,17 @@ def write_ppm(path, w, h, rows):
             f.write(r)
 
 
+def release_memory():
+    """Runs the cyclic garbage collector and asks glibc to return freed memory to the system (a no-op where that is not available)."""
+    import gc
+    gc.collect()
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
+
 class AvExtractor:
     """PyAV: each worker thread opens the film ONCE and then only seeks. Skips the repeated open, probe and index reads of one process per
     thumbnail. Needs PyAV; HDR needs a PyAV linked to an ffmpeg that has zscale (the apt package python3-av on Ubuntu, not the pip wheel)."""
@@ -712,6 +723,13 @@ class AvExtractor:
                 st[0].close()
             except Exception:                  # noqa: BLE001
                 pass
+            with self.lock:
+                self.opened = [o for o in self.opened if o is not st[0]]      # a closed container must not be kept alive by this list
+            del st
+            # The container, its decoder and the filter graph refer to each other, so dropping them does not free them: they wait for Python's cyclic
+            # collector, which does not see the hundreds of MB of native memory behind them. Measured on the owner's rig: every failed read (mount I/O
+            # errors come in bursts) left about 20 MB behind, 3 GB after one film. Collect now, and give the freed memory back to the system.
+            release_memory()
 
     @staticmethod
     def _log_setup():
@@ -775,6 +793,7 @@ class AvExtractor:
                 except Exception:              # noqa: BLE001
                     pass
             self.opened = []
+        release_memory()
 
 
 class AutoExtractor:
