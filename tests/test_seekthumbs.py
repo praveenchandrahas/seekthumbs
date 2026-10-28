@@ -1047,6 +1047,52 @@ try:
     check("without read_url_base the mount path is used", st.read_source({}, "a/b.mkv", "/m/a/b.mkv") == "/m/a/b.mkv")
     srv14.shutdown()
     srv14.server_close()
+    # ---- bounded range reads: no request asks for more than one chunk; the open-ended default asks for the rest of the file
+    f16 = os.path.join(lib14, "Bounded.mkv")                       # the range server above serves lib14
+    make_film(f16, seconds=120, size="640x360", gop=24)
+    sz16 = os.path.getsize(f16)
+    asked16 = []
+
+    class H16(RangeHandler):
+        def _serve(self, head):
+            rng = self.headers.get("Range") or ""
+            if rng.startswith("bytes="):
+                a, _, b = rng[6:].partition("-")
+                asked16.append((min(sz16 - 1, int(b)) if b else sz16 - 1) - int(a or 0) + 1)
+            super()._serve(head)
+
+    srv16 = QuietServer(("127.0.0.1", 0), H16)
+    threading.Thread(target=srv16.serve_forever, daemon=True).start()
+    u16 = f"http://u:secret@127.0.0.1:{srv16.server_address[1]}/Bounded.mkv"
+    vf16 = st.vf_chain(dict(duration=120, width=640, height=360, transfer=""), 200, False)
+    res16 = {}
+    for kb in (256, 0):
+        asked16.clear()
+        ex16 = st.AvExtractor(u16, vf16, dict(st.DEFAULTS, http_chunk_kb=kb, seek_timeout=30.0))
+        oks = [ex16.grab(t, os.path.join(tmp, f"b16_{kb}_{t}.ppm"))[0] for t in (5, 35, 65, 95)]
+        ex16.close()
+        res16[kb] = (all(oks), max(asked16 or [0]), sum(asked16))
+    check("bounded reading decodes thumbnails over HTTP, with Basic auth taken from user:password@", res16[256][0], res16)
+    check("bounded reading: no single request asks for more than one chunk", 0 < res16[256][1] <= 256 * 1024, res16)
+    check("bounded reading asks for far less than the open-ended default", res16[256][2] * 2 < res16[0][2], res16)
+    rf16 = st.RangeFile(u16, chunk=65536)
+    rf16.seek(100)
+    a16 = rf16.read(70000)
+    with open(f16, "rb") as fh16:
+        fh16.seek(100)
+        same16 = fh16.read(70000)
+    check("RangeFile returns the same bytes as the file, across chunk borders", a16 == same16 and rf16.seek(0, 2) == sz16 and rf16.seek(0, 0x10000) == sz16, (len(a16), rf16.size))
+    srv16.shutdown()
+    srv16.server_close()
+
+    # ---- a source that keeps answering with a server error: the read stops after server_error_stop failures in a row (not after an hour of back-off)
+    gv = st.Governor(4, cooldown=0.01)
+    check("a success between server errors resets the count", not gv.server_error("HTTP Error 503 Service Unavailable", 3) and not gv.server_error("HTTP Error 503", 3)
+          and (gv.release("ok") or True) and not gv.server_error("HTTP Error 503", 3))
+    gv = st.Governor(4, cooldown=0.01)
+    r_ = [gv.server_error("Server returned 5XX Server Error reply", 3) for _ in range(3)]
+    check("three server errors in a row with a limit of 3 stop; other failures do not count", r_ == [False, False, True] and not st.Governor(2).server_error("no frame decoded", 1))
+    check("the provider words are recognised", all(st.PROVIDER_RE.search(x) for x in ("HTTP Error 503 Service Unavailable", "bytes_limit_reached", "Server returned 5XX Server Error reply")))
     lib15, store15 = os.path.join(tmp, "lib15"), os.path.join(tmp, "store15")
     make_film(os.path.join(lib15, "Fall.Back.2021.mkv"), seconds=60, size="320x180", gop=24)
     out15 = io.StringIO()

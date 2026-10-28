@@ -51,12 +51,12 @@ DEFAULTS = dict(library="", store="", interval=20.0, width=400, workers=6, pause
                 min_size_mb=300.0, max_films=0, budget_mb=10.0, safety=0.8, seek_timeout=90.0, probesize="1M", yield_to_playback=1,
                 breaker_hours=1.0, extractor="auto", rate_cooldown=30.0,
                 play_workers=2, play_pause=2.0, worker_mem_mb=1000, read_url_base="", mem_reserve_mb=3000, play_extractor="pyav", share=1, share_tolerance=2.0, encode_jobs=0, skip_tv=0, exclude="",
-                probe_timeout=300.0, wake_ahead=3, progress_every=60.0)
+                probe_timeout=300.0, wake_ahead=3, progress_every=60.0, http_chunk_kb=1024, server_error_stop=12)
 PLAYERS = ("mpv", "mpv-atmos", "mpv-object-audio", "vlc", "kodi", "kodi.bin")
 SUFFIX = ".seekthumbs"
 STOP = False
 # Words that mean "the server is pushing back" rather than "this part of the file is bad".
-THROTTLE_RE = re.compile(r"429|too many request|rate.?limit|quota|slow.?down|service unavailable|\b503\b|\b403\b|forbidden|temporar|timed? ?out|timeout",
+THROTTLE_RE = re.compile(r"429|too many request|rate.?limit|quota|slow.?down|service unavailable|\b503\b|\b403\b|forbidden|http error 5\d\d|returned 5xx|server error|bytes_limit|temporar|timed? ?out|timeout",
                          re.I)
 
 
@@ -389,6 +389,10 @@ class State:
 
 # ---------------------------------------------------------------- the governor: as fast as the mount allows
 
+# A source that answers with a server error again and again is not slow, it is refusing (a debrid account over its traffic limit does exactly this).
+PROVIDER_RE = re.compile(r"http error 5\d\d|returned 5xx|server error|service unavailable|\b503\b|bytes_limit|limit (?:reached|exceeded)|traffic limit", re.I)
+
+
 class Governor:
     """Limits how many reads run at once. Starts at the maximum. On a rate-limit signal it halves the limit and stops all new reads for a
     cool-down (30 s, doubling to 15 min); after 40 clean reads it raises the limit by one again. Only the first signal of a burst acts."""
@@ -404,6 +408,7 @@ class Governor:
         self.throttles = 0
         self.consec = 0
         self.floor_bursts = 0
+        self.server_errs = 0                # consecutive reads (all workers) that failed with a server error / provider limit
         self.cv = threading.Condition()
 
     def acquire(self):
@@ -432,6 +437,7 @@ class Governor:
                     log(f"rate-limit signal: reads in parallel now {self.limit}, no new reads for {self.cool:.0f} s")
                     self.cool = min(self.cool * 2, 900.0)
             elif outcome == "ok":
+                self.server_errs = 0
                 self.consec = 0
                 self.floor_bursts = 0
                 self.streak += 1
@@ -442,6 +448,13 @@ class Governor:
                         self.cool = self.base
                     log(f"clean reads: parallel reads back to {self.limit}")
             self.cv.notify_all()
+
+    def server_error(self, why, limit):
+        """Counts a read that failed with a server error. True once `limit` in a row failed with no success between: the source is refusing."""
+        with self.cv:
+            if PROVIDER_RE.search(why or ""):
+                self.server_errs += 1
+            return limit > 0 and self.server_errs >= limit
 
     def hopeless(self):
         """True after 8 rate-limit bursts in a row at one read at a time (about an hour of backing off with the defaults)."""
@@ -692,6 +705,117 @@ def release_memory():
         pass
 
 
+class RangeFile:
+    """A read-only, seekable file over HTTP that asks for BOUNDED ranges (default 1 MiB at a time) instead of one open-ended request.
+    ffmpeg's own HTTP reader asks for 'bytes=N-' and lets the server stream on; the data in flight when it stops is still billed. Measured on the
+    owner's rig: about 65 MB received per thumbnail, about 16 GB for one 4K film, and the debrid account hit its traffic limit. Here a read
+    never fetches more than `chunk` bytes beyond what is asked for. Errors carry the HTTP status ("HTTP Error 503 ...") so THROTTLE_RE sees them."""
+
+    def __init__(self, url, chunk=1 << 20, timeout=60.0, keep=4):
+        import urllib.parse
+        import base64
+        u = urllib.parse.urlsplit(url)
+        self.auth = None
+        if u.username is not None:
+            raw = f"{urllib.parse.unquote(u.username)}:{urllib.parse.unquote(u.password or '')}"
+            self.auth = "Basic " + base64.b64encode(raw.encode()).decode()
+            host = u.hostname + (f":{u.port}" if u.port else "")
+            url = urllib.parse.urlunsplit((u.scheme, host, u.path, u.query, ""))
+        self.url, self.chunk, self.timeout, self.keep = url, max(4096, int(chunk)), float(timeout), max(1, int(keep))
+        self.pos = 0
+        self.size = None
+        self.cache = {}                    # chunk number -> bytes, oldest first
+        self.bytes = 0                     # received from the server, for measuring
+        self.requests = 0
+        self.closed = False
+
+    def _fetch(self, lo, hi):
+        import urllib.request
+        import urllib.error
+        hd = {"Range": f"bytes={lo}-{hi}"}
+        if self.auth:
+            hd["Authorization"] = self.auth
+        try:
+            with urllib.request.urlopen(urllib.request.Request(self.url, headers=hd), timeout=self.timeout) as r:
+                data = r.read(hi - lo + 1)
+                cr = r.headers.get("Content-Range", "")
+                status = getattr(r, "status", 206)
+        except urllib.error.HTTPError as ex:
+            if ex.code == 416 and self.size is not None:
+                return b""
+            raise OSError(f"HTTP Error {ex.code} {ex.reason}") from None
+        except (urllib.error.URLError, TimeoutError) as ex:
+            raise OSError(f"HTTP read failed: {ex}") from None
+        self.requests += 1
+        self.bytes += len(data)
+        if "/" in cr and cr.rsplit("/", 1)[1].isdigit():
+            self.size = int(cr.rsplit("/", 1)[1])
+        elif status == 200 and self.size is None:        # the server ignored Range and sent everything: not usable bounded
+            raise OSError("HTTP server ignores Range requests")
+        return data
+
+    def _size(self):
+        if self.size is None:
+            self._fetch(0, 0)
+        return self.size or 0
+
+    def _chunk(self, n):
+        d = self.cache.get(n)
+        if d is None:
+            d = self._fetch(n * self.chunk, (n + 1) * self.chunk - 1)
+            self.cache[n] = d
+            while len(self.cache) > self.keep:
+                self.cache.pop(next(iter(self.cache)))
+        return d
+
+    def readable(self):
+        return True
+
+    def seekable(self):
+        return True
+
+    def tell(self):
+        return self.pos
+
+    def seek(self, off, whence=0):
+        if whence == 0:
+            self.pos = off
+        elif whence == 1:
+            self.pos += off
+        elif whence == 2:
+            self.pos = self._size() + off
+        elif whence == 0x10000:                           # AVSEEK_SIZE
+            return self._size()
+        self.pos = max(0, self.pos)
+        return self.pos
+
+    def read(self, n=-1):
+        size = self._size()
+        if n is None or n < 0:
+            n = size - self.pos
+        n = max(0, min(n, size - self.pos))
+        out = []
+        while n > 0:
+            c, o = divmod(self.pos, self.chunk)
+            d = self._chunk(c)
+            part = d[o:o + n]
+            if not part:
+                break
+            out.append(part)
+            self.pos += len(part)
+            n -= len(part)
+        return b"".join(out)
+
+    def readinto(self, b):
+        d = self.read(len(b))
+        b[:len(d)] = d
+        return len(d)
+
+    def close(self):
+        self.closed = True
+        self.cache = {}
+
+
 class AvExtractor:
     """PyAV: each worker thread opens the film ONCE and then only seeks. Skips the repeated open, probe and index reads of one process per
     thumbnail. Needs PyAV; HDR needs a PyAV linked to an ffmpeg that has zscale (the apt package python3-av on Ubuntu, not the pip wheel)."""
@@ -732,13 +856,19 @@ class AvExtractor:
         self.src, self.vf, self.cfg = src, vf, cfg
         self.local = threading.local()
         self.opened = []
+        self.files = []                      # RangeFile objects, for the byte count
         self.lock = threading.Lock()
 
     def _state(self):
         st = getattr(self.local, "st", None)
         if st is None:
             import av
-            c = av.open(self.src, options={"probesize": str(self.cfg["probesize"])}, timeout=float(self.cfg["seek_timeout"]))
+            if self.src.startswith(("http://", "https://")) and int(self.cfg.get("http_chunk_kb") or 0) > 0:
+                rf = RangeFile(self.src, chunk=int(self.cfg["http_chunk_kb"]) * 1024, timeout=float(self.cfg["seek_timeout"]))
+                self.files.append(rf)
+                c = av.open(rf, options={"probesize": str(self.cfg["probesize"])}, timeout=float(self.cfg["seek_timeout"]))
+            else:
+                c = av.open(self.src, options={"probesize": str(self.cfg["probesize"])}, timeout=float(self.cfg["seek_timeout"]))
             stream = c.streams.video[0]
             try:
                 stream.codec_context.skip_frame = "NONKEY"
@@ -1059,6 +1189,10 @@ def build_entry(rel, src, size, cfg, gov, zscale_ok):
                     with lock:
                         stats["retried"] += 1
                     continue
+                if not ok and gov.server_error(why, int(cfg.get("server_error_stop") or 0)):
+                    abort.append(("provider", f"{gov.server_errs} reads in a row got a server error ({(why or '')[:80]}); the source is refusing, "
+                                               "probably a provider traffic limit"))
+                    return
                 if kind == "throttled":
                     if gov.hopeless():
                         abort.append(("throttled", why))
@@ -1105,6 +1239,8 @@ def build_entry(rel, src, size, cfg, gov, zscale_ok):
             raise KeyboardInterrupt
         if abort:
             kind, why = abort[0]
+            if kind == "provider":
+                raise Throttled(f"{why}. Pausing; the queue is kept and nothing is marked failed")
             if kind == "throttled":
                 raise Throttled(f"still rate-limited after backing off: {why[:120]}")
             raise ReadFailures(f"repeated failed reads: {why[:150]}")
