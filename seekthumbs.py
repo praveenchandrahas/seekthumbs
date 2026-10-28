@@ -49,7 +49,7 @@ VIDEO_EXT = {".mkv", ".mp4", ".m4v", ".avi", ".mov", ".ts", ".m2ts", ".webm", ".
 DEFAULTS = dict(library="", store="", interval=20.0, width=240, workers=6, pause=0.0, film_pause=0.0, poll=1800.0, settle=600.0,
                 min_size_mb=300.0, max_films=0, budget_mb=10.0, safety=0.8, seek_timeout=90.0, probesize="1M", yield_to_playback=1,
                 breaker_hours=1.0, extractor="auto", rate_cooldown=30.0,
-                play_workers=2, play_pause=2.0, worker_mem_mb=600, mem_reserve_mb=3000, play_extractor="pyav", share=1, share_tolerance=2.0, encode_jobs=0, skip_tv=0, exclude="",
+                play_workers=2, play_pause=2.0, worker_mem_mb=1000, mem_reserve_mb=3000, play_extractor="pyav", share=1, share_tolerance=2.0, encode_jobs=0, skip_tv=0, exclude="",
                 probe_timeout=300.0, wake_ahead=3, progress_every=60.0)
 PLAYERS = ("mpv", "mpv-atmos", "mpv-object-audio", "vlc", "kodi", "kodi.bin")
 SUFFIX = ".seekthumbs"
@@ -976,7 +976,7 @@ def build_entry(rel, src, size, cfg, gov, zscale_ok):
                 now = time.time()
                 rate = (ok - last) / max(0.001, now - t_last)
                 left = (n - ok) / rate / 60 if rate > 0 else float("inf")
-                log(f"  {ok}/{n} thumbnails read, {rate:.2f}/s in the last {now - t_last:.0f} s" + (f", about {left:.0f} min left" if left != float("inf") else ", no progress"))
+                log(f"  {ok}/{n} thumbnails read, {rate:.2f}/s in the last {now - t_last:.0f} s" + (f", about {left:.0f} min left" if left != float("inf") else ", no progress") + (f", memory {self_rss_mb():.0f} MB" if self_rss_mb() else ""))
                 last, t_last = ok, now
 
         tk = threading.Thread(target=ticker, daemon=True)
@@ -1297,19 +1297,72 @@ def mem_available_mb():
     return None
 
 
+def self_rss_mb():
+    """This process's resident memory in MB (all read threads share it), or None."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024.0
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def cgroup_headroom_mb():
+    """(headroom MB, limit MB) under the tightest memory.max of this process's cgroup or any parent, or None when there is none (or no cgroup v2).
+    Headroom = limit minus the anonymous (and kernel) memory in use there; page cache is left out because the kernel drops it before it kills anything.
+    MemAvailable describes the whole computer, while a service started with `-p MemoryMax=5G` is killed at 5 GB whatever is free."""
+    root = os.environ.get("SEEKTHUMBS_CGROUP_ROOT", "/sys/fs/cgroup")
+    try:
+        with open(os.environ.get("SEEKTHUMBS_PROC_CGROUP", "/proc/self/cgroup")) as f:
+            rel = next(l.strip().split(":", 2)[2] for l in f if l.startswith("0::"))
+    except (OSError, StopIteration, IndexError):
+        return None
+    best = None
+    parts = [p for p in rel.split("/") if p]
+    for depth in range(len(parts), -1, -1):
+        d = os.path.join(root, *parts[:depth])
+        try:
+            with open(os.path.join(d, "memory.max")) as f:
+                raw = f.read().strip()
+            if raw == "max":
+                continue
+            limit = int(raw)
+            stat = {}
+            with open(os.path.join(d, "memory.stat")) as f:
+                for line in f:
+                    k, _, v = line.partition(" ")
+                    stat[k] = int(v)
+            used = stat.get("anon", 0) + stat.get("kernel", stat.get("slab_unreclaimable", 0))
+        except (OSError, ValueError):
+            continue
+        room = (limit - used) / 1048576.0
+        if best is None or room < best[0]:
+            best = (room, limit / 1048576.0)
+    return best
+
+
 def memory_limited_workers(requested, cfg):
     """(workers to use, note). Every parallel read keeps its own open decoder (about 180 MB each for a 4K 10-bit HEVC film measured without HDR
-    tone-mapping, more with it), so the number of reads is cut to what the free memory allows after `mem_reserve_mb` is left for the rest of the
-    computer: workers <= (MemAvailable - mem_reserve_mb) / worker_mem_mb. worker_mem_mb = 0 turns the limit off. Never below 1."""
+    tone-mapping; the HDR path on the owner's rig used far more), so the number of reads is cut to what memory allows:
+    workers <= (MemAvailable - mem_reserve_mb) / worker_mem_mb, and, under a cgroup memory limit (systemd-run -p MemoryMax=...), also
+    <= (that limit's headroom - 300 MB) / worker_mem_mb. worker_mem_mb = 0 turns the limit off. Never below 1."""
     requested = max(1, int(requested))
     per, reserve = float(cfg.get("worker_mem_mb") or 0), float(cfg.get("mem_reserve_mb") or 0)
-    avail = mem_available_mb() if per > 0 else None
-    if avail is None:
+    if per <= 0:
         return requested, ""
-    n = max(1, min(requested, int((avail - reserve) // per)))
+    avail, cg, caps = mem_available_mb(), cgroup_headroom_mb(), []
+    if avail is not None:
+        caps.append((int((avail - reserve) // per), f"{avail / 1024:.1f} GB of memory is free, {reserve / 1024:.1f} GB is kept for the rest of the computer"))
+    if cg is not None:
+        caps.append((int((cg[0] - 300) // per), f"only {max(cg[0], 0) / 1024:.1f} GB is left under this service's {cg[1] / 1024:.1f} GB memory limit"))
+    if not caps:
+        return requested, ""
+    n_cap, why = min(caps, key=lambda c: c[0])
+    n = max(1, min(requested, n_cap))
     if n < requested:
-        return n, (f"{requested} parallel reads asked for, {n} used: {avail / 1024:.1f} GB of memory is free, {reserve / 1024:.1f} GB is kept for the rest of the "
-                   f"computer and each read is counted at {per:.0f} MB (settings worker_mem_mb and mem_reserve_mb)")
+        return n, f"{requested} parallel reads asked for, {n} used: {why}; each read is counted at {per:.0f} MB (settings worker_mem_mb and mem_reserve_mb)"
     return n, ""
 
 

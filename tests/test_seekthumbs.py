@@ -915,7 +915,8 @@ try:
     check("periodic counts appear while a film is read", "thumbnails read," in out9.getvalue(), out9.getvalue()[-400:])
 
     # ---- memory guard: the number of parallel reads follows the free memory
-    real_mem = st.mem_available_mb
+    real_mem, real_cg = st.mem_available_mb, st.cgroup_headroom_mb
+    st.cgroup_headroom_mb = lambda: None
     try:
         mc = {"worker_mem_mb": 600, "mem_reserve_mb": 3000}
         st.mem_available_mb = lambda: 7500.0
@@ -936,8 +937,33 @@ try:
         with contextlib.redirect_stderr(out10), contextlib.redirect_stdout(out10):
             st.scan_pass(cfg(lib10, store10, settle=0, share=0, workers=8, pause=0.0))
         check("a build logs the memory limit and reads with the reduced number", "MEMORY: 8 parallel reads asked for, 1 used" in out10.getvalue() and "with 1 parallel read(s)" in out10.getvalue(), out10.getvalue()[-500:])
+        # a cgroup limit (systemd-run -p MemoryMax=5G): headroom, not free memory, decides
+        st.mem_available_mb = lambda: 12000.0
+        st.cgroup_headroom_mb = lambda: (2500.0, 5120.0)    # (2500 - 300) / 600 = 3 reads
+        n3, note3 = st.memory_limited_workers(8, mc)
+        check("under a 5 GB cgroup limit with 2.5 GB left: 3 reads, and the note names the limit", n3 == 3 and "under this service's 5.0 GB memory limit" in note3, (n3, note3))
+        st.cgroup_headroom_mb = lambda: (-100.0, 5120.0)
+        check("a limit already exceeded: still one read", st.memory_limited_workers(8, mc)[0] == 1)
     finally:
-        st.mem_available_mb = real_mem
+        st.mem_available_mb, st.cgroup_headroom_mb = real_mem, real_cg
+    # the real reader, on a fake cgroup tree: tightest memory.max on the path wins, page cache is not counted
+    cgr = os.path.join(tmp, "cgroot")
+    os.makedirs(os.path.join(cgr, "user.slice", "app.service"))
+    for rel, mx, anon in (("user.slice", "max", 0), ("user.slice/app.service", str(5 * 1024 ** 3), 2 * 1024 ** 3)):
+        with open(os.path.join(cgr, rel, "memory.max"), "w") as f:
+            f.write(mx + "\n")
+        with open(os.path.join(cgr, rel, "memory.stat"), "w") as f:
+            f.write(f"anon {anon}\nfile {9 * 1024 ** 3}\n")
+    with open(os.path.join(tmp, "proc-cgroup"), "w") as f:
+        f.write("0::/user.slice/app.service\n")
+    os.environ["SEEKTHUMBS_CGROUP_ROOT"], os.environ["SEEKTHUMBS_PROC_CGROUP"] = cgr, os.path.join(tmp, "proc-cgroup")
+    try:
+        hr = st.cgroup_headroom_mb()
+        check("cgroup headroom = limit minus anonymous memory (3 GB left of 5; cache ignored)", hr and abs(hr[0] - 3072) < 1 and abs(hr[1] - 5120) < 1, hr)
+        os.remove(os.path.join(cgr, "user.slice", "app.service", "memory.max"))
+        check("no limit anywhere on the path: None", st.cgroup_headroom_mb() is None)
+    finally:
+        del os.environ["SEEKTHUMBS_CGROUP_ROOT"], os.environ["SEEKTHUMBS_PROC_CGROUP"]
     ok_adj = st.prefer_to_be_killed_first(300)
     if ok_adj:
         with open("/proc/self/oom_score_adj") as f:
