@@ -96,6 +96,8 @@ try:
     st.scan_pass(c)
     state = st.State(store)
     check("corrupt file is recorded as failed", "Broken.mkv" in state.d["fail"])
+    why = state.d["fail"]["Broken.mkv"]["why"]
+    check("the failure reason is kept without the file's path in front of it", "Broken.mkv" not in why and "<file>" in why and len(why.replace("<file>", "")) > 10, why)
     check("failed file is not retried at once", st.scan_pass(c, dry=True) == 0)
 
     # --- prune: orphan removal, and refusal when the library looks unmounted

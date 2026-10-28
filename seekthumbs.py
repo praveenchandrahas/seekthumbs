@@ -574,7 +574,9 @@ def ffprobe(path, cfg):
     except subprocess.TimeoutExpired:
         raise ProbeTimeout(f"ffprobe did not finish within {tmo:.0f} s") from None
     if r.returncode != 0:
-        raise RuntimeError("ffprobe: " + (r.stderr.strip() or "failed")[:200])
+        # ffprobe starts every message with the file's full path; with long release names that used up the whole 200 characters and hid the reason
+        msg = (r.stderr.strip() or "failed").replace(path, "<file>").replace(os.path.basename(path), "<file>")
+        raise RuntimeError("ffprobe: " + msg[:300])
     j = json.loads(r.stdout or "{}")
     st = (j.get("streams") or [{}])[0]
     dur = float(j.get("format", {}).get("duration") or 0)
