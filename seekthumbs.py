@@ -840,6 +840,8 @@ class AutoExtractor:
         self.av_off = av is None
         self.av_ok = 0
         self.av_err = 0
+        self.fallbacks = 0
+        self.lock = threading.Lock()
         self.name = "pyav" if av else "ffmpeg"
 
     def grab(self, t, out):
@@ -851,6 +853,7 @@ class AutoExtractor:
                     return r
                 if r[1].startswith("decode error"):          # a bad read, not a broken PyAV: the caller retries; no 6x dearer ffmpeg command
                     return r
+                self.note_fallback(t, r[1])
             except Exception as ex:            # noqa: BLE001
                 why = str(ex)
                 if THROTTLE_RE.search(why):
@@ -859,7 +862,17 @@ class AutoExtractor:
                 if self.av_err >= 3 and self.av_ok == 0:
                     self.av_off = True
                     log("PyAV does not work on this film, using the ffmpeg command instead:", why[:120])
+                else:
+                    self.note_fallback(t, why)
         return self.cli.grab(t, out)
+
+    def note_fallback(self, t, why):
+        """A PyAV read failed and the dearer ffmpeg command takes over for it. Logged for the first 3, then every 50th, so it is no longer silent."""
+        with self.lock:
+            self.fallbacks += 1
+            n = self.fallbacks
+        if n <= 3 or n % 50 == 0:
+            log(f"PyAV read at {t:.0f} s failed ({why[:100]}); the ffmpeg command reads it instead (fallback #{n} on this film)")
 
     def close(self):
         if self.av:
