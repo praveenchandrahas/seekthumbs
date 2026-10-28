@@ -61,7 +61,7 @@ thumbnails per second, the network speed of the whole computer (so other downloa
 store, and how much of the library is covered. Every chart has a Table view, and the log is at the bottom.
 
 It listens on 127.0.0.1 only and every request needs the token; the Host header must be this computer; the page cannot name a file, only pick films that seekthumbs itself
-listed. It reads the library and writes the thumbnail store, nothing else. The queue is saved in the store (`.web-queue.json`), so closing the page keeps it. Do not run
+listed. It reads the library and writes the thumbnail store, nothing else. The queue is saved in the store (`.web-queue.json`), so closing the page keeps it. The film being read is recorded there too: if the page is killed mid-film (out of memory, power cut), the film comes back at the top of the queue on the next start (`RESUMED:` in the log) instead of being lost. Until 2026-10-28 the film in hand was dropped from the saved queue the moment it started, so it was lost after a kill. Do not run
 `scan` or `watch` at the same time as a Start from the page (one film is never built twice, but the two would compete for the mount).
 
 ## How it works

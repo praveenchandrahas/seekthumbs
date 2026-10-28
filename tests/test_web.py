@@ -173,6 +173,17 @@ try:
     e2 = web.Engine(st, cfg)
     check("a new engine reads the saved queue back", [q for q in e2.queue] == [ids[0]], e2.queue)
     e2.close()
+    # killed mid-film: the file says a film was in hand and the queue no longer holds it -> it comes back at the top
+    with open(os.path.join(store, ".web-queue.json"), "w") as f:
+        json.dump({"queue": [], "current": ids[1]}, f)
+    e3 = web.Engine(st, cfg)
+    check("a film that was being read when the page was killed is back at the top of the queue", e3.queue == [ids[1]], e3.queue)
+    e3.close()
+    with open(os.path.join(store, ".web-queue.json"), "w") as f:
+        json.dump({"queue": [ids[0]], "current": ids[0]}, f)
+    e4 = web.Engine(st, cfg)
+    check("a film in hand that is also queued is not duplicated", e4.queue == [ids[0]], e4.queue)
+    e4.close()
     engine = None
 
     # ---- status and tags helpers

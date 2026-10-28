@@ -166,7 +166,7 @@ class Engine:
             tmp = self.qfile + ".tmp"
             os.makedirs(os.path.dirname(self.qfile), exist_ok=True)
             with open(tmp, "w") as f:
-                json.dump({"queue": self.queue}, f)
+                json.dump({"queue": self.queue, "current": self.job_gid}, f)
             os.replace(tmp, self.qfile)
         except OSError:
             pass
@@ -174,7 +174,13 @@ class Engine:
     def _load_queue(self):
         try:
             with open(self.qfile) as f:
-                ids = json.load(f).get("queue", [])
+                saved = json.load(f)
+            ids = list(saved.get("queue", []))
+            cur = saved.get("current")
+            if cur and cur in self.groups and cur not in ids:
+                # the film that was being read when the page stopped (killed, rebooted): it goes back to the top, not lost
+                ids.insert(0, cur)
+                self.st.log(f"RESUMED: {self.groups[cur]['title']} was being read when the page stopped; it is back at the top of the queue")
             self.queue = [i for i in ids if i in self.groups]
         except (OSError, ValueError, AttributeError):
             self.queue = []
@@ -303,8 +309,8 @@ class Engine:
                         continue
                     self.note = ""
                     gid = self.queue.pop(0)
-                    self._save_queue()
                     self.job_gid = gid
+                    self._save_queue()                # records the film in hand too, so a kill does not lose it
                     self.rev += 1
                     return gid
                 if self.state == "running" and not self.queue:
@@ -326,6 +332,7 @@ class Engine:
                 with self.cv:
                     self.run_seconds += time.time() - t0
                     self.job, self.job_gid = None, None
+                    self._save_queue()
                     if self.state == "stopping":
                         self.state, self.note = "idle", "stopped; the film that was being read was discarded and is back at the top of the queue"
                     elif self.stop_after and self.state in ("running", "paused"):
