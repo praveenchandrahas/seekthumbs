@@ -26,7 +26,8 @@ local utils = require "mp.utils"
 local options = require "mp.options"
 
 local opts = { library = "", store = "", overlay_id = 42, ffmpeg = "ffmpeg", cache_items = 80, debug = false,
-              build = true, builder = "", python = "python3", min_size_mb = 300, recheck_s = 10 }
+              build = true, builder = "", python = "python3", min_size_mb = 300, recheck_s = 10,
+              no_overlay = false, no_convert = false }   -- the last two are for finding a cost: no_convert answers hovers with nothing, no_overlay converts but never shows
 options.read_options(opts, "seekthumbs")
 
 local SUFFIX = ".seekthumbs"
@@ -217,7 +218,7 @@ local function now() return mp.get_time and mp.get_time() or os.time() end
 
 local function show_now(i, x, y)
     local e = cache[i]
-    if not e then return end
+    if not e or opts.no_overlay then return end
     mp.commandv("overlay-add", tostring(opts.overlay_id), tostring(x), tostring(y), e.file, "0", "bgra",
                 tostring(e.w), tostring(e.h), tostring(e.w * 4))
     shown, shown_x, shown_y, last_show = i, x, y, now()
@@ -318,6 +319,7 @@ local function on_thumb(t, x, y)
     local i = pick(t)
     if i == nil then return end
     want, last_x, last_y = i, x, y
+    if opts.no_convert then return end
     if cache[i] then show(i, x, y) else convert(i, x, y) end
 end
 

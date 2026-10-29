@@ -633,7 +633,7 @@ try:
         LUA = lupa.LuaRuntime(unpack_returned_tuples=True)
         source = open(os.path.join(TOOL, "thumbfast.lua")).read()
 
-        def viewer(path, file_size, library=lib, store_=store, builder="", build=True, min_size=300):
+        def viewer(path, file_size, library=lib, store_=store, builder="", build=True, min_size=300, extra=""):
             """Loads thumbfast.lua with a mocked mp API. Returns (handlers, log, props)."""
             log = []
             props = {"path": path, "file-size": str(file_size) if file_size is not None else None, "working-directory": "/", "pid": "4242"}
@@ -693,6 +693,8 @@ try:
             chunk = source.replace('local opts = { library = "", store = "",', f'local opts = {{ library = "{library}", store = "{store_}",')
             chunk = chunk.replace('build = true, builder = "", python = "python3", min_size_mb = 300,',
                                   f'build = {"true" if build else "false"}, builder = "{builder}", python = "python3", min_size_mb = {min_size},')
+            if extra:
+                chunk = chunk.replace("no_overlay = false, no_convert = false", extra)
             LUA.execute(chunk)
             return handlers, log, props
 
@@ -799,6 +801,18 @@ try:
             check("pictures the mouse had passed are not converted (2 at once, then the newest)", h["started"] - k0 == 3, h["started"] - k0)
         adds = [l for l in log if l[1] == "overlay-add"]
         check("after the sweep the picture under the mouse is shown where the mouse is", adds and adds[-1][3] == str(10 + int(times[-1])), adds[-1] if adds else None)
+
+        for extra, what in (("no_overlay = true, no_convert = false", "no_overlay"), ("no_overlay = false, no_convert = true", "no_convert")):
+            h, log, _ = viewer(film, size, extra=extra)
+            h["ev"]["file-loaded"]()
+            log.clear()
+            k0 = h["started"]
+            for t in (37, 80, 120):
+                h["msg"]["thumb"](str(t), "100", "50")
+                advance(h, 0.05)
+            check(f"{what}: nothing is shown", not [l for l in log if l[1] == "overlay-add"], log)
+            check(f"{what}: " + ("pictures are still converted" if what == "no_overlay" else "no conversion is started"),
+                  (h["started"] - k0 > 0) if what == "no_overlay" else (h["started"] - k0 == 0), h["started"] - k0)
 
         h, log, _ = viewer(film, size)
         h["ev"]["file-loaded"]()
