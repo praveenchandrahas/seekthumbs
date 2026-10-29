@@ -633,7 +633,7 @@ try:
         LUA = lupa.LuaRuntime(unpack_returned_tuples=True)
         source = open(os.path.join(TOOL, "thumbfast.lua")).read()
 
-        def viewer(path, file_size, library=lib, store_=store, builder="", build=True, min_size=300, extra=""):
+        def viewer(path, file_size, library=lib, store_=store, builder="", build=True, min_size=300, extra="", bulk=True, ffmpeg_cmd=None):
             """Loads thumbfast.lua with a mocked mp API. Returns (handlers, log, props)."""
             log = []
             props = {"path": path, "file-size": str(file_size) if file_size is not None else None, "working-directory": "/", "pid": "4242"}
@@ -695,6 +695,10 @@ try:
                                   f'build = {"true" if build else "false"}, builder = "{builder}", python = "python3", min_size_mb = {min_size},')
             if extra:
                 chunk = chunk.replace("no_overlay = false, no_convert = false", extra)
+            if not bulk:
+                chunk = chunk.replace("bulk = true,", "bulk = false,")
+            if ffmpeg_cmd:
+                chunk = chunk.replace('ffmpeg = "ffmpeg",', f'ffmpeg = "{ffmpeg_cmd}",')
             LUA.execute(chunk)
             return handlers, log, props
 
@@ -742,7 +746,7 @@ try:
         check("overlay uses the thumbfast overlay id (42)", adds and adds[0][2] == "42")
         if adds:
             f, offs, w_, h_, stride = adds[0][5], int(adds[0][6]), int(adds[0][8]), int(adds[0][9]), int(adds[0][10])
-            check("raw frame file has the size the overlay claims", os.path.getsize(f) == w_ * h_ * 4 and stride == w_ * 4)
+            check("the frame the overlay points at lies inside its raw file", offs % (w_ * h_ * 4) == 0 and os.path.getsize(f) >= offs + w_ * h_ * 4 and stride == w_ * 4)
         log.clear()
         advance(h, 0.05)
         h["msg"]["thumb"]("37", "120", "50")
@@ -783,7 +787,7 @@ try:
         advance(h, 0.2)
         check("leaving the bar cancels a picture that was waiting", not [l for l in log if l[1] == "overlay-add" and l[3] == "133"] and any(l[1] == "overlay-remove" for l in log), log)
 
-        h, log, _ = viewer(film, size)
+        h, log, _ = viewer(film, size, bulk=False)
         h["ev"]["file-loaded"]()
         h["defer"] = True
         log.clear()
@@ -803,7 +807,7 @@ try:
         check("after the sweep the picture under the mouse is shown where the mouse is", adds and adds[-1][3] == str(10 + int(times[-1])), adds[-1] if adds else None)
 
         for extra, what in (("no_overlay = true, no_convert = false", "no_overlay"), ("no_overlay = false, no_convert = true", "no_convert")):
-            h, log, _ = viewer(film, size, extra=extra)
+            h, log, _ = viewer(film, size, extra=extra, bulk=(what == "no_convert"))
             h["ev"]["file-loaded"]()
             log.clear()
             k0 = h["started"]
@@ -814,7 +818,7 @@ try:
             check(f"{what}: " + ("pictures are still converted" if what == "no_overlay" else "no conversion is started"),
                   (h["started"] - k0 > 0) if what == "no_overlay" else (h["started"] - k0 == 0), h["started"] - k0)
 
-        h, log, _ = viewer(film, size)
+        h, log, _ = viewer(film, size, bulk=False)
         h["ev"]["file-loaded"]()
         h["defer"] = True
         log.clear()
@@ -824,6 +828,113 @@ try:
             finish_one(h)
         advance(h, 0.1)
         check("a conversion that ends after another film was loaded shows nothing", not [l for l in log if l[1] == "overlay-add"], log)
+
+
+        # --- one ffmpeg run per film (2026-10-29 18:59 run: with one ffmpeg per picture the audio still ran dry 110 times inside the hover and
+        # the display dropped 21 frames, none outside it; mpv's "worker" thread, which runs `subprocess`, was the busiest thread). The hover must start nothing.
+        def raw_of(jpg_bytes):
+            return subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-f", "image2pipe", "-c:v", "mjpeg", "-i", "-", "-f", "rawvideo", "-pix_fmt", "bgra", "-"],
+                                  input=jpg_bytes, capture_output=True).stdout
+
+        def overlay_bytes(log_, k=-1):
+            a = [l for l in log_ if l[1] == "overlay-add"][k]
+            f_, off_, w2, h2 = a[5], int(a[6]), int(a[8]), int(a[9])
+            with open(f_, "rb") as fh:
+                fh.seek(off_)
+                return fh.read(w2 * h2 * 4)
+
+        edir_b = os.path.join(store, os.path.relpath(film, lib) + ".seekthumbs")
+        pack_b = open(os.path.join(edir_b, "thumbs.pack"), "rb").read()
+        h, log, _ = viewer(film, size)
+        h["ev"]["file-loaded"]()
+        check("loading a film starts exactly one ffmpeg for all its pictures", h["started"] == 1, h["started"])
+        k0 = h["started"]
+        log.clear()
+        for k in range(0, cnt):                          # hover over every picture in turn
+            h["msg"]["thumb"](str(k * step), "100", "50")
+            advance(h, 0.05)
+        check("hovering over every picture starts no program at all", h["started"] == k0, h["started"] - k0)
+        check("every picture was shown", len([l for l in log if l[1] == "overlay-add"]) == cnt, len([l for l in log if l[1] == "overlay-add"]))
+        for k in (0, cnt // 2, cnt - 1):
+            log.clear()
+            advance(h, 0.05)
+            h["msg"]["thumb"](str(k * step), str(200 + k), "50")
+            o_, l_ = eix["offsets"][k], eix["lengths"][k]
+            check(f"picture {k} shown from the shared file is the right picture", overlay_bytes(log) == raw_of(pack_b[o_:o_ + l_]), k)
+
+        # a picture that could not be built has no bytes in the pack: the frames after it must still be matched correctly
+        import shutil
+        store_g = os.path.join(tmp, "store_gap")
+        rel_g = os.path.relpath(film, lib)
+        dg = os.path.join(store_g, rel_g + ".seekthumbs")
+        os.makedirs(dg)
+        parts_g = [pack_b[o:o + l] for o, l in zip(eix["offsets"], eix["lengths"])]
+        drop = 2
+        parts_g[drop] = b""
+        offs_g, pos = [], 0
+        for b_ in parts_g:
+            offs_g.append(pos)
+            pos += len(b_)
+        open(os.path.join(dg, "thumbs.pack"), "wb").write(b"".join(parts_g))
+        ig = dict(eix)
+        ig.update(offsets=offs_g, lengths=[len(b_) for b_ in parts_g])
+        json.dump(ig, open(os.path.join(dg, "index.json"), "w"))
+        h, log, _ = viewer(film, size, store_=store_g)
+        h["ev"]["file-loaded"]()
+        log.clear()
+        advance(h, 0.05)
+        h["msg"]["thumb"](str((drop + 1) * step), "10", "10")
+        orig = pack_b[eix["offsets"][drop + 1]:eix["offsets"][drop + 1] + eix["lengths"][drop + 1]]
+        check("with a missing picture earlier in the pack, the next ones are still the right pictures", overlay_bytes(log) == raw_of(orig))
+        log.clear()
+        advance(h, 0.05)
+        h["msg"]["thumb"](str(drop * step), "10", "10")
+        o_, l_ = eix["offsets"][drop - 1], eix["lengths"][drop - 1]
+        check("the missing picture shows the nearest earlier one", overlay_bytes(log) == raw_of(pack_b[o_:o_ + l_]))
+
+        # a hover while the one run is still going shows nothing and starts nothing; the picture appears when the run ends
+        h, log, _ = viewer(film, size)
+        h["defer"] = True
+        h["ev"]["file-loaded"]()
+        log.clear()
+        h["msg"]["thumb"]("37", "100", "50")
+        h["msg"]["thumb"]("80", "120", "50")
+        check("while the one run is going, hovers start nothing and show nothing", h["started"] == 1 and not [l for l in log if l[1] == "overlay-add"], (h["started"], log))
+        finish_one(h)
+        advance(h, 0.1)
+        adds = [l for l in log if l[1] == "overlay-add"]
+        check("when it ends, the picture under the mouse appears where the mouse is", len(adds) == 1 and adds[0][3:5] == ("120", "50"), adds)
+        # ... and a film change in the middle drops it
+        h, log, _ = viewer(film, size)
+        h["defer"] = True
+        h["ev"]["file-loaded"]()
+        h["msg"]["thumb"]("37", "100", "50")
+        h["ev"]["file-loaded"]()
+        log.clear()
+        while h["queue"]:
+            finish_one(h)
+        advance(h, 0.1)
+        check("a one-run conversion that ends after another film was loaded shows nothing", not [l for l in log if l[1] == "overlay-add"], log)
+
+        # fallbacks: ffmpeg refuses the whole pack -> one picture at a time; a pack too big for bulk_max_mb -> one picture at a time
+        fake = os.path.join(tmp, "fake-ffmpeg.sh")
+        open(fake, "w").write('#!/bin/sh\ncase "$*" in *image2pipe*) exit 1;; esac\nexec ffmpeg "$@"\n')
+        os.chmod(fake, 0o755)
+        h, log, _ = viewer(film, size, ffmpeg_cmd=fake)
+        h["ev"]["file-loaded"]()
+        k0 = h["started"]
+        log.clear()
+        h["msg"]["thumb"]("37", "100", "50")
+        check("if the one run fails, a hover falls back to converting that picture", h["started"] - k0 == 1 and len([l for l in log if l[1] == "overlay-add"]) == 1, (h["started"] - k0, log))
+        h, log, _ = viewer(film, size, extra="no_overlay = false, no_convert = false, bulk_max_mb = 0")
+        h["ev"]["file-loaded"]()
+        k0 = h["started"]
+        log.clear()
+        h["msg"]["thumb"]("37", "100", "50")
+        check("a pack over bulk_max_mb is converted one picture at a time", k0 == 0 and h["started"] == 1 and len([l for l in log if l[1] == "overlay-add"]) == 1, (k0, h["started"]))
+        h, log, _ = viewer(film, size, bulk=False)
+        h["ev"]["file-loaded"]()
+        check("bulk=no starts nothing when the film loads", h["started"] == 0, h["started"])
 
         h, log, _ = viewer(film, size + 1)
         h["ev"]["file-loaded"]()

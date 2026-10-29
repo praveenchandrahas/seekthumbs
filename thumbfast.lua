@@ -27,6 +27,7 @@ local options = require "mp.options"
 
 local opts = { library = "", store = "", overlay_id = 42, ffmpeg = "ffmpeg", cache_items = 80, debug = false,
               build = true, builder = "", python = "python3", min_size_mb = 300, recheck_s = 10,
+              bulk = true, bulk_max_mb = 256,            -- bulk: convert the whole pack with ONE ffmpeg run when the film loads (see below)
               no_overlay = false, no_convert = false }   -- the last two are for finding a cost: no_convert answers hovers with nothing, no_overlay converts but never shows
 options.read_options(opts, "seekthumbs")
 
@@ -47,6 +48,14 @@ local last_show, show_timer, show_args = -1e9, nil, nil
 local running, waiting = 0, nil
 local last_x, last_y = 0, 0
 local gen = 0              -- bumped when another film is loaded: a conversion finishing after that belongs to the old film and is dropped
+-- Why one ffmpeg run for the whole pack (2026-10-29, run at 18:59 with the throttled viewer, which still stuttered): while hovering, mpv's
+-- "worker" thread (the pool that runs `subprocess`) went from nothing to 13-41 % of a core, the whole computer used 1.7 cores more than
+-- everything we watch could explain, an ffmpeg was alive in 18 of 34 samples, and the audio ran dry 110 times and the display dropped 21
+-- frames, all inside the hover and none outside it. Starting a program from inside a 1 GB, many-threaded mpv is the one thing the hover
+-- did that plain mouse seeking does not. So the hover starts nothing now: the pack is turned into one raw file when the film loads, and a
+-- hover only points overlay-add at the right offset in it. (If that cannot be done, the one-ffmpeg-per-picture path below still works.)
+local bulk = { state = nil, file = nil, token = nil }     -- state: nil | "running" | "ready" | "failed"
+local start_bulk, convert                              -- defined further down
 
 local function dbg(...) if opts.debug then mp.msg.info(...) end end
 
@@ -175,6 +184,7 @@ local function adopt()
         mp.command_native({ name = "subprocess", args = { "mkdir", "-p", tmpdir } })
     end
     mp.msg.info(string.format("seek thumbnails: %s (%d x %d, every %gs)", rel, ix.w, ix.h, ix.interval))
+    start_bulk()
     return true
 end
 
@@ -219,7 +229,7 @@ local function now() return mp.get_time and mp.get_time() or os.time() end
 local function show_now(i, x, y)
     local e = cache[i]
     if not e or opts.no_overlay then return end
-    mp.commandv("overlay-add", tostring(opts.overlay_id), tostring(x), tostring(y), e.file, "0", "bgra",
+    mp.commandv("overlay-add", tostring(opts.overlay_id), tostring(x), tostring(y), e.file, string.format("%d", e.off or 0), "bgra",
                 tostring(e.w), tostring(e.h), tostring(e.w * 4))
     shown, shown_x, shown_y, last_show = i, x, y, now()
 end
@@ -261,7 +271,54 @@ local function pick(t)
     return i
 end
 
-local function convert(i, x, y)
+-- One ffmpeg run turns the whole pack (JPEGs laid end to end) into one raw file of equal-sized frames. A picture that failed to build has
+-- no bytes in the pack, so its frame number is the count of the pictures before it that have some. If the result is not exactly the size that
+-- implies, nothing in it is trusted and the viewer falls back to one ffmpeg per picture.
+function start_bulk()
+    bulk.state = nil
+    if not opts.bulk or opts.no_convert or not ix or not edir or not tmpdir then return end
+    local frames, n = {}, 0
+    for i = 0, ix.count - 1 do
+        if (ix.lengths[i + 1] or 0) > 0 then frames[i] = n; n = n + 1 end
+    end
+    if n == 0 then return end
+    local limit = (tonumber(opts.bulk_max_mb) or 256) * 1048576
+    if n * ix.w * ix.h * 4 > limit then
+        mp.msg.info(string.format("seek thumbnails: %d pictures would take more than %g MB raw; converting them one at a time instead", n, limit / 1048576))
+        return
+    end
+    local out = utils.join_path(tmpdir, string.format("all-%d.bgra", gen))
+    local mygen, w = gen, ix.w
+    bulk.state, bulk.file = "running", out
+    bulk.token = mp.command_native_async({ name = "subprocess", playback_only = false, capture_stdout = true, capture_stderr = true,
+        args = { opts.ffmpeg, "-nostdin", "-v", "error", "-threads", "1", "-y", "-f", "image2pipe", "-c:v", "mjpeg",
+                 "-i", utils.join_path(edir, "thumbs.pack"), "-f", "rawvideo", "-pix_fmt", "bgra", out } },
+        function(ok, res)
+            if mygen ~= gen then os.remove(out); return end
+            local function fail(why)
+                dbg("bulk conversion failed:", why)
+                bulk.state = "failed"
+                os.remove(out)
+                if want ~= nil and ix and not cache[want] then convert(want, last_x, last_y) end
+            end
+            if not ok or not res or res.status ~= 0 then fail("ffmpeg"); return end
+            local r = io.open(out, "rb")
+            if not r then fail("no output"); return end
+            local total = r:seek("end")
+            r:close()
+            local per = n * w * 4                         -- bytes of one "row" of frames, so the height is total / per
+            local h = total and total >= per and math.floor(total / per) or 0
+            if h < 1 or h * per ~= total then fail("size " .. tostring(total)); return end
+            bulk.state = "ready"
+            for i, fno in pairs(frames) do
+                cache[i] = { file = out, off = fno * w * h * 4, w = w, h = h, shared = true }
+            end
+            mp.msg.info(string.format("seek thumbnails: %d pictures ready", n))
+            if want ~= nil and cache[want] then show(want, last_x, last_y) end
+        end)
+end
+
+function convert(i, x, y)
     if pending[i] then return end
     if running >= MAX_CONV then waiting = { i, x, y }; return end         -- only the newest one waits; the rest are passed over
     pending[i] = true
@@ -320,7 +377,9 @@ local function on_thumb(t, x, y)
     if i == nil then return end
     want, last_x, last_y = i, x, y
     if opts.no_convert then return end
-    if cache[i] then show(i, x, y) else convert(i, x, y) end
+    if cache[i] then show(i, x, y)
+    elseif bulk.state == "running" then return          -- the one conversion is on its way and shows what is wanted when it is done
+    else convert(i, x, y) end
 end
 
 local function on_clear()
@@ -331,7 +390,10 @@ end
 local function on_file_loaded()
     clear()
     stop_timer()
-    for k in pairs(cache) do os.remove(cache[k].file) end
+    for k in pairs(cache) do if not cache[k].shared then os.remove(cache[k].file) end end
+    if bulk.token and mp.abort_async_command then pcall(mp.abort_async_command, bulk.token) end     -- stop a conversion of the film that is leaving
+    if bulk.file then os.remove(bulk.file) end
+    bulk = { state = nil, file = nil, token = nil }
     cache, order, pending, want = {}, {}, {}, nil
     gen = gen + 1
     ix, edir = nil, nil
