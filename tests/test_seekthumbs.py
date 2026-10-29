@@ -637,7 +637,7 @@ try:
             """Loads thumbfast.lua with a mocked mp API. Returns (handlers, log, props)."""
             log = []
             props = {"path": path, "file-size": str(file_size) if file_size is not None else None, "working-directory": "/", "pid": "4242"}
-            handlers = {"msg": {}, "ev": {}, "timers": [], "killed": [], "clock": {"t": 1000.0}}
+            handlers = {"msg": {}, "ev": {}, "timers": [], "killed": [], "clock": {"t": 1000.0}, "timeouts": [], "defer": False, "queue": [], "started": 0}
             py = {}
 
             def get_property(name):
@@ -656,8 +656,17 @@ try:
             def command_native_async(t, cb):
                 t = dict(t)
                 args = list(dict(t["args"]).values())
+                handlers["started"] += 1
+                if handlers["defer"]:                  # the test finishes it later, so several can be in flight at once
+                    handlers["queue"].append((args, cb))
+                    return
                 r = subprocess.run(args, capture_output=True)
                 cb(True, LUA.table(status=r.returncode))
+
+            def add_timeout(sec, fn):
+                e = {"due": handlers["clock"]["t"] + sec, "fn": fn, "dead": False}
+                handlers["timeouts"].append(e)
+                return LUA.table(kill=lambda *a: e.__setitem__("dead", True))
 
             def reg_msg(name, fn):
                 handlers["msg"][name] = fn
@@ -669,7 +678,7 @@ try:
             # Stand-ins for the three modules the script requires.
             g = LUA.globals()
             mp = LUA.table(get_property=get_property, commandv=commandv, command_native=command_native, command_native_async=command_native_async,
-                           register_script_message=reg_msg, register_event=reg_ev, get_time=lambda: handlers["clock"]["t"],
+                           register_script_message=reg_msg, register_event=reg_ev, get_time=lambda: handlers["clock"]["t"], add_timeout=add_timeout,
                            add_periodic_timer=lambda sec, fn: (handlers["timers"].append(fn), LUA.table(kill=lambda *a: handlers["killed"].append(1)))[1],
                            msg=LUA.table(info=lambda *a: log.append(("info",) + tuple(str(x) for x in a))))
             utils = LUA.eval("""function(json_decode, json_encode)
@@ -702,6 +711,20 @@ try:
                 return {k: _to_py(v) for k, v in t.items()}
             return t
 
+        def advance(h, dt):
+            """Moves the mocked clock on and runs the timeouts that are due."""
+            h["clock"]["t"] += dt
+            for e in list(h["timeouts"]):
+                if not e["dead"] and e["due"] <= h["clock"]["t"]:
+                    e["dead"] = True
+                    e["fn"]()
+
+        def finish_one(h):
+            """Finishes the oldest conversion that is in flight (defer mode): runs the real command, then calls back."""
+            args, cb = h["queue"].pop(0)
+            r = subprocess.run(args, capture_output=True)
+            cb(True, LUA.table(status=r.returncode))
+
         size = os.path.getsize(film)
         # the film was regenerated after the first build; rebuild so the store matches the current file
         st.scan_pass(c)
@@ -719,13 +742,74 @@ try:
             f, offs, w_, h_, stride = adds[0][5], int(adds[0][6]), int(adds[0][8]), int(adds[0][9]), int(adds[0][10])
             check("raw frame file has the size the overlay claims", os.path.getsize(f) == w_ * h_ * 4 and stride == w_ * 4)
         log.clear()
+        advance(h, 0.05)
         h["msg"]["thumb"]("37", "120", "50")
         check("a second hover on the same thumbnail reuses the converted frame", len([l for l in log if l[1] == "overlay-add"]) == 1)
         h["msg"]["clear"]()
         check("leaving the bar removes the overlay", any(l[1] == "overlay-remove" for l in log))
         log.clear()
+        advance(h, 0.05)
         h["msg"]["thumb"]("99999", "10", "10")
         check("a time past the end uses the last thumbnail", len([l for l in log if l[1] == "overlay-add"]) == 1)
+
+        # --- the cost of hovering. Measured 2026-10-29 (4K stream): the viewer sent overlay-add on every mouse move, mpv went from 26 % to
+        # 76-101 % of a core, with 14 dropped frames and 16 audio underruns in 9 s while hovering. The viewer now sends a picture at most
+        # every 0.04 s, only when it or its place changed, and runs at most 2 conversions at once.
+        eix = json.load(open(os.path.join(store, os.path.relpath(film, lib) + ".seekthumbs", "index.json")))
+        step, cnt = eix["interval"], eix["count"]
+        h, log, _ = viewer(film, size)
+        h["ev"]["file-loaded"]()
+        log.clear()
+        h["msg"]["thumb"]("37", "100", "50")
+        for k in range(300):                          # 300 mouse moves in 0.3 s, the place changing every 10 ms
+            h["msg"]["thumb"]("37", str(100 + k // 10), "50")
+            advance(h, 0.001)
+        advance(h, 0.1)
+        adds = [l for l in log if l[1] == "overlay-add"]
+        check("300 mouse moves in 0.3 s send at most 10 overlays", 1 <= len(adds) <= 10, len(adds))
+        check("the last overlay is where the mouse ended up", adds and adds[-1][3:5] == ("129", "50"), adds[-1] if adds else None)
+        log.clear()
+        for k in range(100):
+            h["msg"]["thumb"]("37", "129", "50")
+            advance(h, 0.05)
+        check("the same picture in the same place is not sent again", not [l for l in log if l[1] == "overlay-add"], len(log))
+        log.clear()
+        h["msg"]["thumb"]("37", "131", "50")          # shown at once (the gap since the last one is over)
+        advance(h, 0.01)
+        h["msg"]["thumb"]("37", "133", "50")          # too soon: it waits
+        h["msg"]["clear"]()                           # the mouse leaves before the gap is over
+        advance(h, 0.2)
+        check("leaving the bar cancels a picture that was waiting", not [l for l in log if l[1] == "overlay-add" and l[3] == "133"] and any(l[1] == "overlay-remove" for l in log), log)
+
+        h, log, _ = viewer(film, size)
+        h["ev"]["file-loaded"]()
+        h["defer"] = True
+        log.clear()
+        k0 = h["started"]
+        times = [i * step for i in range(cnt)]
+        for t in times:                               # a fast sweep along the bar over every thumbnail
+            h["msg"]["thumb"](str(t), str(10 + int(t)), "50")
+            advance(h, 0.001)
+        check("a fast sweep starts at most 2 conversions at once", 1 <= len(h["queue"]) <= 2 and h["started"] - k0 <= 2, (len(h["queue"]), h["started"] - k0))
+        while h["queue"]:
+            finish_one(h)
+            advance(h, 0.001)
+        advance(h, 0.1)
+        if cnt >= 5:
+            check("pictures the mouse had passed are not converted (2 at once, then the newest)", h["started"] - k0 == 3, h["started"] - k0)
+        adds = [l for l in log if l[1] == "overlay-add"]
+        check("after the sweep the picture under the mouse is shown where the mouse is", adds and adds[-1][3] == str(10 + int(times[-1])), adds[-1] if adds else None)
+
+        h, log, _ = viewer(film, size)
+        h["ev"]["file-loaded"]()
+        h["defer"] = True
+        log.clear()
+        h["msg"]["thumb"]("37", "100", "50")
+        h["ev"]["file-loaded"]()                       # another film is loaded while the conversion runs
+        while h["queue"]:
+            finish_one(h)
+        advance(h, 0.1)
+        check("a conversion that ends after another film was loaded shows nothing", not [l for l in log if l[1] == "overlay-add"], log)
 
         h, log, _ = viewer(film, size + 1)
         h["ev"]["file-loaded"]()

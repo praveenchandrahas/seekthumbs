@@ -35,6 +35,17 @@ local want = nil            -- the thumbnail index most recently asked for
 local shown = nil           -- the index currently on screen
 local pending = {}          -- index -> true while its conversion runs
 local cache, order = {}, {} -- index -> {file=, w=, h=}, in the order they were made
+-- Hover cost control. uosc sends a `thumb` message for every mouse move (a hundred or more a second), and each overlay-add makes mpv read
+-- the picture again and redraw, on the thread that also feeds the audio. A sweep along the bar also starts one ffmpeg per new picture.
+-- Measured 2026-10-29 on a 4K stream: mpv's CPU went from 26 % to 76-101 % of a core while hovering, with 14 dropped frames and 16 audio
+-- underruns in 9 s, and none in the 108 s before. So: a picture is sent at most every SHOW_GAP seconds and only when it or its place changed,
+-- and at most MAX_CONV conversions run at once (the newest wanted one goes next; the ones passed over are not made).
+local SHOW_GAP, MAX_CONV = 0.04, 2
+local shown_x, shown_y = nil, nil
+local last_show, show_timer, show_args = -1e9, nil, nil
+local running, waiting = 0, nil
+local last_x, last_y = 0, 0
+local gen = 0              -- bumped when another film is loaded: a conversion finishing after that belongs to the old film and is dropped
 
 local function dbg(...) if opts.debug then mp.msg.info(...) end end
 
@@ -136,8 +147,10 @@ local function send_info()
 end
 
 local function clear()
-    mp.commandv("overlay-remove", tostring(opts.overlay_id))
-    shown = nil
+    if show_timer then show_timer:kill(); show_timer = nil end
+    show_args, waiting = nil, nil
+    if shown ~= nil then mp.commandv("overlay-remove", tostring(opts.overlay_id)) end
+    shown, shown_x, shown_y = nil, nil, nil
 end
 
 local VIDEO = { mkv = true, mp4 = true, m4v = true, avi = true, mov = true, ts = true, m2ts = true, webm = true, wmv = true }
@@ -200,12 +213,36 @@ local function remember(i, entry)
     end
 end
 
-local function show(i, x, y)
+local function now() return mp.get_time and mp.get_time() or os.time() end
+
+local function show_now(i, x, y)
     local e = cache[i]
     if not e then return end
-    mp.commandv("overlay-add", tostring(opts.overlay_id), tostring(math.floor(x)), tostring(math.floor(y)), e.file, "0", "bgra",
+    mp.commandv("overlay-add", tostring(opts.overlay_id), tostring(x), tostring(y), e.file, "0", "bgra",
                 tostring(e.w), tostring(e.h), tostring(e.w * 4))
-    shown = i
+    shown, shown_x, shown_y, last_show = i, x, y, now()
+end
+
+local function show(i, x, y)
+    if not cache[i] then return end
+    x, y = math.floor(x), math.floor(y)
+    if shown == i and shown_x == x and shown_y == y and not show_args then return end      -- nothing changed: do not make mpv redraw
+    local wait = SHOW_GAP - (now() - last_show)
+    if wait <= 0 then
+        if show_timer then show_timer:kill(); show_timer = nil end
+        show_args = nil
+        show_now(i, x, y)
+        return
+    end
+    show_args = { i, x, y }            -- too soon after the last one: keep only the newest and send it when the gap is over
+    if not show_timer then
+        show_timer = mp.add_timeout(wait, function()
+            show_timer = nil
+            local a = show_args
+            show_args = nil
+            if a and want == a[1] and cache[a[1]] then show_now(a[1], a[2], a[3]) end
+        end)
+    end
 end
 
 -- index of the thumbnail to use for a time; walks back over thumbnails that could not be made
@@ -225,6 +262,7 @@ end
 
 local function convert(i, x, y)
     if pending[i] then return end
+    if running >= MAX_CONV then waiting = { i, x, y }; return end         -- only the newest one waits; the rest are passed over
     pending[i] = true
     local f = io.open(utils.join_path(edir, "thumbs.pack"), "rb")
     if not f then pending[i] = nil; return end
@@ -237,21 +275,31 @@ local function convert(i, x, y)
     if not o then pending[i] = nil; return end
     o:write(bytes)
     o:close()
+    running = running + 1
+    local mygen = gen
     mp.command_native_async({ name = "subprocess", playback_only = false, capture_stdout = true, capture_stderr = true,
-        args = { opts.ffmpeg, "-nostdin", "-v", "error", "-y", "-i", jpg, "-f", "rawvideo", "-pix_fmt", "bgra", raw } },
+        args = { opts.ffmpeg, "-nostdin", "-v", "error", "-threads", "1", "-y", "-i", jpg, "-f", "rawvideo", "-pix_fmt", "bgra", raw } },
         function(ok, res)
+            running = running - 1
             pending[i] = nil
             os.remove(jpg)
-            if not ok or not res or res.status ~= 0 then dbg("ffmpeg failed for thumbnail", i); return end
+            if mygen ~= gen then os.remove(raw); return end
+            local function next_waiting()
+                local w = waiting
+                waiting = nil
+                if w and want == w[1] and not cache[w[1]] then convert(w[1], last_x, last_y) end
+            end
+            if not ok or not res or res.status ~= 0 then dbg("ffmpeg failed for thumbnail", i); next_waiting(); return end
             local r = io.open(raw, "rb")
-            if not r then return end
+            if not r then next_waiting(); return end
             local n = r:seek("end")
             r:close()
-            local w = ix.w
-            local h = math.floor(n / (w * 4))
-            if h < 1 then return end
+            local w = ix and ix.w
+            local h = w and math.floor(n / (w * 4)) or 0
+            if h < 1 then next_waiting(); return end
             remember(i, { file = raw, w = w, h = h })
-            if want == i then show(i, x, y) end
+            if want == i then show(i, last_x, last_y) end        -- where the mouse is now, not where it was when this was asked for
+            next_waiting()
         end)
 end
 
@@ -269,7 +317,7 @@ local function on_thumb(t, x, y)
     if not (t and x and y) then return end
     local i = pick(t)
     if i == nil then return end
-    want = i
+    want, last_x, last_y = i, x, y
     if cache[i] then show(i, x, y) else convert(i, x, y) end
 end
 
@@ -283,6 +331,7 @@ local function on_file_loaded()
     stop_timer()
     for k in pairs(cache) do os.remove(cache[k].file) end
     cache, order, pending, want = {}, {}, {}, nil
+    gen = gen + 1
     ix, edir = nil, nil
     if not ini_done then ini_done = true; read_ini() end     -- library=, store= (if not set in script-opts) and min_size_mb from the generator's config.ini
     if not adopt() then
