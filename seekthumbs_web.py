@@ -301,7 +301,14 @@ class Engine:
                     state = st.State(self.cfg["store"])
                     if state.d["breaker_until"] > time.time():
                         self.state = "idle"
-                        self.note = f"the mount pushed back; paused for another {(state.d['breaker_until'] - time.time()) / 60:.0f} min"
+                        why = "the daily read budget is used" if state.d.get("budget_until", 0) >= state.d["breaker_until"] - 1 else "the mount pushed back"
+                        self.note = f"{why}; paused for another {(state.d['breaker_until'] - time.time()) / 60:.0f} min"
+                        continue
+                    blocked, until, used = st.budget_gate(self.cfg)
+                    if blocked:
+                        st.budget_pause(state, self.cfg, until, used)
+                        self.state = "idle"
+                        self.note = f"the daily read budget ({used / 1e9:.0f} GB) is used; paused for another {(until + 60 - time.time()) / 60:.0f} min (until the day rolls over)"
                         continue
                     if self.settings["yield_to_playback"] and st.player_running():
                         self.note = "a player is running; waiting"

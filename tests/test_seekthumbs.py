@@ -1093,6 +1093,49 @@ try:
     r_ = [gv.server_error("Server returned 5XX Server Error reply", 3) for _ in range(3)]
     check("three server errors in a row with a limit of 3 stop; other failures do not count", r_ == [False, False, True] and not st.Governor(2).server_error("no frame decoded", 1))
     check("the provider words are recognised", all(st.PROVIDER_RE.search(x) for x in ("HTTP Error 503 Service Unavailable", "bytes_limit_reached", "Server returned 5XX Server Error reply")))
+
+    # ---- the daily read budget: counted per day (midnight in budget_tz), pauses the queue, rolls over
+    from datetime import datetime as _dt, timezone as _tz
+    store17 = os.path.join(tmp, "store17")
+    os.makedirs(store17)
+    bc = dict(store=store17, daily_budget_gb=1.0, budget_tz="Europe/Berlin")
+    t_a = _dt(2026, 10, 28, 20, 0, tzinfo=_tz.utc).timestamp()           # 21:00 CET on the 28th
+    t_b = _dt(2026, 10, 28, 23, 30, tzinfo=_tz.utc).timestamp()          # 00:30 CET on the 29th
+    d_a, end_a = st.budget_day(bc, t_a)
+    d_b, _ = st.budget_day(bc, t_b)
+    check("the budget day ends at midnight in budget_tz (23:00 UTC in late October)", d_a == "2026-10-28" and d_b == "2026-10-29" and end_a == _dt(2026, 10, 28, 23, 0, tzinfo=_tz.utc).timestamp(), (d_a, d_b, end_a))
+    st.spend_add(bc, 600_000_000, t_a)
+    st.spend_add(bc, 300_000_000, t_a)
+    check("bytes are added up within a day and the gate stays open below the limit", st.spend_load(bc, t_a) == 900_000_000 and not st.budget_gate(bc, t_a)[0])
+    st.spend_add(bc, 200_000_000, t_a)
+    blk, until_a, used_a = st.budget_gate(bc, t_a)
+    check("at the limit the gate closes until the day ends", blk and until_a == end_a and used_a == 1_100_000_000)
+    check("the next day starts again at 0 and the gate opens", st.spend_load(bc, t_b) == 0 and not st.budget_gate(bc, t_b)[0])
+    check("a budget of 0 turns the gate off", not st.budget_gate(dict(bc, daily_budget_gb=0), t_a)[0])
+    check("an unknown zone name falls back instead of failing", st.budget_day(dict(bc, budget_tz="No/Such_Zone"), t_a)[0] == "2026-10-28")
+
+    # a scan with a tiny budget: the first film is built (its bytes counted), then the queue pauses and the rest is kept, not failed
+    lib18, store18 = os.path.join(tmp, "lib18"), os.path.join(tmp, "store18")
+    for nm in ("Budget.One.2021.mkv", "Budget.Two.2021.mkv"):
+        make_film(os.path.join(lib18, nm), seconds=60, size="320x180", gop=24)
+    rx_fake = [0]
+
+    def fake_rx():
+        rx_fake[0] += 2_000_000_000                                   # every call: 2 GB more received
+        return rx_fake[0]
+    real_rx = st.net_rx_bytes
+    st.net_rx_bytes = fake_rx
+    out18 = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(out18), contextlib.redirect_stdout(out18):
+            n18 = st.scan_pass(cfg(lib18, store18, interval=10.0, workers=1, daily_budget_gb=1.0))
+    finally:
+        st.net_rx_bytes = real_rx
+    st18 = st.State(store18)
+    built18 = [r for r in ("Budget.One.2021.mkv", "Budget.Two.2021.mkv") if st.entry_current(store18, r, os.path.getsize(os.path.join(lib18, r)))]
+    check("a scan builds one film, then stops at the daily budget with a clear log line", n18 == 1 and len(built18) == 1 and "daily read budget reached" in out18.getvalue(), (n18, built18, out18.getvalue()[-500:]))
+    check("the pause is held by the breaker and nothing is recorded as failed", st18.d["breaker_until"] > time.time() and st18.d.get("budget_until", 0) >= st18.d["breaker_until"] - 1 and not st18.d["fail"], st18.d)
+
     lib15, store15 = os.path.join(tmp, "lib15"), os.path.join(tmp, "store15")
     make_film(os.path.join(lib15, "Fall.Back.2021.mkv"), seconds=60, size="320x180", gop=24)
     out15 = io.StringIO()

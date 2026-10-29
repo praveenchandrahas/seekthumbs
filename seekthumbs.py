@@ -44,14 +44,14 @@ import threading
 import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 VIDEO_EXT = {".mkv", ".mp4", ".m4v", ".avi", ".mov", ".ts", ".m2ts", ".webm", ".wmv"}
 DEFAULTS = dict(library="", store="", interval=20.0, width=400, workers=6, pause=0.0, film_pause=0.0, poll=1800.0, settle=600.0,
                 min_size_mb=300.0, max_films=0, budget_mb=10.0, safety=0.8, seek_timeout=90.0, probesize="1M", yield_to_playback=1,
                 breaker_hours=1.0, extractor="auto", rate_cooldown=30.0,
                 play_workers=2, play_pause=2.0, worker_mem_mb=1000, read_url_base="", mem_reserve_mb=3000, play_extractor="pyav", share=1, share_tolerance=2.0, encode_jobs=0, skip_tv=0, exclude="",
-                probe_timeout=300.0, wake_ahead=3, progress_every=60.0, http_chunk_kb=1024, server_error_stop=12)
+                probe_timeout=300.0, wake_ahead=3, progress_every=60.0, http_chunk_kb=1024, server_error_stop=12, daily_budget_gb=150.0, budget_tz="Europe/Berlin")
 PLAYERS = ("mpv", "mpv-atmos", "mpv-object-audio", "vlc", "kodi", "kodi.bin")
 SUFFIX = ".seekthumbs"
 STOP = False
@@ -385,6 +385,70 @@ class State:
     def ok(self, rel):
         if self.d["fail"].pop(rel, None) is not None:
             self.save()
+
+
+# ---------------------------------------------------------------- the daily read budget
+
+# Reading thumbnails costs far more data than the thumbnails weigh (about 65 MB received per thumbnail, 16 GB for one 4K film, measured on the owner's
+# rig), and a debrid service counts that against the account. On 2026-10-28 Decypharr stopped serving anything after about 452 GB in one day. The budget
+# counts what this computer received while seekthumbs was reading, per day, and pauses the queue when the day's total reaches daily_budget_gb.
+_SPEND_LOCK = threading.Lock()
+
+
+def budget_day(cfg, now=None):
+    """(day name, epoch of the next midnight) in budget_tz. The default, Europe/Berlin, is the midnight CET at which Decypharr resets its daily counter."""
+    from zoneinfo import ZoneInfo
+    try:
+        tz = ZoneInfo(cfg.get("budget_tz") or "Europe/Berlin")
+    except Exception:                                  # noqa: BLE001 - an unknown zone name must not stop the reading
+        tz = ZoneInfo("Europe/Berlin")
+    d = datetime.fromtimestamp(time.time() if now is None else now, tz)
+    nxt = (d.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)).timestamp()
+    return d.strftime("%Y-%m-%d"), nxt
+
+
+def spend_load(cfg, now=None):
+    """Bytes counted so far today."""
+    day, _ = budget_day(cfg, now)
+    try:
+        with open(os.path.join(cfg["store"], ".spend.json")) as f:
+            d = json.load(f)
+        return int(d["bytes"]) if d.get("day") == day else 0
+    except (OSError, ValueError, KeyError, TypeError):
+        return 0
+
+
+def spend_add(cfg, nbytes, now=None):
+    """Adds bytes to today's total (a new day starts again at 0)."""
+    if not nbytes or nbytes < 0 or not cfg.get("store"):
+        return
+    day, _ = budget_day(cfg, now)
+    path = os.path.join(cfg["store"], ".spend.json")
+    with _SPEND_LOCK:
+        total = spend_load(cfg, now) + int(nbytes)
+        try:
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"day": day, "bytes": total}, f)
+            os.replace(tmp, path)
+        except OSError:
+            pass
+
+
+def budget_gate(cfg, now=None):
+    """(blocked, epoch when the day ends, bytes counted today). Never blocked when daily_budget_gb is 0."""
+    limit = float(cfg.get("daily_budget_gb") or 0) * 1e9
+    used = spend_load(cfg, now)
+    return (limit > 0 and used >= limit), budget_day(cfg, now)[1], used
+
+
+def budget_pause(state, cfg, until, used):
+    """Logs why, and holds the queue until the day rolls over. Uses the circuit breaker, so scan, refine and the web page all stop; nothing is marked failed."""
+    log(f"daily read budget reached: {used / 1e9:.0f} GB received today while reading, limit {float(cfg['daily_budget_gb']):g} GB. Pausing until "
+        f"{datetime.fromtimestamp(until).strftime('%Y-%m-%d %H:%M')} (midnight {cfg.get('budget_tz') or 'Europe/Berlin'}). The queue is kept and nothing is marked failed")
+    state.d["breaker_until"] = max(state.d.get("breaker_until", 0), until + 60)
+    state.d["budget_until"] = until + 60
+    state.save()
 
 
 # ---------------------------------------------------------------- the governor: as fast as the mount allows
@@ -1231,7 +1295,9 @@ def build_entry(rel, src, size, cfg, gov, zscale_ok):
                 list(pool.map(work_one, todo_ix))
         finally:
             halt.set()
-        rx1 = net_rx_bytes()
+            rx1 = net_rx_bytes()                                         # counted against the daily budget even when the build fails
+            if rx0 is not None and rx1 is not None and rx1 >= rx0:
+                spend_add(cfg, rx1 - rx0)
         ext.close()
         if job and job.stopped:
             raise JobStopped()
@@ -1391,6 +1457,10 @@ def scan_pass(cfg, dry=False):
         k += 1
         if STOP:
             break
+        blocked, until, used = budget_gate(cfg)
+        if blocked:
+            budget_pause(state, cfg, until, used)
+            break
         while cfg["yield_to_playback"] and player_running() and not STOP:
             log("a player is running; waiting 5 min")
             sleep_interruptible(300)
@@ -1485,6 +1555,10 @@ def refine_pass(cfg, dry=False):
     done = 0
     for rel, src, size, ix, edir, n_new, keep in batch:
         if STOP:
+            break
+        blocked, until, used = budget_gate(cfg)
+        if blocked:
+            budget_pause(state, cfg, until, used)
             break
         while cfg["yield_to_playback"] and player_running() and not STOP:
             log("a player is running; waiting 5 min")
@@ -1777,6 +1851,7 @@ def cmd_status(cfg):
     st = State(cfg["store"])
     print(f"{len(st.d['fail'])} film(s) with recorded failures" + (f"; circuit breaker open {(st.d['breaker_until'] - time.time()) / 60:.0f} more min"
                                                                if st.d["breaker_until"] > time.time() else ""))
+    print(f"{spend_load(cfg) / 1e9:.1f} GB received today while reading (daily budget {float(cfg.get('daily_budget_gb') or 0):g} GB, 0 = off; the day ends at midnight {cfg.get('budget_tz')})")
     for rel, f in list(st.d["fail"].items())[:5]:
         print(f"  {rel}: {f['why']} (x{f['count']})")
 
