@@ -16,8 +16,9 @@
 -- rebuilt since are ignored).
 --
 -- On play: when the playing file is a video under `library`, at least min_size_mb big, and has no entry, the script starts `seekthumbs.py build FILE`
--- in the background (mpv's detached `run`, so it never blocks mpv and finishes even if you stop watching), once per file per session. `install-viewer`
--- records the path of seekthumbs.py as builder= in script-opts/seekthumbs.conf; build=no there turns this off. Until the entry exists nothing is shown;
+-- in the background (mpv's detached `run`, so it never blocks mpv and finishes even if you stop watching), once per file per session. IT IS OFF BY DEFAULT
+-- (a build of a 4K remux read about 66 MB/s through the mount for as long as it ran, 2026-10-30): `install-viewer --on-play` records the path of
+-- seekthumbs.py as builder= and sets build=yes in script-opts/seekthumbs.conf; plain `install-viewer` sets build=no. Until the entry exists nothing is shown;
 -- the script looks again every recheck_s seconds and tells the OSC as soon as it is there.
 --
 -- Settings: ~/.config/seekthumbs/config.ini (the same file the generator reads: library=, store=), overridable in script-opts/seekthumbs.conf.
@@ -26,7 +27,7 @@ local utils = require "mp.utils"
 local options = require "mp.options"
 
 local opts = { library = "", store = "", overlay_id = 42, ffmpeg = "ffmpeg", cache_items = 80, debug = false,
-              build = true, builder = "", python = "python3", min_size_mb = 300, recheck_s = 10,
+              build = false, builder = "", python = "python3", min_size_mb = 300, recheck_s = 10,
               bulk = true, bulk_max_mb = 256,            -- bulk: convert the whole pack with ONE ffmpeg run when the film loads (see below)
               no_overlay = false, no_convert = false }   -- the last two are for finding a cost: no_convert answers hovers with nothing, no_overlay converts but never shows
 options.read_options(opts, "seekthumbs")

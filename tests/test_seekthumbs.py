@@ -620,8 +620,17 @@ try:
     st.cmd_install_viewer(mc2)
     st.cmd_install_viewer(mc2)
     conf = open(os.path.join(mc2, "script-opts", "seekthumbs.conf")).read().split("\n")
-    check("install-viewer sets builder= once, keeps the other lines, and repeats cleanly",
-          conf.count("debug=yes") == 1 and [l for l in conf if l.startswith("builder=")] == ["builder=" + os.path.join(os.path.abspath(TOOL), "seekthumbs.py")], conf)
+    check("install-viewer (default) sets build=no once, keeps the other lines, and repeats cleanly",
+          conf.count("debug=yes") == 1 and conf.count("build=no") == 1 and not any(l.startswith("build=yes") for l in conf), conf)
+    st.cmd_install_viewer(mc2, on_play=True)
+    st.cmd_install_viewer(mc2, on_play=True)
+    conf = open(os.path.join(mc2, "script-opts", "seekthumbs.conf")).read().split("\n")
+    check("install-viewer --on-play sets builder= and build=yes once and replaces build=no",
+          conf.count("debug=yes") == 1 and conf.count("build=yes") == 1 and "build=no" not in conf
+          and [l for l in conf if l.startswith("builder=")] == ["builder=" + os.path.join(os.path.abspath(TOOL), "seekthumbs.py")], conf)
+    st.cmd_install_viewer(mc2)
+    conf = open(os.path.join(mc2, "script-opts", "seekthumbs.conf")).read().split("\n")
+    check("a plain re-install after --on-play turns the on-play build off again", "build=no" in conf and "build=yes" not in conf, conf)
 
     # --- the viewer
     try:
@@ -691,7 +700,7 @@ try:
             g.package.loaded["mp.options"] = options
             os.environ["XDG_RUNTIME_DIR"] = tmp
             chunk = source.replace('local opts = { library = "", store = "",', f'local opts = {{ library = "{library}", store = "{store_}",')
-            chunk = chunk.replace('build = true, builder = "", python = "python3", min_size_mb = 300,',
+            chunk = chunk.replace('build = false, builder = "", python = "python3", min_size_mb = 300,',
                                   f'build = {"true" if build else "false"}, builder = "{builder}", python = "python3", min_size_mb = {min_size},')
             if extra:
                 chunk = chunk.replace("no_overlay = false, no_convert = false", extra)

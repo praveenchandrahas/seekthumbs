@@ -16,7 +16,7 @@ grows back one step per 40 clean reads. Standard library plus ffmpeg/ffprobe; Py
     seekthumbs.py verify [--deep]   check every store entry against its index and the size budget; --deep also decodes every thumbnail and lists likely corrupt ones
     seekthumbs.py prune [--yes]     list (or delete, with --yes) store entries whose film no longer exists; refuses if the library looks unmounted
     seekthumbs.py install-service [--enable]   write ~/.config/systemd/user/seekthumbs.service
-    seekthumbs.py install-viewer [--mpv-config-dir DIR]   put the mpv viewer (thumbfast.lua) into DIR/scripts, moving a real thumbfast aside
+    seekthumbs.py install-viewer [--mpv-config-dir DIR] [--on-play]   put the mpv viewer (thumbfast.lua) into DIR/scripts, moving a real thumbfast aside; --on-play also turns on the build of the playing film (off by default)
 
 Settings come from ~/.config/seekthumbs/config.ini ([seekthumbs] library=, store=, ...) and can be overridden on the command line.
 
@@ -2007,7 +2007,7 @@ def set_conf_key(path, key, value):
         f.write("\n".join(out).rstrip("\n") + "\n")
 
 
-def cmd_install_viewer(mpv_dir):
+def cmd_install_viewer(mpv_dir, on_play=False):
     mpv_dir = os.path.expanduser(mpv_dir)
     sdir = os.path.join(mpv_dir, "scripts")
     os.makedirs(sdir, exist_ok=True)
@@ -2026,8 +2026,14 @@ def cmd_install_viewer(mpv_dir):
     shutil.copyfile(src, dst)
     print("installed", dst)
     conf = os.path.join(mpv_dir, "script-opts", "seekthumbs.conf")
-    set_conf_key(conf, "builder", os.path.join(os.path.dirname(os.path.abspath(__file__)), "seekthumbs.py"))
-    print("set builder= in", conf, "(the viewer starts a background build of the playing film through it; build=no there turns that off)")
+    if on_play:
+        set_conf_key(conf, "builder", os.path.join(os.path.dirname(os.path.abspath(__file__)), "seekthumbs.py"))
+        set_conf_key(conf, "build", "yes")
+        print("set builder= and build=yes in", conf, "(the viewer now starts a background build of the playing film when it has no thumbnails;")
+        print("WARNING: a build of a 4K remux read about 66 MB/s from a debrid mount for as long as it ran. build=no there turns it off)")
+    else:
+        set_conf_key(conf, "build", "no")
+        print("set build=no in", conf, "(the viewer only SHOWS thumbnails that exist; it starts no build. Use `install-viewer --on-play` to turn the on-play build on)")
     print("Needs uosc (or another OSC that talks to thumbfast), ffmpeg on PATH, and library=/store= in ~/.config/seekthumbs/config.ini.")
     print("Check: play a film that has a store entry; mpv's log shows 'seek thumbnails: <path>'. Undo: delete it and rename thumbfast.lua.bak back.")
 
@@ -2068,6 +2074,7 @@ def main(argv):
     p.add_argument("--open", action="store_true", help="also open the page in your browser")
     p = sub.add_parser("install-viewer", parents=[common])
     p.add_argument("--mpv-config-dir", default="~/.config/mpv-object-audio")
+    p.add_argument("--on-play", action="store_true", help="also turn on the on-play build (off by default: it can read tens of GB per film from a debrid mount)")
     args = ap.parse_args(argv)
     cfg = load_config(args)
     if args.cmd in ("build", "scan", "watch", "serve", "probe", "refine"):
@@ -2102,7 +2109,7 @@ def main(argv):
         import seekthumbs_web
         return seekthumbs_web.serve(sys.modules[__name__], cfg, args.port, args.open)
     elif args.cmd == "install-viewer":
-        cmd_install_viewer(args.mpv_config_dir)
+        cmd_install_viewer(args.mpv_config_dir, args.on_play)
     elif args.cmd == "install-service":
         cmd_install_service(cfg, args.enable)
     return 0
