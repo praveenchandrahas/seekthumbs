@@ -1,0 +1,17 @@
+[Unit]
+Description=Seek-bar thumbnails for the film library (parallel, low priority, backs off on rate limits)
+After=network-online.target
+# does nothing until the library and store are set
+ConditionPathExists=%h/.config/seekthumbs/config.ini
+
+[Service]
+ExecStart=/usr/bin/seekthumbs watch
+Restart=on-failure
+RestartSec=60
+Nice=19
+IOSchedulingClass=idle
+CPUQuota=300%
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

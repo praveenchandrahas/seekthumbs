@@ -1,0 +1,73 @@
+#!/bin/bash
+# seekthumbs-setup: sets the packaged seekthumbs up for ONE user. The package itself never does this.
+#
+#   seekthumbs-setup [--dry-run] install [--mpv-config-dir DIR] [--on-play] [--service]
+#                       put the mpv viewer (thumbfast.lua) into DIR/scripts (default ~/.config/mpv-object-audio) via
+#                       `seekthumbs install-viewer`; the on-play build stays OFF unless --on-play; --service also enables the watcher
+#   seekthumbs-setup [--dry-run] uninstall [--mpv-config-dir DIR]
+#                       disable the watcher, take the viewer out and put a thumbfast.lua.bak back if the installer moved one aside
+#   seekthumbs-setup check
+#
+# Library and store are set in ~/.config/seekthumbs/config.ini (this command never writes that file).
+set -u
+DRY=0; ACTION=; DIR=${HOME:-/nonexistent}/.config/mpv-object-audio; ONPLAY=0; SERVICE=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run|-n) DRY=1 ;;
+    --on-play) ONPLAY=1 ;;
+    --service) SERVICE=1 ;;
+    --mpv-config-dir) shift; DIR=${1:?--mpv-config-dir needs a folder} ;;
+    install|uninstall|check) ACTION=$1 ;;
+    -h|--help) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown argument: $1 (try --help)" >&2; exit 2 ;;
+  esac
+  shift
+done
+[ -n "$ACTION" ] || { echo "usage: seekthumbs-setup [--dry-run] install|uninstall|check" >&2; exit 2; }
+if [ "$(id -u)" = 0 ] && [ "$DRY" = 0 ] && [ "$ACTION" != check ] && [ -z "${SDHT_ALLOW_ROOT:-}" ]; then echo "Run seekthumbs-setup as your normal user, not as root." >&2; exit 1; fi
+DIR=${DIR/#\~/$HOME}
+UNIT=seekthumbs.service
+BIN=${HOME:-/nonexistent}/.local/bin
+UDIR=${XDG_CONFIG_HOME:-${HOME:-/nonexistent}/.config}/systemd/user
+run() { if [ "$DRY" = 1 ]; then echo "would run: $*"; else echo "+ $*"; "$@"; fi; }
+have_systemd_user() { systemctl --user show-environment >/dev/null 2>&1; }
+shadowing() {
+  local found=0
+  if [ -e "$BIN/seekthumbs" ] || [ -e "$BIN/seekthumbs.py" ]; then echo "NOTE: a hand-installed seekthumbs is in $BIN; if $BIN is before /usr/bin on PATH it hides the packaged command."; found=1; fi
+  if [ -e "$UDIR/$UNIT" ]; then echo "NOTE: $UDIR/$UNIT exists (written by 'seekthumbs.py install-service') and overrides the packaged unit; it points at the copy that wrote it."; found=1; fi
+  [ "$found" = 0 ] && echo "no hand-installed copies found in $BIN or $UDIR"
+  return 0
+}
+case "$ACTION" in
+  check)
+    shadowing
+    [ -f "${HOME:-/nonexistent}/.config/seekthumbs/config.ini" ] && echo "config.ini present" || echo "no ~/.config/seekthumbs/config.ini yet (set library= and store= in it)"
+    if have_systemd_user; then echo "$UNIT: $(systemctl --user is-enabled "$UNIT" 2>&1 | head -1) / $(systemctl --user is-active "$UNIT" 2>&1 | head -1)"; fi
+    [ -f "$DIR/scripts/thumbfast.lua" ] && echo "viewer: installed in $DIR/scripts" || echo "viewer: not installed in $DIR/scripts"
+    ;;
+  install)
+    shadowing
+    args=(install-viewer --mpv-config-dir "$DIR"); [ "$ONPLAY" = 1 ] && args+=(--on-play)
+    run seekthumbs "${args[@]}"
+    if [ "$SERVICE" = 1 ]; then
+      if [ "$DRY" = 0 ] && ! have_systemd_user; then echo "No user systemd session available; the watcher was not enabled." >&2; exit 1; fi
+      run systemctl --user daemon-reload
+      run systemctl --user enable --now "$UNIT"
+    else
+      echo "The background watcher is not enabled (add --service once library= and store= are set)."
+    fi
+    if [ "$DRY" = 1 ]; then echo "(dry run: nothing was changed)"; fi
+    ;;
+  uninstall)
+    if have_systemd_user || [ "$DRY" = 1 ]; then run systemctl --user disable --now "$UNIT"; fi
+    f=$DIR/scripts/thumbfast.lua
+    if [ -f "$f" ] && head -c 400 "$f" | grep -q "seekthumbs viewer"; then
+      run rm -f "$f"
+      [ -f "$f.bak" ] && run mv "$f.bak" "$f"
+    else
+      echo "no seekthumbs viewer at $f; left alone"
+    fi
+    echo "Your thumbnails (the store folder), ~/.config/seekthumbs and script-opts/seekthumbs.conf are left in place."
+    if [ "$DRY" = 1 ]; then echo "(dry run: nothing was changed)"; fi
+    ;;
+esac

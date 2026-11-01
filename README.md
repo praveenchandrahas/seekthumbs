@@ -1,5 +1,7 @@
 # seekthumbs: seek-bar thumbnails for an rclone library
 
+[![CI](https://github.com/praveenchandrahas/seekthumbs/actions/workflows/ci.yml/badge.svg)](https://github.com/praveenchandrahas/seekthumbs/actions/workflows/ci.yml) *(CI = unit tests, lint, and a package install/remove test in a clean Ubuntu 24.04 container. A green badge does not show the software works on a real rig.)*
+
 ![seekthumbs: seek, preview, explore. Background seek-bar thumbnails for your film library: a read-only rclone film library, a background thumbnail generator (FFmpeg or PyAV), a local thumbnail pack and index, shown on the mpv + uosc seek bar](docs/img/banner.png)
 
 *Illustration, not a screenshot: the film frames are made up, and the hover preview has since been confirmed in real mpv with uosc on a finished film (2026-10-27); the on-play trigger has not (see "Open items" below).*
@@ -15,6 +17,22 @@ debrid mount (numbers below). Open items are listed at the end.
 
 **Three ways to get thumbnails, use any of them:** (0) *the web page* (`./seekthumbs.py serve`): tick the films you want, press Start, watch the speed and the progress (see below); (1) *on play* (**off by default since 2026-10-30**; `install-viewer --on-play` turns it on): the first time you play a film that has none, the viewer starts a
 gentle background build of that one film; (2) *batch*: `scan` / `watch` build the whole library ahead of time. In both, releases of the same film share one set (see below).
+
+## Install (pre-release, experimental)
+
+Releases are marked **pre-release** on the [releases page](https://github.com/praveenchandrahas/seekthumbs/releases). Download the `.deb` and `SHA256SUMS` from one release, check, then install:
+
+```sh
+sha256sum -c --ignore-missing SHA256SUMS
+sudo apt install ./seekthumbs_0.1.0_all.deb
+seekthumbs-setup --dry-run   # then: seekthumbs-setup install
+```
+
+Needs ffmpeg and Python 3 (apt installs them). The web page listens on 127.0.0.1 only.
+
+The package puts files under `/usr` only. Its install and remove scripts do not enable or start services, do not write into any home folder, and do not touch CamillaDSP or PipeWire configuration; the setup command above does the per-user part, and `--dry-run` shows what it would do first. Details, the other repositories' packages, and the one-command installer are in the main repository's [packaging notes](https://github.com/praveenchandrahas/Software-Defined-Home-Theatre/blob/main/docs/packaging.md).
+
+What was checked: written with an AI assistant; checked against simulated rooms and REW exports; used and checked by the author in his own room (one room, one author). No external or second-person validation yet. The packages are unsigned. CI installs and removes them in clean Ubuntu 24.04; the packaging itself has not been run on the author's own rig.
 
 ## Setup (once the paths are known)
 
