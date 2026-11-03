@@ -166,6 +166,11 @@ details summary{cursor:pointer;font-weight:650;font-size:14px}
   <label>Rest after each read (s) <input type="number" id="sPause" min="0" max="30" step="0.5"></label>
   <label>Wait while a player runs <input type="checkbox" id="sYield"></label>
   <p>Changes apply from the next film. They are not written to your config file.</p>
+  <b>Daily network budget</b>
+  <label>Limit, GB (0 = off) <input type="number" id="sBudget" min="0" max="10000" step="1"></label>
+  <div class="sub" id="budgetSub"></div>
+  <button class="btn small" id="bResetBudget">Reset today's count</button>
+  <p>The limit is saved to your config file. Resetting clears today's count and lifts a pause caused by it.</p>
 </div></header>
 <div class="note" id="note"></div>
 
@@ -273,6 +278,8 @@ $("bAfter").onclick = () => ctl("stop_after");
 $("bSet").onclick = () => { const p = $("pop"); p.hidden = !p.hidden; $("bSet").setAttribute("aria-expanded", String(!p.hidden)); };
 const saveSettings = () => api("/api/settings", { workers: +$("sWorkers").value, pause: +$("sPause").value, yield_to_playback: $("sYield").checked }).catch(showErr);
 ["sWorkers", "sPause", "sYield"].forEach((i) => $(i).addEventListener("change", saveSettings));
+$("sBudget").addEventListener("change", () => api("/api/settings", { daily_budget_gb: +$("sBudget").value }).then(poll).catch(showErr));
+$("bResetBudget").onclick = () => api("/api/settings", { reset_budget: true }).then(poll).catch(showErr);
 $("bClear").onclick = () => api("/api/queue", { clear: true }).then(poll).catch(showErr);
 $("bRefresh").onclick = () => api("/api/library?refresh=1").then((l) => { lib = l; drawList(); drawDash(); }).catch(showErr);
 $("bAdd").onclick = async () => {
@@ -354,15 +361,18 @@ function drawNow() {
 }
 function tile(v, unit, label) { return el("div", { class: "tile" }, el("div", { class: "v" }, v, unit ? el("small", {}, unit) : null), el("div", { class: "l" }, label)); }
 function drawTiles() {
-  const t = status.totals, f = lib ? lib.films : [], done = f.filter((x) => x.status === "done").length;
-  $("tiles").replaceChildren(
+  const t = status.totals, b = status.budget, f = lib ? lib.films : [], done = f.filter((x) => x.status === "done").length;
+  $("tiles").replaceChildren(...[
     tile(String(t.films), "", "films built this session" + (t.aliases ? " (+" + t.aliases + " shared)" : "")),
     tile(String(t.thumbs), "", "thumbnails written"),
     tile(lib ? mb(lib.store.bytes) : "–", "", "size of the whole store"),
     tile(done + " / " + f.length, "", "films with thumbnails"),
     tile(t.src_bytes ? gb(t.src_bytes) : "–", "", "of film files covered"),
     tile(t.avg_seconds ? dur(t.avg_seconds) : "–", "", "average per film"),
-    tile(t.eta_seconds ? dur(t.eta_seconds) : "–", "", "estimate for the queue (" + t.to_build + " to build)"));
+    tile(t.eta_seconds ? dur(t.eta_seconds) : "–", "", "estimate for the queue (" + t.to_build + " to build)"),
+    b ? tile(gb(b.session_bytes ?? 0), "", "received this session") : null,
+    b ? tile(gb(b.day_bytes) + (b.day_limit_gb > 0 ? " / " + b.day_limit_gb + " GB" : ""), "", "received today" + (b.blocked ? " — budget paused" : "")) : null,
+  ].filter(Boolean));
 }
 function lineChart(host, xs, ys, color, unit, tableHost, label) {
   host.replaceChildren();
@@ -439,6 +449,10 @@ function drawChrome() {
   $("bAfter").classList.toggle("on", s.stop_after);
   const a = document.activeElement; if (!["sWorkers", "sPause"].includes(a && a.id)) { $("sWorkers").value = s.settings.workers; $("sPause").value = s.settings.pause; }
   $("sYield").checked = s.settings.yield_to_playback;
+  const b = s.budget;
+  if (b && (!a || a.id !== "sBudget")) $("sBudget").value = b.day_limit_gb;
+  if (b) $("budgetSub").textContent = gb(b.day_bytes) + " used today" + (b.day_limit_gb > 0 ? " of " + b.day_limit_gb + " GB" : " (no limit set)") +
+    (b.blocked ? " · paused until the day rolls over" : "") + " · resets " + new Date(b.day_resets_at * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   if (Date.now() - lastErr > 6000) $("note").replaceChildren(...(s.note ? [el("div", {}, s.note)] : []));
 }
 function drawDash() {

@@ -190,6 +190,45 @@ try:
     check("tags: 4K, DV, HDR10+, remux, Atmos", web.file_tags("Tron.Ares.2025.2160p.UHD.Blu-ray.Remux.HDR10+.DoVi.HEVC.TrueHD.7.1.Atmos-HDT.mkv") == ["4K", "DV", "HDR10+", "Remux", "Atmos"])
     check("tags: 1080p BluRay DTS-HD", web.file_tags("Heat.1995.1080p.BluRay.x264.DTS-HD.MA.5.1.mkv") == ["1080p", "BluRay", "DTS-HD"])
     check("title and year come from the release name", web.pretty_title("the imitation game|2014", "x.mkv") == ("The Imitation Game", 2014))
+
+    # ---- the daily budget counter and controls, on a fresh engine/store
+    store19 = os.path.join(tmp, "store19")
+    srv19, engine19, _ = web.start(st, dict(cfg, store=store19), port=18800, token="tok19")
+    import threading as _th
+    _th.Thread(target=srv19.serve_forever, daemon=True).start()
+    base19 = f"http://127.0.0.1:{srv19.server_address[1]}"
+
+    def call19(path, body=None):
+        h = {"X-Token": "tok19"}
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode()
+            h["Content-Type"] = "application/json"
+        with urllib.request.urlopen(urllib.request.Request(base19 + path, data=data, headers=h), timeout=20) as r:
+            return r.status, json.loads(r.read())
+
+    s19 = call19("/api/status")[1]
+    check("a fresh store starts the day at 0 bytes, not blocked", s19["budget"]["day_bytes"] == 0 and not s19["budget"]["blocked"], s19["budget"])
+    check("the configured default budget is reported", s19["budget"]["day_limit_gb"] == st.DEFAULTS["daily_budget_gb"], s19["budget"])
+    check("a session byte count is reported (may be 0, never missing)", "session_bytes" in s19["budget"], s19["budget"])
+
+    code19, body19 = call19("/api/settings", {"daily_budget_gb": 5})
+    check("setting a new daily budget is accepted", code19 == 200 and body19["ok"])
+    s19b = call19("/api/status")[1]
+    check("the new limit shows up in status at once", s19b["budget"]["day_limit_gb"] == 5.0, s19b["budget"])
+
+    os.makedirs(store19, exist_ok=True)
+    st.spend_add(dict(store=store19), 6_000_000_000)                    # 6 GB, over the 5 GB limit just set
+    s19c = call19("/api/status")[1]
+    check("spending over the limit is reflected and marked blocked", s19c["budget"]["day_bytes"] == 6_000_000_000 and s19c["budget"]["blocked"], s19c["budget"])
+
+    call19("/api/settings", {"reset_budget": True})
+    s19d = call19("/api/status")[1]
+    check("reset_budget zeroes today's count and clears the blocked flag", s19d["budget"]["day_bytes"] == 0 and not s19d["budget"]["blocked"], s19d["budget"])
+
+    engine19.close()
+    srv19.shutdown()
+    srv19.server_close()
 finally:
     if engine:
         engine.close()

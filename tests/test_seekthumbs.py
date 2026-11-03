@@ -1332,6 +1332,38 @@ try:
     check("a budget of 0 turns the gate off", not st.budget_gate(dict(bc, daily_budget_gb=0), t_a)[0])
     check("an unknown zone name falls back instead of failing", st.budget_day(dict(bc, budget_tz="No/Such_Zone"), t_a)[0] == "2026-10-28")
 
+    # spend_reset: zeroes today's count (the web page's "reset today's count" button) without touching other days
+    st.spend_reset(bc, t_a)
+    check("spend_reset zeroes today's count", st.spend_load(bc, t_a) == 0)
+    st.spend_add(bc, 50, t_a)
+    check("spending still works right after a reset", st.spend_load(bc, t_a) == 50)
+
+    # save_config_value: writes one key into the ini, keeping the rest of the file (other settings, other sections) untouched
+    ini17 = os.path.join(tmp, "budget17.ini")
+    with open(ini17, "w") as f:
+        f.write("[seekthumbs]\nlibrary = /films\nworkers = 4\n\n[other]\nkeep = me\n")
+    st.save_config_value(ini17, "daily_budget_gb", 75.0)
+    cp17 = __import__("configparser").ConfigParser()
+    cp17.read(ini17)
+    check("the changed key is updated and the rest of the file survives",
+          cp17["seekthumbs"]["daily_budget_gb"] == "75.0" and cp17["seekthumbs"]["library"] == "/films" and cp17["seekthumbs"]["workers"] == "4" and cp17["other"]["keep"] == "me",
+          dict(cp17["seekthumbs"]))
+    st.save_config_value(ini17, "daily_budget_gb", 0.0)                 # changing it again overwrites in place, not append
+    cp17b = __import__("configparser").ConfigParser()
+    cp17b.read(ini17)
+    check("changing the same key again overwrites it once, not appends", cp17b["seekthumbs"]["daily_budget_gb"] == "0.0" and list(cp17b["seekthumbs"]).count("daily_budget_gb") == 1)
+    ini17b = os.path.join(tmp, "nested", "new.ini")                     # a config file that does not exist yet (fresh install): created, not an error
+    st.save_config_value(ini17b, "daily_budget_gb", 10.0)
+    cp17c = __import__("configparser").ConfigParser()
+    cp17c.read(ini17b)
+    check("save_config_value creates a missing ini and its folder", cp17c["seekthumbs"]["daily_budget_gb"] == "10.0")
+
+    # a config path recorded by load_config, so the web page can persist a changed budget back to the same file the user set up
+    import argparse as _ap
+    args17 = _ap.Namespace(config=ini17)
+    cfg17 = st.load_config(args17)
+    check("load_config records which ini it read, for later writes", cfg17.get("_config_path") == ini17, cfg17.get("_config_path"))
+
     # a scan with a tiny budget: the first film is built (its bytes counted), then the queue pauses and the rest is kept, not failed
     lib18, store18 = os.path.join(tmp, "lib18"), os.path.join(tmp, "store18")
     for nm in ("Budget.One.2021.mkv", "Budget.Two.2021.mkv"):

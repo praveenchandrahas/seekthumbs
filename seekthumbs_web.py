@@ -133,6 +133,7 @@ class Engine:
         self.closing = False
         self.started = time.time()
         self.run_seconds = 0.0
+        self.session_rx0 = st.net_rx_bytes() or 0     # network baseline at page start, so "this session" is just the delta from here
         self.qfile = os.path.join(cfg["store"], ".web-queue.json")
         self._tee_log()
         self.wake = st.WakeAhead(cfg.get("wake_ahead", 3), float(cfg.get("probe_timeout") or 300.0))
@@ -284,6 +285,7 @@ class Engine:
             return True
 
     def set_settings(self, d):
+        st = self.st
         with self.cv:
             if "workers" in d:
                 self.settings["workers"] = max(1, min(16, int(d["workers"])))
@@ -291,6 +293,28 @@ class Engine:
                 self.settings["pause"] = max(0.0, min(30.0, float(d["pause"])))
             if "yield_to_playback" in d:
                 self.settings["yield_to_playback"] = bool(d["yield_to_playback"])
+            if "daily_budget_gb" in d:
+                # 0 turns the budget off. Written back to the ini so it survives a restart, not just this run.
+                gb = max(0.0, min(10000.0, float(d["daily_budget_gb"])))
+                self.cfg["daily_budget_gb"] = gb
+                path = self.cfg.get("_config_path")
+                if path:
+                    try:
+                        st.save_config_value(path, "daily_budget_gb", gb)
+                    except OSError as ex:
+                        self.st.log(f"could not save daily_budget_gb to {path}: {ex}")
+            if d.get("reset_budget"):
+                os.makedirs(self.cfg["store"], exist_ok=True)   # store may not exist yet on a brand-new install (nothing built there so far)
+                st.spend_reset(self.cfg)
+                state = st.State(self.cfg["store"])
+                # also lifts a pause that was holding the queue open specifically for the budget (not one from mount trouble)
+                if state.d.get("budget_until", 0) >= state.d.get("breaker_until", 0) - 1:
+                    state.d["breaker_until"] = 0
+                state.d.pop("budget_until", None)
+                state.save()
+                if self.state == "idle" and self.note.startswith("the daily read budget"):
+                    self.note = ""
+                self.cv.notify_all()
 
     # -- the thread that builds
     def _next_group(self):
@@ -493,6 +517,13 @@ class Engine:
         now = time.time()
         with self.cv:
             j, st_ = self.job, self.st
+            day_bytes = st_.spend_load(self.cfg, now)
+            _, day_resets_at = st_.budget_day(self.cfg, now)
+            limit_gb = float(self.cfg.get("daily_budget_gb") or 0)
+            rx_now = st_.net_rx_bytes()
+            budget = dict(day_bytes=day_bytes, day_limit_gb=limit_gb, day_resets_at=day_resets_at,
+                          session_bytes=max(0, rx_now - self.session_rx0) if rx_now is not None else None,
+                          blocked=bool(limit_gb > 0 and day_bytes >= limit_gb * 1e9))
             cur = None
             ser = self._series()
             if j:
@@ -518,7 +549,7 @@ class Engine:
                         queue=[dict(id=i, title=self.groups[i]["title"], year=self.groups[i]["year"], size=self.groups[i]["members"][0][3]) for i in self.queue if i in self.groups],
                         totals=dict(self.totals, avg_seconds=avg, eta_seconds=eta, to_build=to_build, run_seconds=self.run_seconds),
                         history=self.history[-60:], series=ser, settings=dict(self.settings),
-                        interval=self.cfg["interval"])
+                        interval=self.cfg["interval"], budget=budget)
 
 
 # ---------------------------------------------------------------- the server

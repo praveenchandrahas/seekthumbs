@@ -136,7 +136,23 @@ def load_config(args):
             cfg[k] = v
     cfg["library"] = os.path.expanduser(cfg["library"]) if cfg["library"] else ""
     cfg["store"] = os.path.expanduser(cfg["store"]) if cfg["store"] else ""
+    cfg["_config_path"] = ini                 # so a setting changed from the web page (e.g. daily_budget_gb) can be written back
     return cfg
+
+
+def save_config_value(path, key, value):
+    """Writes key=value into the [seekthumbs] section of the ini at path, keeping everything else as it was. Creates the file/section if needed."""
+    cp = configparser.ConfigParser()
+    if os.path.exists(path):
+        cp.read(path)
+    if not cp.has_section("seekthumbs"):
+        cp.add_section("seekthumbs")
+    cp.set("seekthumbs", key, str(value))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        cp.write(f)
+    os.replace(tmp, path)
 
 
 def need_paths(cfg, library=True):
@@ -430,6 +446,20 @@ def spend_add(cfg, nbytes, now=None):
             tmp = path + ".tmp"
             with open(tmp, "w") as f:
                 json.dump({"day": day, "bytes": total}, f)
+            os.replace(tmp, path)
+        except OSError:
+            pass
+
+
+def spend_reset(cfg, now=None):
+    """Zeroes today's counted bytes (used by 'reset today's count' on the web page). A later spend_add still starts the day fresh."""
+    day, _ = budget_day(cfg, now)
+    path = os.path.join(cfg["store"], ".spend.json")
+    with _SPEND_LOCK:
+        try:
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"day": day, "bytes": 0}, f)
             os.replace(tmp, path)
         except OSError:
             pass
