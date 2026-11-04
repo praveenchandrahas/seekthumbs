@@ -21,6 +21,7 @@ stage() {
   local L=/usr/lib/seekthumbs
   inst 755 seekthumbs.py "$L/seekthumbs.py"; pyshebang "$L/seekthumbs.py"
   inst 644 seekthumbs_web.py "$L/seekthumbs_web.py"
+  inst 644 noindex.py "$L/noindex.py"
   inst 644 thumbfast.lua "$L/thumbfast.lua"
   inst 644 web/index.html "$L/web/index.html"
   script /usr/bin/seekthumbs <<'X'

@@ -22,6 +22,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 TOOL = os.path.join(HERE, "..")
 sys.path.insert(0, TOOL)
 import seekthumbs as st  # noqa: E402
+import noindex as ni      # noqa: E402
 
 fails = 0
 
@@ -37,6 +38,21 @@ def make_film(path, seconds=130, size="1280x720", src="testsrc2", gop=48):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", f"{src}=s={size}:r=24", "-t", str(seconds), "-g", str(gop),
                     "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", path], check=True)
+    old = time.time() - 7200
+    os.utime(path, (old, old))
+
+
+def make_film_no_cues(path, seconds=130, size="320x180", src="testsrc2", gop=24):
+    """Same encode as make_film(), but muxed through a pipe: ffmpeg's matroska muxer omits the Cues (seek
+    index) element when it can't seek its output, which a real pipe destination can't - confirmed by byte
+    inspection (no Cues-element ID anywhere before the first Cluster), vs. a plain file write of the same
+    content, which does get one. This is the only no-Cues fixture these tests use; mkvtoolnix is not
+    assumed to be installed."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as out:
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", f"{src}=s={size}:r=25", "-t", str(seconds), "-g", str(gop),
+                        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-f", "matroska", "pipe:1"],
+                       stdin=subprocess.DEVNULL, stdout=out, check=True)
     old = time.time() - 7200
     os.utime(path, (old, old))
 
@@ -1460,6 +1476,166 @@ try:
             check("the process asks to be the first the kernel kills when memory runs out", int(f.read()) >= 300)
     else:
         print("SKIP oom_score_adj (not writable here)")
+
+    # ---- noindex: calibrated, index-free extraction for films with no Cues (seek index) - see noindex.py's own docstring for the why/what/how
+    cal28 = ni.Calibrator(header_end=100, file_size=1100, duration=10.0)
+    check("Calibrator seeds a straight line across the whole file", cal28.predict(5.0) == 600.0, cal28.predict(5.0))
+    check("...at the very start and end too", cal28.predict(0.0) == 100.0 and cal28.predict(10.0) == 1100.0)
+    cal28.add_point(300, 2.0)
+    check("a real point folded in moves the local prediction toward it", 100 < cal28.predict(1.0) < 600, cal28.predict(1.0))
+
+    lib28, store28 = os.path.join(tmp, "lib28"), os.path.join(tmp, "store28")
+    indexed28 = os.path.join(lib28, "Indexed.mkv")
+    noidx28 = os.path.join(lib28, "NoIndex.mkv")
+    make_film(indexed28, seconds=90, size="320x180", gop=34)
+    make_film_no_cues(noidx28, seconds=90, size="320x180", gop=34)
+
+    ra_idx = ni.local_read_at(indexed28)
+    hdr_idx = ni.scan_header(ra_idx)
+    check("a plain ffmpeg-written file has a Cues element", hdr_idx is not None and hdr_idx.has_cues is True)
+    check("detect_no_index says 'use the normal path' for it", ni.detect_no_index(ra_idx, {"duration": 90.0}) is None)
+    ni.close_read_at(ra_idx)
+
+    ra_no = ni.local_read_at(noidx28)
+    hdr_no = ni.scan_header(ra_no)
+    check("the same encode piped through ffmpeg has no Cues element", hdr_no is not None and hdr_no.has_cues is False)
+    check("...and a sane header/cluster-start/timecode-scale come out of the scan",
+          len(hdr_no.header_bytes) > 0 and hdr_no.cluster_start == len(hdr_no.header_bytes) and hdr_no.timecode_scale > 0,
+          (len(hdr_no.header_bytes), hdr_no.cluster_start, hdr_no.timecode_scale) if hdr_no else None)
+    size_no = os.path.getsize(noidx28)
+    hdr_no2 = ni.detect_no_index(ra_no, {"duration": 90.0})
+    check("detect_no_index returns a HeaderInfo for it", hdr_no2 is not None)
+
+    # the cluster locator + keyframe walk, used directly (no PyAV needed for this much)
+    for frac29 in (0.05, 0.5, 0.95):
+        guess29 = int(hdr_no.cluster_start + frac29 * (size_no - hdr_no.cluster_start))
+        b29 = ni.locate_boundary(ra_no, guess29, hdr_no.cluster_start)
+        found29 = ni.walk_to_keyframe_cluster(ra_no, b29) if b29 is not None else None
+        check(f"a real keyframe-leading cluster is found near {frac29:g} of the file", found29 is not None, (frac29, b29))
+    check("a byte offset far past EOF finds nothing (no exception)", ni.locate_boundary(ra_no, size_no * 5, hdr_no.cluster_start) is None)
+    check("scan_header on garbage bytes gives up cleanly instead of raising", ni.scan_header(lambda o, n: b"not an mkv file" if o == 0 else b"") is None)
+    check("scan_header on an empty file gives up cleanly", ni.scan_header(lambda o, n: b"") is None)
+
+    if HAVE_AV:
+        # decoding one located cluster directly (below build_entry, which is covered next) - confirms the synthetic-buffer trick on its own
+        guess30 = int(hdr_no.cluster_start + 0.4 * (size_no - hdr_no.cluster_start))
+        b30 = ni.locate_boundary(ra_no, guess30, hdr_no.cluster_start)
+        off30, clen30, tc30 = ni.walk_to_keyframe_cluster(ra_no, b30)
+        buf30 = hdr_no.header_bytes + ra_no(off30, clen30)
+        import av as _av30, io as _io30
+        c30 = _av30.open(_io30.BytesIO(buf30))
+        stream30 = c30.streams.video[0]
+        fr30 = None
+        for pkt30 in c30.demux(stream30):
+            for fr30 in pkt30.decode():
+                break
+            if fr30 is not None:
+                break
+        decoded_t30 = float(fr30.pts * stream30.time_base) if fr30 and fr30.pts is not None else None
+        c30.close()
+        check("PyAV decodes a keyframe straight out of the synthetic header+cluster buffer, no .seek() involved",
+              fr30 is not None, (off30, clen30))
+        check("...and its timestamp matches the cluster's own declared time",
+              decoded_t30 is not None and abs(decoded_t30 - tc30 * hdr_no.timecode_scale / 1e9) < 0.05, (decoded_t30, tc30))
+    ni.close_read_at(ra_no)
+
+    # end to end: building a no-Cues film's thumbnails for real goes through the fast path, and the result is the same shape as the indexed case
+    if HAVE_AV:
+        out31 = io.StringIO()
+        with contextlib.redirect_stdout(out31):
+            n31 = st.scan_pass(cfg(lib28, store28, interval=9.0, workers=3))
+        log31 = out31.getvalue()
+        ix_idx31 = st.read_index(st.entry_dir(store28, "Indexed.mkv"))
+        ix_no31 = st.read_index(st.entry_dir(store28, "NoIndex.mkv"))
+        check("both films (indexed and no-Cues) are built", n31 == 2)
+        check("the no-Cues film's thumbnails all decoded", ix_no31 is not None and ix_no31["count"] > 0 and all(l > 0 for l in ix_no31["lengths"]), ix_no31)
+        check("the indexed film's thumbnails all decoded too (this path is untouched for it)",
+              ix_idx31 is not None and all(l > 0 for l in ix_idx31["lengths"]), ix_idx31)
+        check("the log says the no-Cues film used the calibrated no-index path", "no Cues (seek index) found" in log31, log31[-2000:])
+        check("...and reports how much of it was read directly vs. fell back", "no-index path:" in log31, log31[-2000:])
+        check("the indexed film's log line never mentions the no-index path", "no-index path:" not in log31.split("built NoIndex.mkv")[0] if "built NoIndex.mkv" in log31 else True)
+
+        # with no_index=0, the same no-Cues film still builds correctly (through the ordinary, slower path) - the flag only ever removes a speed-up
+        store28b = os.path.join(tmp, "store28b")
+        out32 = io.StringIO()
+        with contextlib.redirect_stdout(out32):
+            n32 = st.scan_pass(cfg(lib28, store28b, interval=9.0, workers=2, no_index=0))
+        ix_no32 = st.read_index(st.entry_dir(store28b, "NoIndex.mkv"))
+        check("no_index=0 still builds the same film correctly, without the fast path",
+              n32 == 2 and ix_no32 is not None and all(l > 0 for l in ix_no32["lengths"]) and "no-index path:" not in out32.getvalue(), out32.getvalue()[-500:])
+
+        # the wrapper is transparent: an indexed film's extractor is handed back unwrapped
+        info33 = st.ffprobe(indexed28, cfg(lib28, store28))
+        base33 = st.make_extractor(cfg(lib28, store28), indexed28, info33, False)
+        wrapped33 = st.maybe_wrap_no_index(cfg(lib28, store28), indexed28, os.path.getsize(indexed28), info33, base33, False)
+        check("an indexed film's extractor comes back unwrapped (identical object)", wrapped33 is base33)
+        base33.close()
+
+        info34 = st.ffprobe(noidx28, cfg(lib28, store28))
+        base34 = st.make_extractor(cfg(lib28, store28), noidx28, info34, False)
+        wrapped34 = st.maybe_wrap_no_index(cfg(lib28, store28), noidx28, os.path.getsize(noidx28), info34, base34, False)
+        check("a no-Cues film's extractor comes back wrapped in NoIndexExtractor", isinstance(wrapped34, ni.NoIndexExtractor))
+        wrapped34.close()
+    else:
+        print("SKIP noindex build_entry integration tests (no PyAV)")
+
+    # ---- noindex over HTTP: the same no-Cues film, read only through a local range server (the path RangeFile/read_url_base builds)
+    if HAVE_AV:
+        lib35, store35 = os.path.join(tmp, "lib35"), os.path.join(tmp, "store35")
+        f35 = os.path.join(lib35, "RemoteNoIndex.mkv")
+        make_film_no_cues(f35, seconds=90, size="320x180", gop=34)
+
+        class RangeHandler35(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def _serve(self, head):
+                path = os.path.join(lib35, os.path.basename(self.path.split("?")[0]))
+                if not os.path.isfile(path):
+                    self.send_error(404)
+                    return
+                size = os.path.getsize(path)
+                rng = self.headers.get("Range")
+                lo, hi = 0, size - 1
+                if rng and rng.startswith("bytes="):
+                    a, _, b = rng[6:].partition("-")
+                    lo = int(a) if a else max(0, size - int(b))
+                    hi = min(size - 1, int(b)) if (a and b) else size - 1
+                self.send_response(206 if rng else 200)
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Content-Length", str(hi - lo + 1))
+                if rng:
+                    self.send_header("Content-Range", f"bytes {lo}-{hi}/{size}")
+                self.end_headers()
+                if not head:
+                    with open(path, "rb") as fh:
+                        fh.seek(lo)
+                        try:
+                            self.wfile.write(fh.read(hi - lo + 1))
+                        except OSError:
+                            pass
+
+            def do_GET(self):
+                self._serve(False)
+
+            def do_HEAD(self):
+                self._serve(True)
+
+        srv35 = QuietServer(("127.0.0.1", 0), RangeHandler35)
+        threading.Thread(target=srv35.serve_forever, daemon=True).start()
+        try:
+            out35 = io.StringIO()
+            with contextlib.redirect_stdout(out35):
+                n35 = st.scan_pass(cfg(lib35, store35, interval=9.0, workers=2,
+                                        read_url_base=f"http://127.0.0.1:{srv35.server_address[1]}/"))
+            ix35 = st.read_index(st.entry_dir(store35, "RemoteNoIndex.mkv"))
+            check("a no-Cues film read entirely over HTTP still builds correctly", n35 == 1 and ix35 is not None and all(l > 0 for l in ix35["lengths"]), ix35)
+            check("...using the calibrated no-index path over HTTP too", "no Cues (seek index) found" in out35.getvalue(), out35.getvalue()[-1500:])
+        finally:
+            srv35.shutdown()
+            srv35.server_close()
+    else:
+        print("SKIP noindex-over-HTTP test (no PyAV)")
 
 finally:
     shutil.rmtree(tmp, ignore_errors=True)

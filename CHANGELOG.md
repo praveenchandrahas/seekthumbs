@@ -1,5 +1,9 @@
 # Changelog
 
+## [Unreleased]
+
+- Calibrated, index-free thumbnail reads for films with no Cues (seek index) element at all, which otherwise forced an expensive scattered search for every seek (`noindex.py`; new `no_index` setting, default on). See the README's "Calibrated seeking for files with no Cues at all" entry for the design and what has and hasn't been validated yet.
+
 ## [0.1.0] - 2026-11-01
 
 First packaged pre-release. Experimental. The code on main at the time of tagging is packaged as it is.

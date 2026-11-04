@@ -51,7 +51,8 @@ DEFAULTS = dict(library="", store="", interval=20.0, width=400, workers=6, pause
                 min_size_mb=300.0, max_films=0, budget_mb=10.0, safety=0.8, seek_timeout=90.0, probesize="1M", yield_to_playback=1,
                 breaker_hours=1.0, extractor="auto", rate_cooldown=30.0,
                 play_workers=2, play_pause=2.0, worker_mem_mb=1000, read_url_base="", mem_reserve_mb=3000, play_extractor="pyav", share=1, share_tolerance=2.0, encode_jobs=0, skip_tv=0, exclude="",
-                probe_timeout=300.0, wake_ahead=3, progress_every=60.0, http_chunk_kb=1024, server_error_stop=12, daily_budget_gb=150.0, budget_tz="Europe/Berlin")
+                probe_timeout=300.0, wake_ahead=3, progress_every=60.0, http_chunk_kb=1024, server_error_stop=12, daily_budget_gb=150.0, budget_tz="Europe/Berlin",
+                no_index=1)
 PLAYERS = ("mpv", "mpv-atmos", "mpv-object-audio", "vlc", "kodi", "kodi.bin")
 SUFFIX = ".seekthumbs"
 STOP = False
@@ -1121,6 +1122,40 @@ def make_extractor(cfg, src, info, zscale_ok):
     return av if want == "pyav" else AutoExtractor(av, cli)
 
 
+def maybe_wrap_no_index(cfg, rsrc, size, info, ext, zscale_ok):
+    """Wraps `ext` (whatever make_extractor built) with noindex.NoIndexExtractor when this film has no
+    Cues (seek index) and PyAV is available - see noindex.py for the why/what/how. `ext` keeps working
+    exactly as before for every film that does have one, and is also what the wrapper itself falls back
+    to on any read it can't resolve confidently, so this can only ever add a (rare) slow path, never
+    remove the correct one."""
+    if not cfg.get("no_index", 1):
+        return ext
+    try:
+        import av  # noqa: F401
+    except ImportError:
+        return ext
+    try:
+        import noindex
+    except ImportError:
+        return ext
+    try:
+        if rsrc.startswith(("http://", "https://")) and int(cfg.get("http_chunk_kb") or 0) > 0:
+            rf = RangeFile(rsrc, chunk=int(cfg["http_chunk_kb"]) * 1024, timeout=float(cfg["seek_timeout"]))
+            read_at = noindex.rangefile_read_at(rf)
+        else:
+            read_at = noindex.local_read_at(rsrc)
+        hdr = noindex.detect_no_index(read_at, info)
+        if hdr is None:
+            noindex.close_read_at(read_at)
+            return ext
+        vf = vf_chain(info, cfg["width"], zscale_ok)
+        log(f"no Cues (seek index) found; reading it with the calibrated no-index path instead")
+        return noindex.NoIndexExtractor(rsrc, vf, cfg, info, size, hdr, read_at, fallback=ext, log=log)
+    except Exception as ex:                      # noqa: BLE001 - detection must never block a build
+        log(f"no-index detection failed ({type(ex).__name__}: {ex}); using the normal path")
+        return ext
+
+
 def jpeg(frame, out, width, q):
     cmd = ["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", frame, "-vf", f"scale={width}:-2:flags=bicubic", "-q:v", str(q), "-huffman", "optimal",
            "-pix_fmt", "yuvj420p", out]
@@ -1203,6 +1238,7 @@ def build_entry(rel, src, size, cfg, gov, zscale_ok):
     n = max(1, int(info["duration"] // cfg["interval"]))
     allowed = cfg["budget_mb"] * 1e6 * (info["duration"] / 7200.0) * cfg["safety"]
     ext = make_extractor(cfg, rsrc, info, zscale_ok)
+    ext = maybe_wrap_no_index(cfg, rsrc, size, info, ext, zscale_ok)
     final = entry_dir(cfg["store"], rel)
     os.makedirs(os.path.dirname(final), exist_ok=True)
     work = tempfile.mkdtemp(prefix=".work-", dir=os.path.dirname(final))
@@ -1385,9 +1421,12 @@ def build_entry(rel, src, size, cfg, gov, zscale_ok):
         if job:
             job.bytes, job.phase = total, "done"
         dt = time.time() - t0
+        no_index_note = ""
+        if hasattr(ext, "fast_ok"):            # a noindex.NoIndexExtractor: say how much of the film it read without any index
+            no_index_note = f"no-index path: {ext.fast_ok} read directly, {ext.fast_fail} fell back; "
         log(f"{'refined' if refine else 'built'} {rel}: {n} thumbs ({stats['ok']} read, {stats['fail']} failed reads, {ext.name}), {w}x{h} q{q}, {total / 1e6:.2f} MB "
             f"(budget {allowed / 1e6:.2f}), {dt:.0f}s total (wake {t_wake:.0f}s, probe {t_probe:.0f}s, read {t_read - t_wake - t_probe:.0f}s), "
-            f"{n_read / max(0.1, t_read - t_wake - t_probe):.1f} reads/s; "
+            f"{n_read / max(0.1, t_read - t_wake - t_probe):.1f} reads/s; " + no_index_note
             + (f"network {(rx1 - rx0) / 1e6:.0f} MB received during the read = {(rx1 - rx0) / 1e6 / max(1, stats['ok']):.1f} MB per thumbnail (counts everything this computer received); "
                if rx0 is not None and rx1 is not None and rx1 >= rx0 else "") +
             f"{stats['retried']} reads retried after decode errors, {stats['suspect']} near-constant grey/white frame(s) read again")
