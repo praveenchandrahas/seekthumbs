@@ -1149,6 +1149,8 @@ def maybe_wrap_no_index(cfg, rsrc, size, info, ext, zscale_ok):
             log(f"no-index: giving up on this film's header ({diag['reason']}); using the normal path")
             noindex.close_read_at(read_at)
             return ext
+        if diag.get("cues_note"):
+            log(f"no-index: {diag['cues_note']}")
         if diag["has_cues"]:
             noindex.close_read_at(read_at)
             return ext
@@ -1948,6 +1950,8 @@ def cmd_noindex_probe(cfg, path):
                 print(f"  {eid}: {sz_str}")
         print("falls back to the normal (slower, but always correct) extraction path.")
         return
+    if diag.get("cues_note"):
+        print(f"note: {diag['cues_note']}")
     if diag["has_cues"]:
         print("this film HAS a Cues (seek index) element - no_index is irrelevant here; it already uses the fast indexed path.")
         return

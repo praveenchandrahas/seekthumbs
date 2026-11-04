@@ -1579,6 +1579,54 @@ try:
     else:
         print("SKIP noindex build_entry integration tests (no PyAV)")
 
+    # ---- noindex: a SeekHead that CLAIMS a Cues element must be verified, not trusted blindly - seen on a real
+    # BD remux (Troy, 2026-11-04) whose SeekHead still pointed at a Cues element that was stripped/never written;
+    # that false claim made a film with NO usable index look indexed, silently skipping the no-index speed-up.
+    def _ebml_id36(v, n):
+        return v.to_bytes(n, "big")
+
+    def _ebml_sz36(v, n):
+        return (v | (1 << (7 * n))).to_bytes(n, "big")
+
+    def _seekhead36(cues_seek_pos):
+        seekid_elem = _ebml_id36(ni.ID_SEEKID, 2) + _ebml_sz36(4, 1) + _ebml_id36(ni.ID_CUES, 4)
+        seekpos_elem = _ebml_id36(ni.ID_SEEKPOSITION, 2) + _ebml_sz36(4, 1) + cues_seek_pos.to_bytes(4, "big")
+        seek_body = seekid_elem + seekpos_elem
+        seek_elem = _ebml_id36(ni.ID_SEEK, 2) + _ebml_sz36(len(seek_body), 2) + seek_body
+        return _ebml_id36(ni.ID_SEEKHEAD, 4) + _ebml_sz36(len(seek_elem), 2) + seek_elem
+
+    def _synthetic_mkv36(cues_really_there):
+        ebml_head = _ebml_id36(ni.ID_EBML_HEAD, 4) + _ebml_sz36(0, 1)
+        segment_hdr = _ebml_id36(ni.ID_SEGMENT, 4) + _ebml_sz36(0, 1)
+        cluster = _ebml_id36(ni.ID_CLUSTER, 4) + _ebml_sz36(4, 1) + b"\x00\x00\x00\x00"
+        # placed right after the Cluster, i.e. past where scan_header's own top-level walk ever looks (it returns
+        # as soon as it sees the Cluster) - so has_cues can only become True here via the SeekHead-verification path
+        trailer = (_ebml_id36(ni.ID_CUES, 4) + _ebml_sz36(0, 1)) if cues_really_there else (b"\x80" * 8)
+        seekhead_dummy = _seekhead36(0)
+        cues_seek_pos = len(seekhead_dummy) + len(cluster)      # relative to the Segment's data start
+        seekhead = _seekhead36(cues_seek_pos)
+        return ebml_head + segment_hdr + seekhead + cluster + trailer
+
+    buf36_stale, buf36_real = _synthetic_mkv36(False), _synthetic_mkv36(True)
+    ra36_stale = lambda o, n, _b=buf36_stale: _b[o:o + n]     # noqa: E731
+    ra36_real = lambda o, n, _b=buf36_real: _b[o:o + n]       # noqa: E731
+
+    diag36a = ni.diagnose_header(ra36_stale)
+    check("a SeekHead claiming a Cues element that isn't really there is not trusted",
+          diag36a["ok"] and diag36a["has_cues"] is False, diag36a)
+    check("...and the diagnostic says why", "isn't one there" in (diag36a.get("cues_note") or ""), diag36a.get("cues_note"))
+
+    diag36b = ni.diagnose_header(ra36_real)
+    check("a SeekHead whose claimed Cues position really does hold one is trusted",
+          diag36b["ok"] and diag36b["has_cues"] is True and not diag36b.get("cues_note"), diag36b)
+
+    hdr36a = ni.scan_header(ra36_stale)
+    check("scan_header agrees: a stale SeekHead claim -> has_cues False (so this film gets the fast no-index path)",
+          hdr36a is not None and hdr36a.has_cues is False)
+    hdr36b = ni.scan_header(ra36_real)
+    check("scan_header agrees: a verified SeekHead claim -> has_cues True",
+          hdr36b is not None and hdr36b.has_cues is True)
+
     # ---- noindex over HTTP: the same no-Cues film, read only through a local range server (the path RangeFile/read_url_base builds)
     if HAVE_AV:
         lib35, store35 = os.path.join(tmp, "lib35"), os.path.join(tmp, "store35")

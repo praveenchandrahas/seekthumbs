@@ -64,6 +64,7 @@ ID_SEGMENT = 0x18538067
 ID_SEEKHEAD = 0x114D9B74
 ID_SEEK = 0x4DBB
 ID_SEEKID = 0x53AB
+ID_SEEKPOSITION = 0x53AC
 ID_INFO = 0x1549A966
 ID_TIMECODESCALE = 0x2AD7B1
 ID_CUES = 0x1C53BB6B
@@ -155,18 +156,25 @@ def _scan_info_for_timecode_scale(body):
     return None
 
 
-def _seekhead_points_at_cues(body):
+def _seekhead_cues_seek(body):
+    """Walks one SeekHead's raw bytes for a Seek entry whose SeekID is Cues. Returns (claims_cues,
+    seek_position): claims_cues is True iff such an entry exists; seek_position is its declared
+    SeekPosition (an offset from the Segment's data start) when present, else None. The caller must NOT
+    trust claims_cues alone - real files have been seen with a SeekHead that still advertises a Cues
+    element that was stripped or never written (a stale/incorrect remux), so this only reports what the
+    SeekHead SAYS; _cues_actually_at() below checks whether that is actually true."""
     pos = 0
     while pos < len(body) - 1:
         try:
             sid, p2 = _read_id(body, pos)
             ssz, p3 = _read_size(body, p2)
         except (NeedMoreData, NoIndex):
-            return False
+            return False, None
         if ssz is None:
-            return False
+            return False, None
         if sid == ID_SEEK and p3 + ssz <= len(body):
             sub, jp = body[p3:p3 + ssz], 0
+            is_cues, seek_pos = False, None
             while jp < len(sub) - 1:
                 try:
                     xid, jp2 = _read_id(sub, jp)
@@ -175,12 +183,36 @@ def _seekhead_points_at_cues(body):
                     break
                 if xid == ID_SEEKID and xsz is not None and jp3 + xsz <= len(sub):
                     if int.from_bytes(sub[jp3:jp3 + xsz], "big") == ID_CUES:
-                        return True
+                        is_cues = True
+                if xid == ID_SEEKPOSITION and xsz is not None and jp3 + xsz <= len(sub):
+                    seek_pos = _read_uint(sub, jp3, xsz)
                 if xsz is None:
                     break
                 jp = jp3 + xsz
+            if is_cues:
+                return True, seek_pos
         pos = p3 + ssz
-    return False
+    return False, None
+
+
+def _cues_actually_at(read_at, abs_off):
+    """Confirms a Cues element really starts at `abs_off` (an absolute file offset), rather than trusting a
+    SeekHead's SeekPosition at face value - see _seekhead_cues_seek(). Returns True/False when it could
+    check, or None when it couldn't (a failed or short read) - the caller treats None as "can't tell, so
+    fall back to trusting the SeekHead's claim," which is the old behaviour and never a regression."""
+    if abs_off is None or abs_off < 0:
+        return None
+    try:
+        head = read_at(abs_off, 8)
+    except Exception:                             # noqa: BLE001 - a failed check must never break detection
+        return None
+    if not head:
+        return None
+    try:
+        eid, _ = _read_id(head, 0)
+    except (NeedMoreData, NoIndex):
+        return None
+    return eid == ID_CUES
 
 
 def scan_header(read_at, max_bytes=MAX_HEADER_BYTES):
@@ -205,6 +237,7 @@ def scan_header(read_at, max_bytes=MAX_HEADER_BYTES):
                 return None
             _, p = _read_size(data, p)          # segment size itself is unused (we only read a prefix)
             pos = p
+            seg_data_start = pos                 # SeekPosition values are relative to here
             has_cues = False
             timecode_scale = 1_000_000           # the Matroska default, used whenever Info lacks its own
             while True:
@@ -219,8 +252,11 @@ def scan_header(read_at, max_bytes=MAX_HEADER_BYTES):
                     if tcs:
                         timecode_scale = tcs
                 if cid == ID_SEEKHEAD and csize is not None and p3 + csize <= len(data):
-                    if _seekhead_points_at_cues(data[p3:p3 + csize]):
-                        has_cues = True
+                    claims_cues, seek_pos = _seekhead_cues_seek(data[p3:p3 + csize])
+                    if claims_cues:
+                        verified = _cues_actually_at(read_at, seg_data_start + seek_pos if seek_pos is not None else None)
+                        if verified is not False:   # True or "couldn't tell" -> trust it, as before
+                            has_cues = True
                 if csize is None:
                     return None               # an unknown-size top-level element: can't skip past it cheaply
                 pos = p3 + csize
@@ -515,15 +551,20 @@ def diagnose_header(read_at, max_bytes=MAX_HEADER_BYTES):
                 return dict(ok=False, bytes_read=len(data), reason=f"no Segment element right after the EBML head (got {sid!r})")
             _, p = _read_size(data, p)
             pos = p
+            seg_data_start = pos                 # SeekPosition values are relative to here
             has_cues = False
+            cues_note = None
             timecode_scale = 1_000_000
             while True:
                 cid, p2 = _read_id(data, pos)
                 csize, p3 = _read_size(data, p2)
                 seen.append((hex(cid) if cid else cid, csize))
                 if cid == ID_CLUSTER:
-                    return dict(ok=True, bytes_read=len(data), has_cues=has_cues, timecode_scale=timecode_scale,
-                                cluster_start=pos, header_len=pos, header_bytes=bytes(data[:pos]), top_level_seen=seen)
+                    out = dict(ok=True, bytes_read=len(data), has_cues=has_cues, timecode_scale=timecode_scale,
+                               cluster_start=pos, header_len=pos, header_bytes=bytes(data[:pos]), top_level_seen=seen)
+                    if cues_note:
+                        out["cues_note"] = cues_note
+                    return out
                 if cid == ID_CUES:
                     has_cues = True
                 if cid == ID_INFO and csize is not None and p3 + csize <= len(data):
@@ -531,8 +572,18 @@ def diagnose_header(read_at, max_bytes=MAX_HEADER_BYTES):
                     if tcs:
                         timecode_scale = tcs
                 if cid == ID_SEEKHEAD and csize is not None and p3 + csize <= len(data):
-                    if _seekhead_points_at_cues(data[p3:p3 + csize]):
-                        has_cues = True
+                    claims_cues, seek_pos = _seekhead_cues_seek(data[p3:p3 + csize])
+                    if claims_cues:
+                        abs_off = seg_data_start + seek_pos if seek_pos is not None else None
+                        verified = _cues_actually_at(read_at, abs_off)
+                        if verified is False:
+                            cues_note = (f"SeekHead claims a Cues element at byte {abs_off}, but there isn't "
+                                         f"one there (stale/incorrect SeekHead) - treating this film as having no usable index")
+                        elif verified is None:
+                            cues_note = "SeekHead claims a Cues element, but it couldn't be verified (unreadable position) - trusting the claim"
+                            has_cues = True
+                        else:
+                            has_cues = True
                 if csize is None:
                     return dict(ok=False, bytes_read=len(data), reason=f"top-level element {hex(cid)} has an unknown ('streaming') size, can't skip past it", top_level_seen=seen)
                 pos = p3 + csize
