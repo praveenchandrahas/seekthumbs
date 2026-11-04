@@ -8,6 +8,8 @@ recordings/
 # python
 __pycache__/
 *.pyc
+# mkdocs build output
+site/
 # private calibration and local config
 *-cal.txt
 *.cal

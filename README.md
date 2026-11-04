@@ -1,5 +1,7 @@
 # seekthumbs: seek-bar thumbnails for an rclone library
 
+Full docs: https://praveenchandrahas.github.io/seekthumbs/
+
 [![CI](https://github.com/praveenchandrahas/seekthumbs/actions/workflows/ci.yml/badge.svg)](https://github.com/praveenchandrahas/seekthumbs/actions/workflows/ci.yml) *(CI = unit tests, lint, and a package install/remove test in a clean Ubuntu 24.04 container. A green badge does not show the software works on a real rig.)*
 
 ![seekthumbs: seek, preview, explore. Background seek-bar thumbnails for your film library: a read-only rclone film library, a background thumbnail generator (FFmpeg or PyAV), a local thumbnail pack and index, shown on the mpv + uosc seek bar](docs/img/banner.png)
