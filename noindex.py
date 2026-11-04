@@ -489,6 +489,66 @@ def close_read_at(read_at):
             pass
 
 
+def diagnose_header(read_at, max_bytes=MAX_HEADER_BYTES):
+    """Like scan_header(), but never throws away WHY it gave up - for `seekthumbs.py noindex-probe`, to see
+    what a real file does without guessing. Returns a dict: always has 'ok' and 'bytes_read'; on success
+    also 'has_cues', 'timecode_scale', 'cluster_start', 'header_len'; on failure also 'reason', and - whenever
+    parsing got past the EBML head and Segment - 'top_level_seen' (also present on the max_bytes give-up path,
+    not just the unknown-size one, since that's the case this was built to diagnose: a file whose header is
+    simply too big)."""
+    chunk = 1 << 20
+    data = read_at(0, chunk)
+    seen = []
+    while True:
+        try:
+            pos = 0
+            seen = []
+            eid, p = _read_id(data, pos)
+            if eid != ID_EBML_HEAD:
+                return dict(ok=False, bytes_read=len(data), reason=f"byte 0 is not an EBML head (got {eid!r})")
+            esize, p = _read_size(data, p)
+            if esize is None:
+                return dict(ok=False, bytes_read=len(data), reason="EBML head has an unknown size")
+            pos = p + esize
+            sid, p = _read_id(data, pos)
+            if sid != ID_SEGMENT:
+                return dict(ok=False, bytes_read=len(data), reason=f"no Segment element right after the EBML head (got {sid!r})")
+            _, p = _read_size(data, p)
+            pos = p
+            has_cues = False
+            timecode_scale = 1_000_000
+            while True:
+                cid, p2 = _read_id(data, pos)
+                csize, p3 = _read_size(data, p2)
+                seen.append((hex(cid) if cid else cid, csize))
+                if cid == ID_CLUSTER:
+                    return dict(ok=True, bytes_read=len(data), has_cues=has_cues, timecode_scale=timecode_scale,
+                                cluster_start=pos, header_len=pos, header_bytes=bytes(data[:pos]), top_level_seen=seen)
+                if cid == ID_CUES:
+                    has_cues = True
+                if cid == ID_INFO and csize is not None and p3 + csize <= len(data):
+                    tcs = _scan_info_for_timecode_scale(data[p3:p3 + csize])
+                    if tcs:
+                        timecode_scale = tcs
+                if cid == ID_SEEKHEAD and csize is not None and p3 + csize <= len(data):
+                    if _seekhead_points_at_cues(data[p3:p3 + csize]):
+                        has_cues = True
+                if csize is None:
+                    return dict(ok=False, bytes_read=len(data), reason=f"top-level element {hex(cid)} has an unknown ('streaming') size, can't skip past it", top_level_seen=seen)
+                pos = p3 + csize
+        except NeedMoreData:
+            if len(data) >= max_bytes:
+                return dict(ok=False, bytes_read=len(data), reason=f"no Cluster found within the {max_bytes // (1 << 20)} MB header-scan limit",
+                            top_level_seen=seen)
+            chunk = min(max_bytes, len(data) * 2)
+            more = read_at(len(data), chunk - len(data))
+            if not more:
+                return dict(ok=False, bytes_read=len(data), reason="the source returned no more bytes (short read / connection issue)")
+            data += more
+        except NoIndex as ex:
+            return dict(ok=False, bytes_read=len(data), reason=f"EBML parse error: {ex}")
+
+
 def detect_no_index(read_at, info):
     """Returns a HeaderInfo if the file has no usable Cues element (direct or via SeekHead), or None if
     it has one (or couldn't be determined) - either way, None means "use the normal path"."""

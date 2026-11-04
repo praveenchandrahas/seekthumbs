@@ -1144,10 +1144,15 @@ def maybe_wrap_no_index(cfg, rsrc, size, info, ext, zscale_ok):
             read_at = noindex.rangefile_read_at(rf)
         else:
             read_at = noindex.local_read_at(rsrc)
-        hdr = noindex.detect_no_index(read_at, info)
-        if hdr is None:
+        diag = noindex.diagnose_header(read_at)
+        if not diag["ok"]:
+            log(f"no-index: giving up on this film's header ({diag['reason']}); using the normal path")
             noindex.close_read_at(read_at)
             return ext
+        if diag["has_cues"]:
+            noindex.close_read_at(read_at)
+            return ext
+        hdr = noindex.HeaderInfo(diag["header_bytes"], diag["has_cues"], diag["timecode_scale"], diag["cluster_start"])
         vf = vf_chain(info, cfg["width"], zscale_ok)
         log(f"no Cues (seek index) found; reading it with the calibrated no-index path instead")
         return noindex.NoIndexExtractor(rsrc, vf, cfg, info, size, hdr, read_at, fallback=ext, log=log)
@@ -1902,6 +1907,56 @@ def cmd_probe(cfg, path):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def cmd_noindex_probe(cfg, path):
+    """Checks whether the calibrated no-index path (noindex.py) would engage for one real film, and if not,
+    exactly why - without doing a build or reading more than a growing header prefix. Meant for exactly this
+    kind of question: a film looked no faster after the no_index feature shipped, and the only way to know
+    whether it ever engaged is to ask directly, since a silent fallback and genuine pre-existing slowness
+    look identical from the outside. Reads only header-sized chunks (1 MB, doubling, capped at
+    noindex.MAX_HEADER_BYTES), so this is cheap even over HTTP against a huge file."""
+    import noindex
+    path = os.path.abspath(os.path.expanduser(path))
+    rel = os.path.relpath(path, os.path.abspath(cfg["library"])) if cfg.get("library") else os.path.basename(path)
+    rsrc = read_source(cfg, rel, path) if not rel.startswith("..") else path
+    print(f"probing: {rsrc}" + (f"  (mount: {path})" if rsrc != path else ""))
+    if not cfg.get("no_index", 1):
+        print("no_index is set to 0 in this config; the feature is disabled regardless of what follows.")
+    try:
+        import av  # noqa: F401
+    except ImportError:
+        print("PyAV is not importable here, so the no-index path can never engage (falls back to the normal extractor).")
+        return
+    if rsrc.startswith(("http://", "https://")) and int(cfg.get("http_chunk_kb") or 0) > 0:
+        rf = RangeFile(rsrc, chunk=int(cfg["http_chunk_kb"]) * 1024, timeout=float(cfg["seek_timeout"]))
+        read_at = noindex.rangefile_read_at(rf)
+    else:
+        read_at = noindex.local_read_at(rsrc)
+    try:
+        t0 = time.time()
+        diag = noindex.diagnose_header(read_at)
+        dt = time.time() - t0
+    finally:
+        noindex.close_read_at(read_at)
+    print(f"read {diag['bytes_read'] / 1e6:.1f} MB of header in {dt:.1f} s")
+    if not diag["ok"]:
+        print(f"WOULD NOT ENGAGE: {diag['reason']}")
+        seen = diag.get("top_level_seen")
+        if seen:
+            print("top-level elements seen before giving up:")
+            for eid, sz in seen:
+                sz_str = "unknown size" if sz is None else (f"{sz / 1e6:.1f} MB" if sz >= 1e6 else f"{sz} bytes")
+                print(f"  {eid}: {sz_str}")
+        print("falls back to the normal (slower, but always correct) extraction path.")
+        return
+    if diag["has_cues"]:
+        print("this film HAS a Cues (seek index) element - no_index is irrelevant here; it already uses the fast indexed path.")
+        return
+    print("WOULD ENGAGE the calibrated no-index path:")
+    print(f"  header length (bytes before the first Cluster): {diag['header_len']}")
+    print(f"  timecode scale: {diag['timecode_scale']}")
+    print("Run a normal build on this film and check the log for \"no Cues (seek index) found\" to confirm it actually did.")
+
+
 def cmd_status(cfg):
     need_paths(cfg, library=False)
     n = tot = aliases = 0
@@ -2127,6 +2182,8 @@ def main(argv):
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("probe", parents=[common])
     p.add_argument("file")
+    p = sub.add_parser("noindex-probe", parents=[common])
+    p.add_argument("file")
     p = sub.add_parser("build", parents=[common])
     p.add_argument("file")
     for c in ("plan", "scan", "watch", "status"):
@@ -2151,6 +2208,8 @@ def main(argv):
         prefer_to_be_killed_first()
     if args.cmd == "probe":
         cmd_probe(cfg, args.file)
+    elif args.cmd == "noindex-probe":
+        cmd_noindex_probe(cfg, args.file)
     elif args.cmd == "build":
         return cmd_build(cfg, args.file)
     elif args.cmd == "plan":
