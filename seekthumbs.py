@@ -1953,7 +1953,12 @@ def cmd_noindex_probe(cfg, path):
     if diag.get("cues_note"):
         print(f"note: {diag['cues_note']}")
     if diag["has_cues"]:
-        print("this film HAS a Cues (seek index) element - no_index is irrelevant here; it already uses the fast indexed path.")
+        src = diag.get("cues_source")
+        src_str = {"direct": "found directly as a top-level element in the header",
+                   "seekhead_verified": f"verified: a real Cues element was confirmed at byte {diag.get('cues_abs_off')}",
+                   "seekhead_unverified": f"NOT independently verified (read at byte {diag.get('cues_abs_off')} failed) - trusting the SeekHead's claim"
+                   }.get(src, "reason unknown")
+        print(f"this film HAS a Cues (seek index) element - no_index is irrelevant here; it already uses the fast indexed path. ({src_str})")
         return
     print("WOULD ENGAGE the calibrated no-index path:")
     print(f"  header length (bytes before the first Cluster): {diag['header_len']}")

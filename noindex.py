@@ -554,6 +554,8 @@ def diagnose_header(read_at, max_bytes=MAX_HEADER_BYTES):
             seg_data_start = pos                 # SeekPosition values are relative to here
             has_cues = False
             cues_note = None
+            cues_source = None                    # "direct" | "seekhead_verified" | "seekhead_unverified"
+            cues_abs_off = None
             timecode_scale = 1_000_000
             while True:
                 cid, p2 = _read_id(data, pos)
@@ -564,9 +566,13 @@ def diagnose_header(read_at, max_bytes=MAX_HEADER_BYTES):
                                cluster_start=pos, header_len=pos, header_bytes=bytes(data[:pos]), top_level_seen=seen)
                     if cues_note:
                         out["cues_note"] = cues_note
+                    if has_cues:
+                        out["cues_source"] = cues_source
+                        out["cues_abs_off"] = cues_abs_off
                     return out
                 if cid == ID_CUES:
                     has_cues = True
+                    cues_source, cues_abs_off = "direct", pos
                 if cid == ID_INFO and csize is not None and p3 + csize <= len(data):
                     tcs = _scan_info_for_timecode_scale(data[p3:p3 + csize])
                     if tcs:
@@ -580,10 +586,12 @@ def diagnose_header(read_at, max_bytes=MAX_HEADER_BYTES):
                             cues_note = (f"SeekHead claims a Cues element at byte {abs_off}, but there isn't "
                                          f"one there (stale/incorrect SeekHead) - treating this film as having no usable index")
                         elif verified is None:
-                            cues_note = "SeekHead claims a Cues element, but it couldn't be verified (unreadable position) - trusting the claim"
-                            has_cues = True
+                            cues_note = f"SeekHead claims a Cues element at byte {abs_off}, but it couldn't be verified (unreadable position) - trusting the claim"
+                            if not has_cues:
+                                has_cues, cues_source, cues_abs_off = True, "seekhead_unverified", abs_off
                         else:
-                            has_cues = True
+                            if not has_cues:
+                                has_cues, cues_source, cues_abs_off = True, "seekhead_verified", abs_off
                 if csize is None:
                     return dict(ok=False, bytes_read=len(data), reason=f"top-level element {hex(cid)} has an unknown ('streaming') size, can't skip past it", top_level_seen=seen)
                 pos = p3 + csize
