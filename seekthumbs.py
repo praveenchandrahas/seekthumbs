@@ -515,8 +515,9 @@ class Governor:
                 self.cv.wait(timeout=max(0.05, min(1.0, self.until - now)) if self.until > now else 1.0)
         return False
 
-    def release(self, outcome):
-        """outcome: 'ok', 'throttled' or 'fail'."""
+    def release(self, outcome, why=""):
+        """outcome: 'ok', 'throttled' or 'fail'. `why` is the read's own error text (only used, and only logged, on a throttle signal) so the log says
+        what was actually seen (an HTTP status, a timeout, ...) instead of just that something matched THROTTLE_RE."""
         with self.cv:
             self.active -= 1
             if outcome == "throttled":
@@ -528,7 +529,7 @@ class Governor:
                         self.floor_bursts += 1
                     self.limit = max(1, self.limit // 2)
                     self.until = time.time() + self.cool
-                    log(f"rate-limit signal: reads in parallel now {self.limit}, no new reads for {self.cool:.0f} s")
+                    log(f"rate-limit signal: reads in parallel now {self.limit}, no new reads for {self.cool:.0f} s" + (f" ({why[:160]})" if why else ""))
                     self.cool = min(self.cool * 2, 900.0)
             elif outcome == "ok":
                 self.server_errs = 0
@@ -1261,7 +1262,7 @@ def build_entry(rel, src, size, cfg, gov, zscale_ok):
                     alt = os.path.join(work, f"{i:06d}.png")
                     out = alt if os.path.exists(alt) else out
                 kind = "ok" if ok else ("throttled" if THROTTLE_RE.search(why or "") else "fail")
-                gov.release(kind)
+                gov.release(kind, why or "")
                 if cfg["pause"]:
                     time.sleep(cfg["pause"])
                 if ok and not suspect_seen and suspicious_frame(out):

@@ -1312,6 +1312,17 @@ try:
     check("three server errors in a row with a limit of 3 stop; other failures do not count", r_ == [False, False, True] and not st.Governor(2).server_error("no frame decoded", 1))
     check("the provider words are recognised", all(st.PROVIDER_RE.search(x) for x in ("HTTP Error 503 Service Unavailable", "bytes_limit_reached", "Server returned 5XX Server Error reply")))
 
+    # a throttle signal's log line says what was actually seen (the read's own error text), not just that it matched THROTTLE_RE
+    gv = st.Governor(4, cooldown=0.01)
+    out_gv = io.StringIO()
+    with contextlib.redirect_stdout(out_gv):
+        gv.release("throttled", "HTTP Error 429 Too Many Requests")
+    check("the triggering error text is in the rate-limit signal log line", "rate-limit signal" in out_gv.getvalue() and "HTTP Error 429 Too Many Requests" in out_gv.getvalue(), out_gv.getvalue())
+    out_gv2 = io.StringIO()
+    with contextlib.redirect_stdout(out_gv2):
+        gv.release("ok")                                     # no why given (the "neutral"/"ok" paths): nothing to print, no crash
+    check("release() without a why does not fail and prints nothing extra", out_gv2.getvalue() == "")
+
     # ---- the daily read budget: counted per day (midnight in budget_tz), pauses the queue, rolls over
     from datetime import datetime as _dt, timezone as _tz
     store17 = os.path.join(tmp, "store17")
