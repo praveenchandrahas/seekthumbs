@@ -33,6 +33,10 @@ One row is shown per film; its releases are grouped, and the smallest one is rea
 
 **Building a specific release.** Expanding a film that has several releases shows each one with a status icon and, for a release that isn't done, queued or already running, a **"+ build this one"** button. Its tooltip explains it: it builds that exact release on its own, even though another release of the same film already has thumbnails. This is for when the shared/aliased release isn't the one you actually want thumbnails for.
 
+![The seekthumbs page while it works: the film list with checkboxes on the left; on the right the film being read, its phases, speed and network charts, time per film, coverage and the queue](img/web-dark.png)
+
+*Screenshot of the page running on a small library of synthetic films (so the sizes and times are tiny).*
+
 Tick the films you want, press **Add to queue**, then **Start**. The buttons:
 
 - **Pause** freezes the reads where they are; **Resume** carries on from the same thumbnail.
@@ -67,7 +71,7 @@ After a `git pull`, run `./seekthumbs.py install-viewer` again — `install-view
 
 For the on-play build and release sharing: `play_workers` (2), `play_pause` (2 s), `play_extractor` (`pyav` | `auto` | `ffmpeg`), `share` (1; 0 = one set per file, no aliasing), `share_tolerance` (2 s), `encode_jobs` (0 = all CPUs; the on-play build uses 2 unless set), `worker_mem_mb` and `mem_reserve_mb` (the memory guard, see the README), `read_url_base` (read thumbnails over HTTP range requests instead of the mount — see the README for details and the measurements behind it), `http_chunk_kb` (bounds each HTTP request to this many KB when `read_url_base` is set; default 1024, 0 restores the old open-ended behaviour), `daily_budget_gb` (default 150; 0 turns it off) and `budget_tz` (default `Europe/Berlin`).
 
-For cold files: `probe_timeout` (300 s), `wake_ahead` (3 films), `progress_every` (60 s).
+**Cold files.** On a debrid mount the first touch of a file can take 20 s or more before any data arrives (with the network almost idle), then reads in the same file are fast. So before probing a film, seekthumbs reads 1 MB at the start and end of the file to wake it (`probe_timeout`, 300 s, is how long it waits), wakes the next `wake_ahead` (3) files in the background so those waits overlap, and a file that is still not answering is skipped, tried again at the end of the pass, and never recorded as a failure on the first timeout. The "built" log line shows the wake, probe and read seconds of each film; while a film is read, a line every `progress_every` (60) seconds shows the count, the rate and the time left.
 
 See the README's "How it works" and "Settings" sections for the reasoning and the real-world measurements behind each default — several of these numbers (byte cost per thumbnail, memory per worker, daily budget) come from the author's own rig and mount and are explicitly not guaranteed to transfer to a different one.
 
@@ -80,5 +84,6 @@ The README keeps a running list of what has and hasn't been verified in real use
 - Rate-limit detection is by matching error text and timeouts; a backend that throttles silently is only caught by the 90 s timeout.
 - Dolby Vision profile 5, and HDR through PyAV on a real HDR file, are untested.
 - If `probe` or the first film built shows throttling, lower `--workers`.
+- The web page itself was tested against a synthetic library in a headless browser (light, dark and phone width, no console errors) and with unit tests; the owner ran it on the real mount once (it ran; no numbers recorded yet). Not covered: a real mpv running while the page waits for it (the "wait while a player runs" setting), and very long runs.
 
 The full, up-to-date list — including specific measurements from the author's own debrid mount — is in the project [README](https://github.com/praveenchandrahas/seekthumbs#not-verified-yet--known-weak-spots).
