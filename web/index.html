@@ -286,6 +286,7 @@ $("bAdd").onclick = async () => {
   const ids = visible().filter((f) => selected.has(f.id)).map((f) => f.id).concat([...selected].filter((i) => !visible().some((f) => f.id === i)));
   try { await api("/api/queue", { add: ids }); selected.clear(); await poll(); } catch (e) { showErr(e); }
 };
+async function addRelease(id) { try { await api("/api/queue", { add: [id] }); await poll(); } catch (e) { showErr(e); } }
 $("bNone").onclick = () => { selected.clear(); drawList(); };
 $("bNew").onclick = () => { visible().filter((f) => f.status !== "done" && !f.queued && !f.running && !f.failed).forEach((f) => selected.add(f.id)); drawList(); };
 ["q", "flt", "srt"].forEach((i) => $(i).addEventListener("input", drawList));
@@ -322,7 +323,12 @@ function drawList() {
         f.thumbs ? el("span", {}, f.thumbs.count + " thumbnails · " + mb(f.thumbs.kb * 1000) + (f.thumbs.shared ? " (shared)" : "")) : null,
         f.releases.length > 1 ? el("button", { class: "ic", "aria-expanded": String(expanded.has(f.id)), onclick: (e) => { e.stopPropagation(); expanded.has(f.id) ? expanded.delete(f.id) : expanded.add(f.id); drawList(); } }, expanded.has(f.id) ? "hide" : "show") : null));
     row.querySelector("input").checked = selected.has(f.id);
-    if (expanded.has(f.id)) row.append(el("div", { class: "rel" }, f.releases.map((r) => el("div", {}, el("span", { title: r.name }, (r.done ? "✓ " : "○ ") + r.name), el("span", {}, r.tags.join(" ") + " · " + gb(r.size))))));
+    if (expanded.has(f.id)) row.append(el("div", { class: "rel" }, f.releases.map((r) => el("div", {},
+      el("span", { title: r.name }, (r.done ? "✓ " : r.running ? "● " : r.queued ? "◷ " : "○ ") + r.name),
+      el("span", {}, r.tags.join(" ") + " · " + gb(r.size)),
+      r.done ? null : r.running ? el("span", { class: "chip q" }, "Building") : r.queued ? el("span", { class: "chip q" }, "Queued #" + r.queued) :
+        el("button", { class: "ic", title: "Build this exact release on its own, even though another release of this film already has thumbnails",
+          onclick: (e) => { e.stopPropagation(); addRelease(r.id); } }, "+ build this one")))));
     const toggle = () => { selected.has(f.id) ? selected.delete(f.id) : selected.add(f.id); drawList(); };
     row.addEventListener("click", toggle);
     row.addEventListener("keydown", (e) => { if (e.key === " " || e.key === "Enter") { e.preventDefault(); toggle(); L.querySelector('[data-id="' + f.id + '"]').focus(); } });
@@ -333,7 +339,7 @@ function drawList() {
   const tot = sel.reduce((a, f) => a + f.size, 0);
   $("selTxt").textContent = sel.length ? sel.length + " selected · " + gb(tot) + " source" : "Nothing selected";
   $("bAdd").disabled = !sel.length; $("bAdd").textContent = sel.length ? "Add " + sel.length + " to queue" : "Add to queue";
-  $("libsub").textContent = lib.films.length + " films" + (lib.hidden ? " (" + lib.hidden + " files left out by skip_tv / exclude)" : "") + " · one row per film; the smallest release is read; the others only get an alias if their runtime matches, otherwise they are left out until you play them.";
+  $("libsub").textContent = lib.films.length + " films" + (lib.hidden ? " (" + lib.hidden + " files left out by skip_tv / exclude)" : "") + " · one row per film; the smallest release is read; the others only get an alias if their runtime matches. Expand a film with several releases to build a specific one anyway (\"+ build this one\").";
 }
 
 /* ---------- dashboard ---------- */

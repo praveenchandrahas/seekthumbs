@@ -89,6 +89,28 @@ def library_groups(st, cfg):
     return out, hidden
 
 
+def entry_group(entry):
+    """A queue entry is either a bare group id (build the group's usual way: smallest release first, the
+    rest alias-only) or "gid:idx" (force a real build of one specific release, idx into group['members'],
+    regardless of whether the group is already covered). Returns the bare group id either way."""
+    return entry.split(":", 1)[0]
+
+
+def entry_release_index(entry):
+    """The forced release index of a queue entry, or None for a bare group id."""
+    _, _, idx = entry.partition(":")
+    return int(idx) if idx.isdigit() else None
+
+
+def valid_entry(entry, groups):
+    gid = entry_group(entry)
+    g = groups.get(gid)
+    if g is None:
+        return False
+    idx = entry_release_index(entry)
+    return idx is None or 0 <= idx < len(g["members"])
+
+
 def store_usage(st, store):
     """(real entries, alias entries, bytes of thumbnails and indexes) of the whole store."""
     real = alias = nbytes = 0
@@ -178,11 +200,11 @@ class Engine:
                 saved = json.load(f)
             ids = list(saved.get("queue", []))
             cur = saved.get("current")
-            if cur and cur in self.groups and cur not in ids:
+            if cur and valid_entry(cur, self.groups) and cur not in ids:
                 # the film that was being read when the page stopped (killed, rebooted): it goes back to the top, not lost
                 ids.insert(0, cur)
-                self.st.log(f"RESUMED: {self.groups[cur]['title']} was being read when the page stopped; it is back at the top of the queue")
-            self.queue = [i for i in ids if i in self.groups]
+                self.st.log(f"RESUMED: {self.groups[entry_group(cur)]['title']} was being read when the page stopped; it is back at the top of the queue")
+            self.queue = [i for i in ids if valid_entry(i, self.groups)]
         except (OSError, ValueError, AttributeError):
             self.queue = []
 
@@ -192,7 +214,7 @@ class Engine:
         with self.cv:
             self.groups = {g["id"]: g for g in groups}
             self.hidden, self.scanned_at = hidden, time.time()
-            self.queue = [i for i in self.queue if i in self.groups]
+            self.queue = [i for i in self.queue if valid_entry(i, self.groups)]
             self.rev += 1
 
     def _members_current(self, g):
@@ -202,7 +224,11 @@ class Engine:
         """The film list for the page: fixed facts from the last library scan, status read fresh from the store."""
         st, store = self.st, self.cfg["store"]
         state = st.State(store)
-        qpos = {gid: i + 1 for i, gid in enumerate(self.queue)}
+        qpos = {entry: i + 1 for i, entry in enumerate(self.queue)}           # exact queue entry (bare gid, or "gid:idx") -> 1-based position
+        film_qpos = {}                                                        # gid -> earliest position of any entry (whole-film or a forced release) that touches it
+        for entry, pos in qpos.items():
+            film_qpos.setdefault(entry_group(entry), pos)
+        running_gid = entry_group(self.job_gid) if self.job_gid else None
         films = []
         for g in self.groups.values():
             cur = self._members_current(g)
@@ -221,8 +247,10 @@ class Engine:
                     thumbs = dict(count=sum(1 for l in ix["lengths"] if l), of=ix["count"], kb=round(sum(ix["lengths"]) / 1000), minutes=round(ix["duration"] / 60),
                                   interval=ix["interval"], w=ix["w"], h=ix["h"], shared=r[2] != first[1])
             films.append(dict(
-                id=g["id"], title=g["title"], year=g["year"], status=status, queued=qpos.get(g["id"]), running=g["id"] == self.job_gid, failed=failed,
-                releases=[dict(name=os.path.basename(rel), size=size, tags=file_tags(rel), done=cur[i]) for i, (_, rel, src, size) in enumerate(g["members"])],
+                id=g["id"], title=g["title"], year=g["year"], status=status, queued=film_qpos.get(g["id"]), running=g["id"] == running_gid, failed=failed,
+                releases=[dict(id=f"{g['id']}:{i}", name=os.path.basename(rel), size=size, tags=file_tags(rel), done=cur[i],
+                                queued=qpos.get(f"{g['id']}:{i}"), running=self.job_gid == f"{g['id']}:{i}")
+                          for i, (_, rel, src, size) in enumerate(g["members"])],
                 size=first[3], newest=g["newest"], thumbs=thumbs))
         real, alias, nbytes = store_usage(st, store)
         return dict(films=films, hidden=self.hidden, scanned_at=self.scanned_at, rev=self.rev,
@@ -231,7 +259,7 @@ class Engine:
     # -- queue and controls
     def queue_add(self, ids, top=False):
         with self.cv:
-            ids = [i for i in ids if i in self.groups and i not in self.queue and i != self.job_gid]
+            ids = [i for i in ids if valid_entry(i, self.groups) and i not in self.queue and i != self.job_gid]
             self.queue = (ids + self.queue) if top else (self.queue + ids)
             self._save_queue()
             self.rev += 1
@@ -351,12 +379,12 @@ class Engine:
 
     def _worker(self):
         while not self.closing:
-            gid = self._next_group()
-            if gid is None:
+            entry = self._next_group()
+            if entry is None:
                 return
             t0 = time.time()
             try:
-                self._do_group(self.groups.get(gid), gid)
+                self._do_group(self.groups.get(entry_group(entry)), entry, entry_release_index(entry))
             except Exception as ex:                    # noqa: BLE001 - the worker must survive anything
                 self.st.log(f"web worker: {type(ex).__name__}: {ex}")
             finally:
@@ -373,25 +401,37 @@ class Engine:
 
     def _next_sources(self, k=3):
         out = []
-        for gid in self.queue[:k]:
-            g = self.groups.get(gid)
+        for entry in self.queue[:k]:
+            g = self.groups.get(entry_group(entry))
             if g:
-                out.append(g["members"][0][2])
+                idx = entry_release_index(entry)
+                out.append(g["members"][idx if idx is not None else 0][2])
         return out
 
-    def _do_group(self, g, gid):
+    def _do_group(self, g, entry, force_idx=None):
         if g is None:
             return
         st, cfg0 = self.st, self.cfg
-        # One set per film: once any release of the film has thumbnails (built, or an alias of one), the other releases may only become aliases.
-        # A release whose runtime matches nothing is left alone (it is built when you play it), never read in full a second time.
-        covered = any(st.entry_current(cfg0["store"], rel, size) for (_, rel, _s, size) in g["members"])
-        for (mtime, rel, src, size) in g["members"]:
+        if force_idx is not None:
+            # One specific release, queued explicitly from the web page's per-release "Add this release" action: always
+            # a real build (never the alias-only shortcut below), regardless of whether another release already covers
+            # this film. find_sibling inside build_entry still applies, so a release that is genuinely the same cut
+            # (same runtime) still becomes a proper alias rather than a duplicate build.
+            members = [g["members"][force_idx]]
+            covered = False
+        else:
+            # One set per film: once any release of the film has thumbnails (built, or an alias of one), the other releases may only become aliases.
+            # A release whose runtime matches nothing is left alone (it is built when you play it, or queued explicitly as its own release), never read in full a second time.
+            members = g["members"]
+            covered = any(st.entry_current(cfg0["store"], rel, size) for (_, rel, _s, size) in members)
+        for (mtime, rel, src, size) in members:
             if self.closing or self.stop_requested:
                 return
             if st.entry_current(cfg0["store"], rel, size):
                 continue
-            if rel in self.no_alias:
+            if force_idx is not None:
+                self.no_alias.discard(rel)        # explicitly asked for by id: override "probed once this session, don't bother again"
+            elif rel in self.no_alias:
                 continue
             if time.time() - mtime < cfg0["settle"]:
                 st.log(f"skipped {rel}: modified {time.time() - mtime:.0f} s ago, it may still be downloading")
@@ -427,14 +467,14 @@ class Engine:
                 rec.update(status="stopped")
                 if not self.closing:
                     with self.cv:
-                        self.queue.insert(0, gid)              # stopped is not removed: it waits at the top for the next Start
+                        self.queue.insert(0, entry)              # stopped is not removed: it waits at the top for the next Start
                         self._save_queue()
             except st.ProbeTimeout as ex:
                 if rel not in self.retry_once:
                     self.retry_once.add(rel)
                     st.log(f"SLOW TO OPEN {rel}: {ex}; it goes to the back of the queue (not a failure)")
                     with self.cv:
-                        self.queue.append(gid)
+                        self.queue.append(entry)
                         self._save_queue()
                     rec.update(status="slow")
                     self.totals["slow"] += 1
@@ -448,7 +488,7 @@ class Engine:
                 state.d["breaker_until"] = time.time() + cfg0["breaker_hours"] * 3600
                 state.save()
                 with self.cv:
-                    self.queue.insert(0, gid)
+                    self.queue.insert(0, entry)
                     self._save_queue()
                     self.state, self.note = "idle", "the mount keeps rate-limiting; stopped (it will not be marked as failed)"
                 rec.update(status="throttled")
@@ -539,14 +579,29 @@ class Engine:
             built = [h for h in self.history if h["status"] == "built"]
             avg = (sum(h["seconds"] for h in built[-8:]) / len(built[-8:])) if built else None
             if self._tb_rev != self.rev:                       # the store only changes when a film ends, which bumps rev: do not re-read it every second
-                self._tb = sum(1 for gid in self.queue if gid in self.groups and not any(self._members_current(self.groups[gid])))
+                def _still_to_build(entry):
+                    g2 = self.groups.get(entry_group(entry))
+                    if g2 is None:
+                        return False
+                    cur2 = self._members_current(g2)
+                    idx2 = entry_release_index(entry)
+                    return not cur2[idx2] if idx2 is not None else not any(cur2)
+                self._tb = sum(1 for entry in self.queue if _still_to_build(entry))
                 self._tb_rev = self.rev
             to_build = self._tb
             eta = None
             if avg is not None:
                 eta = avg * to_build + (cur["left"] if cur and cur["left"] else 0)
+            def _queue_row(entry):
+                g2 = self.groups.get(entry_group(entry))
+                if g2 is None:
+                    return None
+                idx2 = entry_release_index(entry)
+                title = g2["title"] if idx2 is None else f"{g2['title']} — {os.path.basename(g2['members'][idx2][1])}"
+                size = g2["members"][0][3] if idx2 is None else g2["members"][idx2][3]
+                return dict(id=entry, title=title, year=g2["year"], size=size)
             return dict(state=self.state, note=self.note, stop_after=self.stop_after, rev=self.rev, now=now, current=cur,
-                        queue=[dict(id=i, title=self.groups[i]["title"], year=self.groups[i]["year"], size=self.groups[i]["members"][0][3]) for i in self.queue if i in self.groups],
+                        queue=[r for r in (_queue_row(i) for i in self.queue) if r is not None],
                         totals=dict(self.totals, avg_seconds=avg, eta_seconds=eta, to_build=to_build, run_seconds=self.run_seconds),
                         history=self.history[-60:], series=ser, settings=dict(self.settings),
                         interval=self.cfg["interval"], budget=budget)

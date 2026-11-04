@@ -130,6 +130,22 @@ try:
     check("the store size is reported", L["store"]["bytes"] > 1000 and L["store"]["real"] == 2 and L["store"]["alias"] == 1, L["store"])
     check("the command line still lists the left-out release (it builds a different cut separately; only the page leaves it out)", st.scan_pass(dict(cfg), dry=True) == 1)
 
+    # ---- a specific release can be forced to build on its own, even though its film is already covered by another release
+    tron2 = next(f for f in L["films"] if f["title"] == "Tron Ares")
+    imax_rel = next(r for r in tron2["releases"] if "IMAX" in r["name"])
+    check("the IMAX release is not done yet and has its own queueable (gid:idx) id", not imax_rel["done"] and ":" in imax_rel["id"], imax_rel)
+    check("an out-of-range release index is not accepted", call("/api/queue", {"add": [imax_rel["id"] + "9"]})[1]["added"] == 0)
+    check("queueing that one specific release", call("/api/queue", {"add": [imax_rel["id"]]})[1]["added"] == 1)
+    check("the queue panel names the release, not just the film", any(q["id"] == imax_rel["id"] and "IMAX" in q["title"] for q in status()["queue"]), status()["queue"])
+    call("/api/control", {"action": "start"})
+    s = wait(lambda s: s["state"] == "idle" and not s["queue"])
+    check("the forced release is actually read and built this time, not left out", any(h["status"] == "built" and "IMAX" in h["rel"] for h in s["history"]), s["history"][-3:])
+    code, L = call("/api/library")
+    check("the store now has a real (non-alias) entry for it too", L["store"]["real"] == 3, L["store"])
+    tron3 = next(f for f in L["films"] if f["title"] == "Tron Ares")
+    imax_rel2 = next(r for r in tron3["releases"] if "IMAX" in r["name"])
+    check("the release itself is now marked done", imax_rel2["done"], imax_rel2)
+
     # ---- pause, resume, stop on a slower film
     slow_dir = os.path.join(tmp, "lib", "Slow.Film.2020.1080p.mkv")
     make_film(os.path.join(slow_dir, "Slow.Film.2020.1080p.mkv"), 120)
@@ -155,14 +171,14 @@ try:
     check("the stopped film is back at the top of the queue, nothing half-built is kept",
           s["queue"] and s["queue"][0]["id"] == slow["id"] and not os.path.exists(os.path.join(store, "Slow.Film.2020.1080p.mkv" + ".seekthumbs", "index.json"))
           and not any(d.startswith(".work-") for dp, dn, fn in os.walk(store) for d in dn), s["queue"])
-    check("a stopped film is not counted as built or failed", s["totals"]["films"] == 2 and s["totals"]["failed"] == 0 and s["history"][-1]["status"] == "stopped", s["history"][-1])
+    check("a stopped film is not counted as built or failed", s["totals"]["films"] == 3 and s["totals"]["failed"] == 0 and s["history"][-1]["status"] == "stopped", s["history"][-1])
 
     # ---- stop after this film
     engine.settings.update(workers=2, pause=0.0)
     call("/api/control", {"action": "start"})
     call("/api/control", {"action": "stop_after"})
     s = wait(lambda s: s["state"] == "idle", 60)
-    check("stop-after finishes the film and then stops", s["state"] == "idle" and s["totals"]["films"] == 3 and "after the film" in s["note"], (s["state"], s["note"], s["totals"]["films"]))
+    check("stop-after finishes the film and then stops", s["state"] == "idle" and s["totals"]["films"] == 4 and "after the film" in s["note"], (s["state"], s["note"], s["totals"]["films"]))
 
     # ---- the queue survives a restart
     other = [f["id"] for f in call("/api/library")[1]["films"] if f["status"] != "done"]
