@@ -1,6 +1,6 @@
 # seekthumbs: seek-bar thumbnails for an rclone library
 
-Full docs: https://praveenchandrahas.github.io/seekthumbs/
+**Full docs:** https://praveenchandrahas.github.io/seekthumbs/ — install and usage (CLI, the web page, the mpv viewer).
 
 [![CI](https://github.com/praveenchandrahas/seekthumbs/actions/workflows/ci.yml/badge.svg)](https://github.com/praveenchandrahas/seekthumbs/actions/workflows/ci.yml) *(CI = unit tests, lint, and a package install/remove test in a clean Ubuntu 24.04 container. A green badge does not show the software works on a real rig.)*
 
