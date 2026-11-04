@@ -1873,7 +1873,18 @@ def net_rx_bytes():
 
 
 def cmd_probe(cfg, path):
-    info = ffprobe(path, cfg)
+    """Measures real per-seek timing and bandwidth for one film. Resolves the same source a real build would
+    use (read_source(): the mount path, or the HTTP address over read_url_base) rather than always the raw
+    mount path - probing the mount directly when read_url_base is set would measure a FUSE mount's own
+    read-ahead behaviour instead of what scan_pass()/build_entry() actually read, which can look dramatically
+    worse (a FUSE/WebDAV layer tuned for sequential streaming can prefetch a large forward window on every
+    random seek, inflating bytes-per-thumbnail far past what the direct HTTP range-read path needs)."""
+    abspath = os.path.abspath(os.path.expanduser(path))
+    rel = os.path.relpath(abspath, os.path.abspath(cfg["library"])) if cfg.get("library") else os.path.basename(abspath)
+    rsrc = read_source(cfg, rel, abspath) if not rel.startswith("..") else abspath
+    if rsrc != abspath:
+        print(f"reading over HTTP: {mask_url(rsrc)}  (mount: {abspath})")
+    info = ffprobe(rsrc, cfg)
     zs = have_filter("zscale")
     n = int(info["duration"] // cfg["interval"])
     print(f"{path}: {info['duration'] / 60:.0f} min, {info['width']}x{info['height']}, transfer {info['transfer'] or '?'}, {n} thumbnails at {cfg['interval']:.0f} s")
@@ -1881,10 +1892,10 @@ def cmd_probe(cfg, path):
     vf = vf_chain(info, cfg["width"], zs)
     tmp = tempfile.mkdtemp(prefix="seekthumbs-probe-")
     try:
-        cands = [("ffmpeg command", CliExtractor(path, vf, cfg), "png")]
+        cands = [("ffmpeg command", CliExtractor(rsrc, vf, cfg), "png")]
         ok, why = AvExtractor.usable(vf)
         if ok:
-            cands.append(("PyAV (open once)", AvExtractor(path, vf, cfg), "ppm"))
+            cands.append(("PyAV (open once)", AvExtractor(rsrc, vf, cfg), "ppm"))
         else:
             print("PyAV not used:", why, "(apt install python3-av may fix it)")
         for label, ex, suffix in cands:
