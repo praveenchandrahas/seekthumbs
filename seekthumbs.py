@@ -48,7 +48,7 @@ from datetime import datetime, timedelta, timezone
 
 VIDEO_EXT = {".mkv", ".mp4", ".m4v", ".avi", ".mov", ".ts", ".m2ts", ".webm", ".wmv"}
 DEFAULTS = dict(library="", store="", interval=20.0, width=400, workers=6, pause=0.0, film_pause=0.0, poll=1800.0, settle=600.0,
-                min_size_mb=300.0, max_films=0, budget_mb=10.0, safety=0.8, seek_timeout=90.0, probesize="1M", yield_to_playback=1,
+                min_size_mb=300.0, max_films=0, budget_mb=10.0, safety=0.8, seek_timeout=30.0, probesize="1M", yield_to_playback=1,
                 breaker_hours=1.0, extractor="auto", rate_cooldown=30.0,
                 play_workers=2, play_pause=2.0, worker_mem_mb=1000, read_url_base="", mem_reserve_mb=3000, play_extractor="pyav", share=1, share_tolerance=2.0, encode_jobs=0, skip_tv=0, exclude="",
                 probe_timeout=300.0, wake_ahead=3, progress_every=60.0, http_chunk_kb=1024, server_error_stop=12, daily_budget_gb=150.0, budget_tz="Europe/Berlin",
