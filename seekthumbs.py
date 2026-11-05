@@ -1433,6 +1433,7 @@ def build_entry(rel, src, size, cfg, gov, zscale_ok):
 
         def ticker():
             last, t_last = 0, time.time()
+            rx_last = rx0
             while every and not halt.wait(every):
                 with lock:
                     ok = stats["ok"]
@@ -1440,21 +1441,38 @@ def build_entry(rel, src, size, cfg, gov, zscale_ok):
                 rate = (ok - last) / max(0.001, now - t_last)
                 left = (n_read - ok) / rate / 60 if rate > 0 else float("inf")
                 log(f"  {ok}/{n_read} thumbnails read, {rate:.2f}/s in the last {now - t_last:.0f} s" + (f", about {left:.0f} min left" if left != float("inf") else ", no progress") + (f", memory {self_rss_mb():.0f} MB" if self_rss_mb() else ""))
-                last, t_last = ok, now
-                # a few thumbnails are enough of a sample (avoid judging by one slow opening read); bail the whole
-                # release rather than grind through hundreds more thumbnails at the same pathological cost - this is
-                # what actually protects the daily budget from one bad release, rather than relying on the user to
-                # notice and hand-add it to `exclude` after the fact.
-                if max_mb > 0 and ok >= 5 and rx0 is not None:
+                # Judge the RECENT window, not the lifetime average since this release started. A lifetime
+                # average is diluted by whatever came before it got expensive: a release that reads cleanly for
+                # its first 100 thumbnails and only then hits a pathological patch (e.g. a damaged region of the
+                # file) can keep its lifetime MB/thumbnail under the limit for a long time even while every
+                # thumbnail *right now* costs several times max_mb_per_thumb - exactly what happened on a real
+                # Avengers Endgame build (first seen 2026-11-05): per-grab deadlines kept firing and falling back
+                # to ffmpeg correctly, but the bail-out itself never tripped, because the early cheap reads were
+                # still propping up the average. So: compare bytes received and thumbnails completed since the
+                # LAST tick, not since the release started.
+                d_ok = ok - last
+                if rx_last is not None:
                     rx_now = net_rx_bytes()
                     if rx_now is not None:
-                        mb_per = (rx_now - rx0) / 1e6 / ok
-                        if mb_per > max_mb:
-                            with lock:
-                                if not abort:
-                                    abort.append(("expensive", f"{mb_per:.0f} MB/thumbnail over the first {ok} reads (limit {max_mb:.0f}); "
-                                                                 "this release looks unusually expensive to seek, not a transient stall"))
-                            return
+                        d_mb = (rx_now - rx_last) / 1e6
+                        # a single thumbnail (or a quiet tick with no completions yet) isn't a big enough sample
+                        # to judge - let bytes and completions carry over into the next tick's window instead of
+                        # either resetting blindly or firing on one unlucky read.
+                        if max_mb > 0 and (d_ok >= 3 or (d_ok == 0 and d_mb > max_mb * 3)):
+                            bail = None
+                            if d_ok >= 3 and d_mb / d_ok > max_mb:
+                                bail = f"{d_mb / d_ok:.0f} MB/thumbnail over the last {d_ok} read(s) (limit {max_mb:.0f}); " \
+                                       "this release looks unusually expensive to seek, not a transient stall"
+                            elif d_ok == 0:
+                                bail = f"{d_mb:.0f} MB received in the last {now - t_last:.0f} s with no new thumbnail completed " \
+                                       f"(limit {max_mb:.0f} MB/thumbnail); reads are failing and retrying, not just slow"
+                            if bail is not None:
+                                with lock:
+                                    if not abort:
+                                        abort.append(("expensive", bail))
+                                return
+                            rx_last = rx_now
+                last, t_last = ok, now
 
         tk = threading.Thread(target=ticker, daemon=True)
         tk.start()
