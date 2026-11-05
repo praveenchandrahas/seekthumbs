@@ -1316,8 +1316,91 @@ try:
         fh16.seek(100)
         same16 = fh16.read(70000)
     check("RangeFile returns the same bytes as the file, across chunk borders", a16 == same16 and rf16.seek(0, 2) == sz16 and rf16.seek(0, 0x10000) == sz16, (len(a16), rf16.size))
+
+    # ---- a RangeFile with a deadline in the past refuses a new request outright: a plain, synchronous, normally-
+    # propagating OSError, not a hang and not a signal that can be swallowed by a C callback boundary (2026-11-05:
+    # a real pathological file showed PyAV running for minutes over RangeFile, un-killable by repeated Ctrl-C,
+    # because an interrupt raised inside RangeFile.read() while PyAV drives it as custom IO can be "ignored" at
+    # that C/Python boundary and the read just retried; a deadline checked before each new request sidesteps that
+    # entirely since nothing needs to interrupt anything mid-flight).
+    rf_dl = st.RangeFile("http://127.0.0.1:1/unreachable")     # never dialed: the deadline check comes first
+    rf_dl.deadline = time.time() - 1
+    try:
+        rf_dl._fetch(0, 10)
+        dl_raised, dl_msg = False, ""
+    except OSError as ex:
+        dl_raised, dl_msg = True, str(ex)
+    check("a RangeFile past its deadline refuses a new request with a plain OSError", dl_raised and "deadline" in dl_msg, dl_msg)
+    rf_dl2 = st.RangeFile(u16, chunk=65536)
+    rf_dl2.deadline = time.time() + 30
+    check("a RangeFile well within its deadline reads normally", rf_dl2.read(10) is not None)
     srv16.shutdown()
     srv16.server_close()
+
+    # ---- a release that is simply too expensive to read is abandoned (recorded as a normal failure), not ground
+    # through at full length: max_mb_per_thumb bails once a few thumbnails already show a bad rate
+    libexp, storeexp = os.path.join(tmp, "libexp"), os.path.join(tmp, "storeexp")
+    fexp = os.path.join(libexp, "Expensive.Film.2021.mkv")
+    make_film(fexp, seconds=130, size="640x360", gop=48)
+
+    class RangeHandlerExp(RangeHandler):
+        def _serve(self, head):
+            path = os.path.join(libexp, os.path.basename(self.path.split("?")[0]))
+            if not os.path.isfile(path):
+                self.send_error(404)
+                return
+            size = os.path.getsize(path)
+            rng = self.headers.get("Range")
+            lo, hi = 0, size - 1
+            if rng and rng.startswith("bytes="):
+                a, _, b = rng[6:].partition("-")
+                lo = int(a) if a else max(0, size - int(b))
+                hi = min(size - 1, int(b)) if (a and b) else size - 1
+            self.send_response(206 if rng else 200)
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(hi - lo + 1))
+            if rng:
+                self.send_header("Content-Range", f"bytes {lo}-{hi}/{size}")
+            self.end_headers()
+            if not head:
+                with open(path, "rb") as fh:
+                    fh.seek(lo)
+                    try:
+                        self.wfile.write(fh.read(hi - lo + 1))
+                    except OSError:
+                        pass
+
+    srvexp = QuietServer(("127.0.0.1", 0), RangeHandlerExp)
+    threading.Thread(target=srvexp.serve_forever, daemon=True).start()
+    # the bail-out must not depend on how fast the real (local, tiny) test fixture happens to read: fake the
+    # whole-machine byte counter so it climbs on every ticker tick regardless of real network speed, making the
+    # "a few bad ticks and it's abandoned" behaviour deterministic instead of a race against real I/O timing.
+    real_net_rx_exp = st.net_rx_bytes
+    ctrexp = [0]
+
+    def fake_net_rx_exp():
+        ctrexp[0] += 50_000_000
+        return ctrexp[0]
+
+    st.net_rx_bytes = fake_net_rx_exp
+    try:
+        outexp = io.StringIO()
+        with contextlib.redirect_stderr(outexp), contextlib.redirect_stdout(outexp):
+            nexp = st.scan_pass(cfg(libexp, storeexp, interval=5.0, workers=1, max_mb_per_thumb=0.0001, progress_every=0.01,
+                                    read_url_base=f"http://127.0.0.1:{srvexp.server_address[1]}/"))
+        check("a pathologically expensive release is abandoned rather than finished", nexp == 0 and "too expensive to read" in outexp.getvalue(), outexp.getvalue()[-500:])
+        check("it is recorded as a normal failure (same backoff as any other), not left to retry immediately",
+              st.State(storeexp).blocked(os.path.relpath(fexp, libexp), os.path.getsize(fexp)), outexp.getvalue()[-300:])
+    finally:
+        st.net_rx_bytes = real_net_rx_exp
+    outexp2 = io.StringIO()
+    storeexp2 = os.path.join(tmp, "storeexp2")
+    with contextlib.redirect_stderr(outexp2), contextlib.redirect_stdout(outexp2):
+        nexp2 = st.scan_pass(cfg(libexp, storeexp2, interval=5.0, workers=2, max_mb_per_thumb=0,
+                                read_url_base=f"http://127.0.0.1:{srvexp.server_address[1]}/"))
+    check("max_mb_per_thumb=0 turns the check off: the same release now finishes normally", nexp2 == 1 and "too expensive" not in outexp2.getvalue(), outexp2.getvalue()[-500:])
+    srvexp.shutdown()
+    srvexp.server_close()
 
     # ---- a source that keeps answering with a server error: the read stops after server_error_stop failures in a row (not after an hour of back-off)
     gv = st.Governor(4, cooldown=0.01)

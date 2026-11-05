@@ -52,7 +52,7 @@ DEFAULTS = dict(library="", store="", interval=20.0, width=400, workers=6, pause
                 breaker_hours=1.0, extractor="auto", rate_cooldown=30.0,
                 play_workers=2, play_pause=2.0, worker_mem_mb=1000, read_url_base="", mem_reserve_mb=3000, play_extractor="pyav", share=1, share_tolerance=2.0, encode_jobs=0, skip_tv=0, exclude="",
                 probe_timeout=300.0, wake_ahead=3, progress_every=60.0, http_chunk_kb=1024, server_error_stop=12, daily_budget_gb=150.0, budget_tz="Europe/Berlin",
-                no_index=1)
+                no_index=1, max_mb_per_thumb=150.0)
 PLAYERS = ("mpv", "mpv-atmos", "mpv-object-audio", "vlc", "kodi", "kodi.bin")
 SUFFIX = ".seekthumbs"
 STOP = False
@@ -824,10 +824,23 @@ class RangeFile:
         self.bytes = 0                     # received from the server, for measuring
         self.requests = 0
         self.closed = False
+        # A per-call `timeout=` on urlopen only bounds ONE request. A read that needs many chunks (a pathological
+        # file where a seek lands far from a decodable frame) can make hundreds of them, each individually well
+        # within its own timeout, while the whole read runs for minutes - and a plain Ctrl-C/KeyboardInterrupt does
+        # NOT reliably stop it either: when PyAV is driving this object as its custom IO source, an exception raised
+        # inside a read() callback invoked from its C layer can be silently "ignored" there and the read retried,
+        # rather than propagating out (seen directly: repeated ^C each only killed one retry, PyAV started another).
+        # `deadline` is a wall-clock cutoff checked before every new REQUEST (not mid-request): once passed, no new
+        # request is issued and a plain OSError is raised from here - an ordinary synchronous exception raised from
+        # inside this function's own execution, not an injected signal, so it propagates normally (as the existing
+        # 5XX/throttle errors already do) instead of hitting the ignored-in-a-callback failure mode above.
+        self.deadline = None
 
     def _fetch(self, lo, hi):
         import urllib.request
         import urllib.error
+        if self.deadline is not None and time.time() > self.deadline:
+            raise OSError(f"grab deadline exceeded ({self.requests} request(s), {self.bytes / 1e6:.1f} MB received so far)")
         hd = {"Range": f"bytes={lo}-{hi}"}
         if self.auth:
             hd["Authorization"] = self.auth
@@ -1050,6 +1063,8 @@ class AvExtractor:
     def _grab(self, t, out):
         try:
             c, stream, g, buf, sink, rf, kind = self._state()
+            if rf is not None:
+                rf.deadline = time.time() + float(self.cfg["seek_timeout"])      # a fresh whole-grab budget, not just one request
             bytes_before = rf.bytes if rf is not None else net_rx_bytes()
             ts = int(t / stream.time_base) + int(stream.start_time or 0)
             c.seek(ts, stream=stream, backward=True, any_frame=False)
@@ -1413,6 +1428,8 @@ def build_entry(rel, src, size, cfg, gov, zscale_ok):
         log(f"reading {n_read} thumbnails of {rel}" + (f" ({len(reuse)} of the {n} already exist at {refine[0]['interval']:g} s and are kept)" if refine else "") + f" with {n_workers} parallel read(s) (wake {t_wake:.0f} s, probe {t_probe:.0f} s)")
         every = float(cfg.get("progress_every", 60.0) or 0)
         halt = threading.Event()
+        rx0 = net_rx_bytes()
+        max_mb = float(cfg.get("max_mb_per_thumb") or 0)
 
         def ticker():
             last, t_last = 0, time.time()
@@ -1424,10 +1441,23 @@ def build_entry(rel, src, size, cfg, gov, zscale_ok):
                 left = (n_read - ok) / rate / 60 if rate > 0 else float("inf")
                 log(f"  {ok}/{n_read} thumbnails read, {rate:.2f}/s in the last {now - t_last:.0f} s" + (f", about {left:.0f} min left" if left != float("inf") else ", no progress") + (f", memory {self_rss_mb():.0f} MB" if self_rss_mb() else ""))
                 last, t_last = ok, now
+                # a few thumbnails are enough of a sample (avoid judging by one slow opening read); bail the whole
+                # release rather than grind through hundreds more thumbnails at the same pathological cost - this is
+                # what actually protects the daily budget from one bad release, rather than relying on the user to
+                # notice and hand-add it to `exclude` after the fact.
+                if max_mb > 0 and ok >= 5 and rx0 is not None:
+                    rx_now = net_rx_bytes()
+                    if rx_now is not None:
+                        mb_per = (rx_now - rx0) / 1e6 / ok
+                        if mb_per > max_mb:
+                            with lock:
+                                if not abort:
+                                    abort.append(("expensive", f"{mb_per:.0f} MB/thumbnail over the first {ok} reads (limit {max_mb:.0f}); "
+                                                                 "this release looks unusually expensive to seek, not a transient stall"))
+                            return
 
         tk = threading.Thread(target=ticker, daemon=True)
         tk.start()
-        rx0 = net_rx_bytes()
         try:
             with ThreadPoolExecutor(max_workers=n_workers) as pool:
                 list(pool.map(work_one, todo_ix))
@@ -1447,6 +1477,8 @@ def build_entry(rel, src, size, cfg, gov, zscale_ok):
                 raise Throttled(f"{why}. Pausing; the queue is kept and nothing is marked failed")
             if kind == "throttled":
                 raise Throttled(f"still rate-limited after backing off: {why[:120]}")
+            if kind == "expensive":
+                raise ReadFailures(f"too expensive to read: {why[:150]}")
             raise ReadFailures(f"repeated failed reads: {why[:150]}")
         if len(frames) < max(1, int(n * 0.8)):
             raise ReadFailures(f"only {len(frames)} of {n} thumbnails could be read")
