@@ -954,11 +954,20 @@ class AvExtractor:
         self.opened = []
         self.files = []                      # RangeFile objects, for the byte count
         self.lock = threading.Lock()
+        # per-grab diagnostics: how much one single seek+decode actually costs, to answer "why so much data
+        # per thumbnail" with numbers instead of theories. grab_n/grab_mb_sum give the mean; the max_* fields
+        # catch the worst single grab, which the mean hides.
+        self.grab_n = 0
+        self.grab_mb_sum = 0.0
+        self.grab_mb_max = 0.0
+        self.grab_packets_max = 0
+        self.grab_seek_gap_max = 0.0          # seconds: how far BEFORE the target the decoded keyframe actually was
 
     def _state(self):
         st = getattr(self.local, "st", None)
         if st is None:
             import av
+            rf = None
             if self.src.startswith(("http://", "https://")) and int(self.cfg.get("http_chunk_kb") or 0) > 0:
                 rf = RangeFile(self.src, chunk=int(self.cfg["http_chunk_kb"]) * 1024, timeout=float(self.cfg["seek_timeout"]))
                 self.files.append(rf)
@@ -971,11 +980,19 @@ class AvExtractor:
             except Exception:                  # noqa: BLE001 - older PyAV: decode everything it is given, still correct
                 pass
             g, buf, sink = self._graph_for(self.vf, stream)
-            st = (c, stream, g, buf, sink)
+            st = (c, stream, g, buf, sink, rf)
             self.local.st = st
             with self.lock:
                 self.opened.append(c)
         return st
+
+    def diag_note(self):
+        """One line summarising the per-grab diagnostics above, or None if nothing was recorded yet (local
+        file, or no successful grab)."""
+        if self.grab_n == 0:
+            return None
+        return (f"per-thumbnail read: avg {self.grab_mb_sum / self.grab_n:.1f} MB, worst {self.grab_mb_max:.1f} MB, "
+                f"worst packet count {self.grab_packets_max}, worst seek landed {self.grab_seek_gap_max:.1f}s before target")
 
     def _drop(self):
         st = getattr(self.local, "st", None)
@@ -1024,10 +1041,11 @@ class AvExtractor:
 
     def _grab(self, t, out):
         try:
-            c, stream, g, buf, sink = self._state()
+            c, stream, g, buf, sink, rf = self._state()
+            bytes_before = rf.bytes if rf is not None else None
             ts = int(t / stream.time_base) + int(stream.start_time or 0)
             c.seek(ts, stream=stream, backward=True, any_frame=False)
-            frame = None
+            frame, n = None, 0
             for n, pkt in enumerate(c.demux(stream)):
                 for fr in pkt.decode():
                     frame = fr
@@ -1036,12 +1054,22 @@ class AvExtractor:
                     break
             if frame is None:
                 return False, "no frame decoded"
+            decoded_t = float(frame.pts * stream.time_base) if frame.pts is not None else None
             buf.push(frame)
             o = sink.pull()
             plane = o.planes[0]
             ls, w, h = plane.line_size, o.width, o.height
             data = bytes(plane)
             write_ppm(out, w, h, (data[r * ls: r * ls + w * 3] for r in range(h)))
+            if bytes_before is not None:
+                mb = (rf.bytes - bytes_before) / 1e6
+                gap = max(0.0, t - decoded_t) if decoded_t is not None else 0.0
+                with self.lock:
+                    self.grab_n += 1
+                    self.grab_mb_sum += mb
+                    self.grab_mb_max = max(self.grab_mb_max, mb)
+                    self.grab_packets_max = max(self.grab_packets_max, n)
+                    self.grab_seek_gap_max = max(self.grab_seek_gap_max, gap)
             return True, ""
         except Exception as ex:                # noqa: BLE001
             self._drop()
@@ -1069,6 +1097,9 @@ class AutoExtractor:
         self.fallbacks = 0
         self.lock = threading.Lock()
         self.name = "pyav" if av else "ffmpeg"
+
+    def diag_note(self):
+        return self.av.diag_note() if self.av is not None else None
 
     def grab(self, t, out):
         if not self.av_off:
@@ -1431,6 +1462,9 @@ def build_entry(rel, src, size, cfg, gov, zscale_ok):
         no_index_note = ""
         if hasattr(ext, "fast_ok"):            # a noindex.NoIndexExtractor: say how much of the film it read without any index
             no_index_note = f"no-index path: {ext.fast_ok} read directly, {ext.fast_fail} fell back; "
+        diag = ext.diag_note() if hasattr(ext, "diag_note") else None
+        if diag:
+            no_index_note += diag + "; "
         log(f"{'refined' if refine else 'built'} {rel}: {n} thumbs ({stats['ok']} read, {stats['fail']} failed reads, {ext.name}), {w}x{h} q{q}, {total / 1e6:.2f} MB "
             f"(budget {allowed / 1e6:.2f}), {dt:.0f}s total (wake {t_wake:.0f}s, probe {t_probe:.0f}s, read {t_read - t_wake - t_probe:.0f}s), "
             f"{n_read / max(0.1, t_read - t_wake - t_probe):.1f} reads/s; " + no_index_note
