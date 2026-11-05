@@ -955,11 +955,14 @@ class AvExtractor:
         self.files = []                      # RangeFile objects, for the byte count
         self.lock = threading.Lock()
         # per-grab diagnostics: how much one single seek+decode actually costs, to answer "why so much data
-        # per thumbnail" with numbers instead of theories. grab_n/grab_mb_sum give the mean; the max_* fields
-        # catch the worst single grab, which the mean hides.
-        self.grab_n = 0
-        self.grab_mb_sum = 0.0
-        self.grab_mb_max = 0.0
+        # per thumbnail" with numbers instead of theories. Kept per "kind" of read, because they are not
+        # equally trustworthy: "http" comes from RangeFile's own byte count (exact, this read only); "mount"
+        # and "direct-http" come from the whole-machine /proc/net/dev counter (net_rx_bytes), the only signal
+        # available when PyAV opens the file directly (no RangeFile in the loop) - approximate, and smeared
+        # across whatever else this machine's network is doing at the same moment, including other workers'
+        # concurrent reads. Still far better than no visibility at all into the mount-read case, which is
+        # the one that actually dominates when a film's HTTP open fails and it falls back to the mount.
+        self.stats = {}                       # kind -> dict(n, mb_sum, mb_max)
         self.grab_packets_max = 0
         self.grab_seek_gap_max = 0.0          # seconds: how far BEFORE the target the decoded keyframe actually was
 
@@ -980,19 +983,24 @@ class AvExtractor:
             except Exception:                  # noqa: BLE001 - older PyAV: decode everything it is given, still correct
                 pass
             g, buf, sink = self._graph_for(self.vf, stream)
-            st = (c, stream, g, buf, sink, rf)
+            kind = "http" if rf is not None else ("mount" if not self.src.startswith(("http://", "https://")) else "direct-http")
+            st = (c, stream, g, buf, sink, rf, kind)
             self.local.st = st
             with self.lock:
                 self.opened.append(c)
         return st
 
     def diag_note(self):
-        """One line summarising the per-grab diagnostics above, or None if nothing was recorded yet (local
-        file, or no successful grab)."""
-        if self.grab_n == 0:
+        """One line per kind of read summarising the per-grab diagnostics above, or None if nothing was
+        recorded yet (no successful grab, or net_rx_bytes is unavailable on this machine)."""
+        if not self.stats:
             return None
-        return (f"per-thumbnail read: avg {self.grab_mb_sum / self.grab_n:.1f} MB, worst {self.grab_mb_max:.1f} MB, "
-                f"worst packet count {self.grab_packets_max}, worst seek landed {self.grab_seek_gap_max:.1f}s before target")
+        label = {"http": "http(bounded)", "mount": "mount(approx)", "direct-http": "direct-http(approx)"}
+        parts = [f"{label.get(k, k)} avg {s['mb_sum'] / s['n']:.1f} MB worst {s['mb_max']:.1f} MB ({s['n']} reads)"
+                 for k, s in self.stats.items()]
+        return ("per-thumbnail read: " + ", ".join(parts) +
+                f"; worst packet count {self.grab_packets_max}, worst seek landed {self.grab_seek_gap_max:.1f}s before target"
+                + (" (approx = this machine's whole network counter, not just this read)" if any(k != "http" for k in self.stats) else ""))
 
     def _drop(self):
         st = getattr(self.local, "st", None)
@@ -1041,8 +1049,8 @@ class AvExtractor:
 
     def _grab(self, t, out):
         try:
-            c, stream, g, buf, sink, rf = self._state()
-            bytes_before = rf.bytes if rf is not None else None
+            c, stream, g, buf, sink, rf, kind = self._state()
+            bytes_before = rf.bytes if rf is not None else net_rx_bytes()
             ts = int(t / stream.time_base) + int(stream.start_time or 0)
             c.seek(ts, stream=stream, backward=True, any_frame=False)
             frame, n = None, 0
@@ -1062,12 +1070,13 @@ class AvExtractor:
             data = bytes(plane)
             write_ppm(out, w, h, (data[r * ls: r * ls + w * 3] for r in range(h)))
             if bytes_before is not None:
-                mb = (rf.bytes - bytes_before) / 1e6
+                mb = (rf.bytes - bytes_before) / 1e6 if rf is not None else max(0.0, ((net_rx_bytes() or bytes_before) - bytes_before) / 1e6)
                 gap = max(0.0, t - decoded_t) if decoded_t is not None else 0.0
                 with self.lock:
-                    self.grab_n += 1
-                    self.grab_mb_sum += mb
-                    self.grab_mb_max = max(self.grab_mb_max, mb)
+                    s = self.stats.setdefault(kind, dict(n=0, mb_sum=0.0, mb_max=0.0))
+                    s["n"] += 1
+                    s["mb_sum"] += mb
+                    s["mb_max"] = max(s["mb_max"], mb)
                     self.grab_packets_max = max(self.grab_packets_max, n)
                     self.grab_seek_gap_max = max(self.grab_seek_gap_max, gap)
             return True, ""
@@ -1097,9 +1106,23 @@ class AutoExtractor:
         self.fallbacks = 0
         self.lock = threading.Lock()
         self.name = "pyav" if av else "ffmpeg"
+        # the ffmpeg command re-opens and re-probes the whole file on every call (no reused handle like PyAV's), so
+        # it is the most expensive path when PyAV keeps failing and falling back; measured the same approximate way
+        # as AvExtractor's non-http kinds (the whole-machine net_rx_bytes counter), since CliExtractor has no byte
+        # count of its own.
+        self.cli_n = 0
+        self.cli_mb_sum = 0.0
+        self.cli_mb_max = 0.0
 
     def diag_note(self):
-        return self.av.diag_note() if self.av is not None else None
+        parts = []
+        d = self.av.diag_note() if self.av is not None else None
+        if d:
+            parts.append(d)
+        if self.cli_n:
+            parts.append(f"ffmpeg-fallback avg {self.cli_mb_sum / self.cli_n:.1f} MB worst {self.cli_mb_max:.1f} MB "
+                          f"({self.cli_n} reads, approx)")
+        return "; ".join(parts) if parts else None
 
     def grab(self, t, out):
         if not self.av_off:
@@ -1121,7 +1144,17 @@ class AutoExtractor:
                     log("PyAV does not work on this film, using the ffmpeg command instead:", why[:120])
                 else:
                     self.note_fallback(t, why)
-        return self.cli.grab(t, out)
+        before = net_rx_bytes()
+        r = self.cli.grab(t, out)
+        if before is not None and r[0]:
+            after = net_rx_bytes()
+            if after is not None:
+                mb = max(0.0, (after - before) / 1e6)
+                with self.lock:
+                    self.cli_n += 1
+                    self.cli_mb_sum += mb
+                    self.cli_mb_max = max(self.cli_mb_max, mb)
+        return r
 
     def note_fallback(self, t, why):
         """A PyAV read failed and the dearer ffmpeg command takes over for it. Logged for the first 3, then every 50th, so it is no longer silent."""
