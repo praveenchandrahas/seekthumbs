@@ -69,9 +69,11 @@ def pretty_title(key, fallback_name):
 
 
 def library_groups(st, cfg):
-    """One group per film: all its releases (the smallest first, the one that gets built). Returns (groups, hidden): `hidden` counts files left out by skip_tv/exclude."""
+    """One group per film: all its releases (the smallest first, the one that gets built). Returns (groups, hidden): `hidden` counts files left out by skip_tv/exclude.
+    With `source = rd` the list comes from Real-Debrid's inventory (st.list_films); a provider refusal raises st.Throttled and the caller keeps the
+    previous list instead of emptying the page."""
     items, hidden = [], 0
-    for rel, src, size, mtime in st.walk_library(cfg["library"], cfg["min_size_mb"] * 1e6):
+    for rel, src, size, mtime, _token in st.list_films(cfg, cfg["min_size_mb"] * 1e6):
         if st.excluded(cfg, rel):
             hidden += 1
             continue
@@ -210,12 +212,17 @@ class Engine:
 
     # -- the library and what is done
     def refresh_library(self):
-        groups, hidden = library_groups(self.st, self.cfg)
+        try:
+            groups, hidden = library_groups(self.st, self.cfg)
+        except Exception as ex:                    # noqa: BLE001 - a provider outage must not empty the page or kill the server
+            self.st.log(f"library listing failed ({ex}); keeping the previous list")
+            return False
         with self.cv:
             self.groups = {g["id"]: g for g in groups}
             self.hidden, self.scanned_at = hidden, time.time()
             self.queue = [i for i in self.queue if valid_entry(i, self.groups)]
             self.rev += 1
+        return True
 
     def _members_current(self, g):
         return [self.st.entry_current(self.cfg["store"], rel, size) for _, rel, src, size in g["members"]]

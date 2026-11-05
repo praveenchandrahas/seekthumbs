@@ -17,8 +17,11 @@ grows back one step per 40 clean reads. Standard library plus ffmpeg/ffprobe; Py
     seekthumbs.py prune [--yes]     list (or delete, with --yes) store entries whose film no longer exists; refuses if the library looks unmounted
     seekthumbs.py install-service [--enable]   write ~/.config/systemd/user/seekthumbs.service
     seekthumbs.py install-viewer [--mpv-config-dir DIR] [--on-play]   put the mpv viewer (thumbfast.lua) into DIR/scripts, moving a real thumbfast aside; --on-play also turns on the build of the playing film (off by default)
+    seekthumbs.py rd-probe [--refresh] [--films N] [--extract]   check the Real-Debrid account, match its torrents to the mount, and measure reads (source=rd)
 
 Settings come from ~/.config/seekthumbs/config.ini ([seekthumbs] library=, store=, ...) and can be overridden on the command line.
+With `source = rd` the film list and the bytes to read come from the Real-Debrid API (see realdebrid.py); the mount is still
+used for playback and as the path every store entry is keyed by. The token is read from RD_API_TOKEN, so it need not be in the ini.
 
 Store layout (mirrors the library, so a player script can find a film's entry by path alone):
     STORE/<path of the film relative to LIBRARY>.seekthumbs/index.json   {v, src, size, duration, interval, w, h, count, offsets[], lengths[], q, made}
@@ -52,7 +55,12 @@ DEFAULTS = dict(library="", store="", interval=20.0, width=400, workers=6, pause
                 breaker_hours=1.0, extractor="auto", rate_cooldown=30.0,
                 play_workers=2, play_pause=2.0, worker_mem_mb=1000, read_url_base="", mem_reserve_mb=3000, play_extractor="pyav", share=1, share_tolerance=2.0, encode_jobs=0, skip_tv=0, exclude="",
                 probe_timeout=300.0, wake_ahead=3, progress_every=60.0, http_chunk_kb=1024, server_error_stop=12, daily_budget_gb=150.0, budget_tz="Europe/Berlin",
-                no_index=1, max_mb_per_thumb=150.0)
+                no_index=1, max_mb_per_thumb=150.0,
+                # source = "mount" keeps the old behaviour. "rd" lists the Real-Debrid account and reads direct links;
+                # `library` is still the Decypharr mount, both for playback and for the store path the viewer looks up.
+                source="mount", rd_token="", rd_api_base="https://api.real-debrid.com/rest/1.0", rd_folder_naming="filename",
+                rd_cache_ttl=900.0, rd_info_ttl=86400.0, rd_link_ttl=1500.0, rd_require_mount=1, rd_mount_index=1,
+                rd_min_interval=0.26, rd_timeout=30.0)
 PLAYERS = ("mpv", "mpv-atmos", "mpv-object-audio", "vlc", "kodi", "kodi.bin")
 SUFFIX = ".seekthumbs"
 STOP = False
@@ -625,10 +633,181 @@ class Job:
         return not (self.stopped or STOP)
 
 
-def read_source(cfg, rel, src):
+def is_rd(cfg):
+    return str((cfg or {}).get("source") or "mount").strip().lower() in ("rd", "realdebrid", "real-debrid")
+
+
+def provider_error(ex):
+    """True for errors that mean 'the provider is refusing or the account is unusable', not 'this film is bad'.
+    Those pause all work (the circuit breaker) instead of marking the film failed and moving to the next one."""
+    try:
+        import realdebrid
+    except ImportError:
+        return False
+    return isinstance(ex, (realdebrid.RdAuthError, realdebrid.RdThrottle, realdebrid.RdServerError))
+
+
+_RD_LOCK = threading.Lock()
+_RD_STATES = {}
+
+
+def rd_state(cfg):
+    """The one Real-Debrid client/inventory/link cache for this config. Creating one per call would reload the
+    inventory cache and defeat the link cache for every thumbnail; keying by what can change keeps tests and a
+    token switch from reusing the wrong account."""
+    import realdebrid
+    token = realdebrid.token_from(cfg)
+    key = (token, cfg.get("rd_api_base") or realdebrid.API_BASE, cfg.get("store") or "", cfg.get("library") or "",
+           cfg.get("rd_folder_naming") or "filename", int(cfg.get("rd_require_mount", 1) or 0),
+           int(cfg.get("rd_mount_index", 1) or 0), float(cfg.get("min_size_mb") or 0))
+    with _RD_LOCK:
+        state = _RD_STATES.get(key)
+        if state is None:
+            state = RdState(cfg, token)
+            _RD_STATES[key] = state
+        return state
+
+
+class RdState:
+    """Listing, path mapping and link resolution for `source = rd`.
+
+    The inventory is Real-Debrid's; the path is still the Decypharr mount's, because that is what playback and the
+    viewer use. Every item therefore carries both: `rel`/`src` for the store and the fallback, and `token` (torrent
+    id, file id, restricted link) for this module to resolve a direct URL when a build starts."""
+
+    def __init__(self, cfg, token):
+        import realdebrid
+        self.cfg, self.rd, self.token = cfg, realdebrid, token
+        if not token:
+            raise realdebrid.RdAuthError("no Real-Debrid API token: set RD_API_TOKEN (or rd_token) - "
+                                         "create one at https://real-debrid.com/apitoken")
+        store = cfg.get("store") or "."
+        self.client = realdebrid.RdClient(token, base=cfg.get("rd_api_base") or realdebrid.API_BASE,
+                                          timeout=float(cfg.get("rd_timeout") or 30.0),
+                                          min_interval=float(cfg.get("rd_min_interval") or 0.0), log=log)
+        self.inventory = realdebrid.Inventory(self.client, realdebrid.cache_name(token, store), video_ext=VIDEO_EXT,
+                                              min_size=int(float(cfg.get("min_size_mb") or 0) * 1e6),
+                                              list_ttl=float(cfg.get("rd_cache_ttl") or 900.0),
+                                              info_ttl=float(cfg.get("rd_info_ttl") or 86400.0), log=log)
+        self.links = realdebrid.LinkCache(self.client, ttl=float(cfg.get("rd_link_ttl") or 1500.0))
+        self._mapped, self._stats, self._mapped_at, self._forced_at = None, {}, 0.0, 0.0
+        self.lock = threading.RLock()
+
+    def _item(self, raw, rel, st):
+        token = dict(torrent_id=raw["torrent_id"], file_id=raw.get("file_id"), link=raw["link"], size=st.st_size,
+                     file_name=raw.get("file_name") or "")
+        d = dict(raw)
+        d.update(rel=rel, src=os.path.join(self.cfg.get("library") or "", *rel.split("/")), size=st.st_size,
+                 mtime=st.st_mtime, token=token)
+        return d
+
+    def mapped(self, refresh=False):
+        """[(item, ...)], {counts}. Resolves each RD file to the mount path Decypharr actually gave it. When the
+        expected name does not match, a same-name-and-size file elsewhere under the library is used (exactly one
+        candidate, never a guess among several); with `rd_require_mount=0`, an absent file keeps the expected path."""
+        import realdebrid
+        with self.lock:
+            if not refresh and self._mapped is not None and time.time() - self._mapped_at < 30.0:
+                return self._mapped, self._stats
+            library = self.cfg.get("library") or ""
+            naming = self.cfg.get("rd_folder_naming") or "filename"
+            require = bool(int(self.cfg.get("rd_require_mount", 1) or 0))
+            raw = self.inventory.items(refresh=refresh)
+            stats = dict(raw=len(raw), path=0, indexed=0, unmatched=0, size_mismatch=0, ambiguous=0, skipped=0)
+            mapped, missing = [], []
+            for it in raw:
+                cands = realdebrid.mount_candidates(it, naming)
+                found = realdebrid.find_on_mount(library, cands, it["size"]) if library else None
+                if found:
+                    mapped.append(self._item(it, found[0], found[1]))
+                    stats["path"] += 1
+                else:
+                    missing.append((it, cands))
+            if missing and library:
+                for it, cands in missing:
+                    if realdebrid.find_on_mount(library, cands, None) is not None:
+                        stats["size_mismatch"] += 1
+                if int(self.cfg.get("rd_mount_index", 1) or 0):
+                    index = realdebrid.mount_index(library, VIDEO_EXT, int(float(self.cfg.get("min_size_mb") or 0) * 1e6))
+                    for it, cands in list(missing):
+                        hits = index.get((realdebrid.norm_name(it.get("file_name")), it["size"]), [])
+                        if len(hits) == 1:
+                            found = realdebrid.find_on_mount(library, hits, it["size"])
+                            if found:
+                                mapped.append(self._item(it, found[0], found[1]))
+                                stats["indexed"] += 1
+                                missing.remove((it, cands))
+                        elif len(hits) > 1:
+                            stats["ambiguous"] += 1
+                            missing.remove((it, cands))
+            for it, cands in missing:
+                if require or not cands:
+                    stats["unmatched"] += 1
+                    continue
+                rel = cands[0]                         # no mount file (yet): keep the expected path so the store can catch up
+                fake = type("S", (), dict(st_size=it["size"], st_mtime=realdebrid.parse_date(it.get("added"))))()
+                mapped.append(self._item(it, rel, fake))
+                stats["unmatched"] += 1
+            stats["skipped"] = stats["unmatched"] if require else 0
+            self._mapped, self._stats, self._mapped_at = mapped, stats, time.time()
+            if stats["indexed"] or stats["ambiguous"] or stats["size_mismatch"]:
+                log(f"Real-Debrid: {stats['path']} film(s) matched the mount by path, {stats['indexed']} by file name and size, "
+                    f"{stats['size_mismatch']} had a same-named file of a different size, {stats['ambiguous']} were ambiguous")
+            if stats["skipped"]:
+                log(f"Real-Debrid: {stats['skipped']} film(s) have no file on the mount under {library or '(no library)'}; "
+                    f"skipped (rd_require_mount=1 keeps the store and the viewer in agreement)")
+            return mapped, stats
+
+    def item_for(self, rel, token=None):
+        """The item for one mount-relative path, or RdNotFound. A token from the scan avoids the lookup; a path that is
+        not in the cached inventory (a film added moments ago, or an on-play build) forces one refresh, at most once a minute."""
+        import realdebrid
+        if token:
+            return dict(rel=rel, token=token, size=int(token.get("size") or 0), src=os.path.join(self.cfg.get("library") or "", *rel.split("/")))
+        items, _ = self.mapped()
+        for it in items:
+            if it["rel"] == rel:
+                return it
+        with self.lock:
+            can_force = time.time() - self._forced_at > 60.0
+            if can_force:
+                self._forced_at = time.time()
+        if can_force:
+            log(f"Real-Debrid: {rel} is not in the cached inventory; refreshing it")
+            items, _ = self.mapped(refresh=True)
+            for it in items:
+                if it["rel"] == rel:
+                    return it
+        raise realdebrid.RdNotFound(f"no downloaded Real-Debrid torrent maps to {rel}")
+
+    def source_for(self, rel, token=None):
+        """A refreshable HttpSource for one film. On an expired restricted link the torrent's file list is read again;
+        the direct URL is refreshed in place by RangeFile when the CDN answers 401/403/404/410."""
+        import realdebrid
+        item = self.item_for(rel, token)
+        link = item["token"].get("link")
+        try:
+            url = self.links.get(link)
+        except realdebrid.RdNotFound:
+            info = self.inventory.refresh_torrent(item["token"]["torrent_id"])
+            fresh = next((f for f in realdebrid.files_from_info(info, VIDEO_EXT, 0)
+                          if str(f.get("file_id")) == str(item["token"].get("file_id"))), None)
+            if fresh is None:
+                raise realdebrid.RdNotFound(f"Real-Debrid no longer offers {item.get('file_name') or rel}") from None
+            item["token"]["link"] = fresh["link"]
+            link = fresh["link"]
+            url = self.links.get(link, force=True)
+        label = f"Real-Debrid {item.get('file_name') or os.path.basename(rel)} (signed link)"
+        return HttpSource(url, refresh=lambda: self.links.get(item["token"]["link"], force=True), label=label)
+
+
+def read_source(cfg, rel, src, token=None):
     """Where the pictures are read from. By default the file on the mount (`src`). With `read_url_base` set (for example the WebDAV address of the same
     folder, http://127.0.0.1:8282/webdav/.../__all__/) the film is read over HTTP with range requests instead: `base + the path of the film relative to the
-    library`, each part percent-encoded. The mount stays the library listing and the fallback."""
+    library`, each part percent-encoded. The mount stays the library listing and the fallback.
+    With `source = rd`, Real-Debrid resolves a direct URL for the file; that URL is short-lived and carries a signature."""
+    if is_rd(cfg):
+        return rd_state(cfg).source_for(rel, token)
     base = (cfg.get("read_url_base") or "").strip()
     if not base:
         return src
@@ -637,8 +816,40 @@ def read_source(cfg, rel, src):
 
 
 def mask_url(u):
-    """The URL without a user:password@ part, for the log."""
+    """The URL without a user:password@ part, for the log. An HttpSource may also carry an opaque signed URL, which
+    must never reach the log: it uses the source's safe label instead."""
+    if isinstance(u, HttpSource):
+        return u.label
     return re.sub(r"^(https?://)[^/@]*@", r"\1", u)
+
+
+def library_items(cfg, min_size):
+    """(rel, src, size, mtime, token) for every film the configured source offers. The mount yields a token of None;
+    Real-Debrid yields the torrent/file identity that a build needs to resolve a direct URL."""
+    if is_rd(cfg):
+        items, _ = rd_state(cfg).mapped()
+        for it in items:
+            if it["size"] >= min_size:
+                yield it["rel"], it["src"], it["size"], it["mtime"], it["token"]
+        return
+    for rel, src, size, mtime in walk_library(cfg["library"], min_size):
+        yield rel, src, size, mtime, None
+
+
+def library_files(cfg, min_size):
+    """The old four-tuple view, for callers that only list films (the web page, prune's safety check)."""
+    for rel, src, size, mtime, _token in library_items(cfg, min_size):
+        yield rel, src, size, mtime
+
+
+def list_films(cfg, min_size):
+    """The whole list, with provider refusals turned into Throttled so a pass pauses instead of blaming a film."""
+    try:
+        return list(library_items(cfg, min_size))
+    except Exception as ex:                            # noqa: BLE001
+        if provider_error(ex):
+            raise Throttled(f"Real-Debrid: {ex}") from None
+        raise
 
 
 def http_wake(url, timeout):
@@ -801,15 +1012,30 @@ def release_memory():
         pass
 
 
+class HttpSource(str):
+    """A URL string that also knows how to get a fresh one. Real-Debrid direct links are pre-signed and expire; keeping
+    the refresh callback on the string means every existing caller (ffprobe, CliExtractor, PyAV, RangeFile) keeps
+    working unchanged. `label` is what may be written to a log: the URL itself carries a signature and must not be."""
+
+    def __new__(cls, url, refresh=None, label=None):
+        o = super().__new__(cls, url)
+        o.refresh = refresh
+        o.label = label or url
+        return o
+
+
 class RangeFile:
     """A read-only, seekable file over HTTP that asks for BOUNDED ranges (default 1 MiB at a time) instead of one open-ended request.
     ffmpeg's own HTTP reader asks for 'bytes=N-' and lets the server stream on; the data in flight when it stops is still billed. Measured on the
     owner's rig: about 65 MB received per thumbnail, about 16 GB for one 4K film, and the debrid account hit its traffic limit. Here a read
-    never fetches more than `chunk` bytes beyond what is asked for. Errors carry the HTTP status ("HTTP Error 503 ...") so THROTTLE_RE sees them."""
+    never fetches more than `chunk` bytes beyond what is asked for. Errors carry the HTTP status ("HTTP Error 503 ...") so THROTTLE_RE sees them.
+    If the URL came from `HttpSource` and 401/403/404/410 comes back, the link is refreshed once (a Real-Debrid direct URL that expired)."""
 
     def __init__(self, url, chunk=1 << 20, timeout=60.0, keep=4):
         import urllib.parse
         import base64
+        self.refresh = getattr(url, "refresh", None)
+        self.refreshes = 0
         u = urllib.parse.urlsplit(url)
         self.auth = None
         if u.username is not None:
@@ -839,22 +1065,33 @@ class RangeFile:
     def _fetch(self, lo, hi):
         import urllib.request
         import urllib.error
-        if self.deadline is not None and time.time() > self.deadline:
-            raise OSError(f"grab deadline exceeded ({self.requests} request(s), {self.bytes / 1e6:.1f} MB received so far)")
-        hd = {"Range": f"bytes={lo}-{hi}"}
-        if self.auth:
-            hd["Authorization"] = self.auth
-        try:
-            with urllib.request.urlopen(urllib.request.Request(self.url, headers=hd), timeout=self.timeout) as r:
-                data = r.read(hi - lo + 1)
-                cr = r.headers.get("Content-Range", "")
-                status = getattr(r, "status", 206)
-        except urllib.error.HTTPError as ex:
-            if ex.code == 416 and self.size is not None:
-                return b""
-            raise OSError(f"HTTP Error {ex.code} {ex.reason}") from None
-        except (urllib.error.URLError, TimeoutError) as ex:
-            raise OSError(f"HTTP read failed: {ex}") from None
+        for attempt in range(2):
+            if self.deadline is not None and time.time() > self.deadline:
+                raise OSError(f"grab deadline exceeded ({self.requests} request(s), {self.bytes / 1e6:.1f} MB received so far)")
+            hd = {"Range": f"bytes={lo}-{hi}"}
+            if self.auth:
+                hd["Authorization"] = self.auth
+            try:
+                with urllib.request.urlopen(urllib.request.Request(self.url, headers=hd), timeout=self.timeout) as r:
+                    data = r.read(hi - lo + 1)
+                    cr = r.headers.get("Content-Range", "")
+                    status = getattr(r, "status", 206)
+                break
+            except urllib.error.HTTPError as ex:
+                if ex.code == 416 and self.size is not None:
+                    return b""
+                if attempt == 0 and ex.code in (401, 403, 404, 410) and self.refresh is not None:
+                    try:
+                        fresh = self.refresh()
+                    except Exception as rex:              # noqa: BLE001 - report both the read error and the refresh failure
+                        raise OSError(f"HTTP Error {ex.code} {ex.reason}; refreshing the link failed: {rex}") from None
+                    if fresh and fresh != self.url:
+                        self.url = fresh
+                        self.refreshes += 1
+                        continue                          # the same range against the new, pre-signed URL
+                raise OSError(f"HTTP Error {ex.code} {ex.reason}") from None
+            except (urllib.error.URLError, TimeoutError) as ex:
+                raise OSError(f"HTTP read failed: {ex}") from None
         self.requests += 1
         self.bytes += len(data)
         if "/" in cr and cr.rsplit("/", 1)[1].isdigit():
@@ -1282,13 +1519,18 @@ def choose_and_encode(frames, outdir, width0, budget_bytes, jobs):
         idx += 1
 
 
-def build_entry(rel, src, size, cfg, gov, zscale_ok):
+def build_entry(rel, src, size, cfg, gov, zscale_ok, token=None):
     """Returns True on success. All writes go to the local store; the source is only read."""
     t0 = time.time()
     job = cfg.get("_job")
     if job:
         job.phase = "waking"
-    rsrc = read_source(cfg, rel, src)             # the mount path, or the HTTP address of the same file
+    try:
+        rsrc = read_source(cfg, rel, src, token)   # the mount path, or the HTTP address of the same file
+    except Exception as ex:                        # noqa: BLE001 - a provider refusal pauses work; a missing film fails normally
+        if provider_error(ex):
+            raise Throttled(f"Real-Debrid: {ex}") from None
+        raise
     if rsrc != src:
         log(f"reading {rel} over HTTP: {mask_url(rsrc)}")
     t_wake = wake_file(rsrc, float(cfg.get("probe_timeout") or 300.0))
@@ -1302,7 +1544,7 @@ def build_entry(rel, src, size, cfg, gov, zscale_ok):
     except ProbeTimeout:
         raise
     except RuntimeError as ex:
-        if rsrc == src:
+        if rsrc == src or not os.path.exists(src):
             raise
         log(f"HTTP read failed ({str(ex)[:160]}); using the mount path for {rel}")
         rsrc = src
@@ -1576,6 +1818,8 @@ def player_running():
 
 
 def library_ready(cfg):
+    if is_rd(cfg) and not int(cfg.get("rd_require_mount", 1) or 0):
+        return True                                    # no mount needed: the inventory is Real-Debrid's
     try:
         return len(os.listdir(cfg["library"])) > 0
     except OSError:
@@ -1618,7 +1862,14 @@ def scan_pass(cfg, dry=False):
         return 0
     todo = []
     n_excluded = 0
-    for rel, src, size, mtime in walk_library(cfg["library"], cfg["min_size_mb"] * 1e6):
+    try:
+        films = list_films(cfg, cfg["min_size_mb"] * 1e6)
+    except Throttled as ex:
+        log(f"STOPPING: {ex}")
+        state.d["breaker_until"] = time.time() + cfg["breaker_hours"] * 3600
+        state.save()
+        return 0
+    for rel, src, size, mtime, token in films:
         if excluded(cfg, rel):
             n_excluded += 1
             continue
@@ -1626,13 +1877,13 @@ def scan_pass(cfg, dry=False):
             continue
         if time.time() - mtime < cfg["settle"]:
             continue
-        todo.append((mtime, rel, src, size))
+        todo.append((mtime, rel, src, size, token))
     if n_excluded:
         log(f"{n_excluded} file(s) left out by skip_tv/exclude")
     ordered = order_todo(todo, bool(cfg.get("share", 1)))
     todo = [it for it, role, n in ordered]       # newest additions first; the releases of one film together, the smallest file first
     if dry:
-        for (mtime, rel, src, size), role, n in ordered:
+        for (mtime, rel, src, size, token), role, n in ordered:
             note = f"   [{n} releases share this: built from this one, the smallest]" if role == "build" and n > 1 else \
                    "   [alias of the one above if its runtime agrees within " + f"{cfg.get('share_tolerance', 2.0):g} s]" if role == "alias" else ""
             print(f"{size / 1e9:6.1f} GB  {rel}{note}")
@@ -1647,7 +1898,7 @@ def scan_pass(cfg, dry=False):
     queue, retried, k = list(batch), set(), 0           # a file that is slow to open goes to the back of the queue once
     wk = WakeAhead(cfg.get("wake_ahead", 3), float(cfg.get("probe_timeout") or 300.0))
     while k < len(queue):
-        mtime, rel, src, size = queue[k]
+        mtime, rel, src, size, token = queue[k]
         k += 1
         if STOP:
             break
@@ -1664,7 +1915,7 @@ def scan_pass(cfg, dry=False):
             log(f"{rel} is being built by another seekthumbs; skipping")
             continue
         try:
-            if build_entry(rel, src, size, cfg, gov, zs):
+            if build_entry(rel, src, size, cfg, gov, zs, token):
                 state.ok(rel)
                 done += 1
                 bad_streak = 0
@@ -1675,7 +1926,7 @@ def scan_pass(cfg, dry=False):
         except ProbeTimeout as ex:
             if rel not in retried:
                 retried.add(rel)
-                queue.append((mtime, rel, src, size))
+                queue.append((mtime, rel, src, size, token))
                 log(f"SLOW TO OPEN {rel}: {ex}; skipped for now, tried again at the end of this pass (not a failure)")
             else:
                 log(f"FAILED {rel}: still not opening on the second try: {ex}")
@@ -1722,7 +1973,14 @@ def refine_pass(cfg, dry=False):
         return 0
     state = State(cfg["store"])
     todo = []
-    for rel, src, size, mtime in walk_library(cfg["library"], cfg["min_size_mb"] * 1e6):
+    try:
+        films = list_films(cfg, cfg["min_size_mb"] * 1e6)
+    except Throttled as ex:
+        log(f"STOPPING: {ex}")
+        state.d["breaker_until"] = time.time() + cfg["breaker_hours"] * 3600
+        state.save()
+        return 0
+    for rel, src, size, mtime, token in films:
         if excluded(cfg, rel):
             continue
         edir = entry_dir(cfg["store"], rel)
@@ -1736,10 +1994,10 @@ def refine_pass(cfg, dry=False):
                    & {round(min((j + 0.5) * cfg["interval"], max(0.0, ix["duration"] - 1.0)), 2) for j in range(n_new)})
         if int(ix.get("w") or 0) < int(cfg["width"]):
             keep = 0                                   # its thumbnails are narrower than the width now asked for: all are read again
-        todo.append((rel, src, size, ix, edir, n_new, keep))
+        todo.append((rel, src, size, ix, edir, n_new, keep, token))
     todo.sort(key=lambda t: t[2])                      # the smallest files first, as for the first build
     if dry:
-        for rel, src, size, ix, edir, n_new, keep in todo:
+        for rel, src, size, ix, edir, n_new, keep, token in todo:
             print(f"{size / 1e9:6.1f} GB  {rel}   {ix['interval']:g} s -> {cfg['interval']:g} s: {n_new - keep} to read, {keep} kept")
         log(f"{len(todo)} film(s) could be refined to {cfg['interval']:g} s; {sum(t[5] - t[6] for t in todo)} thumbnails to read")
         return len(todo)
@@ -1747,7 +2005,7 @@ def refine_pass(cfg, dry=False):
     zs = have_filter("zscale")
     gov = Governor(cfg["workers"], cfg["rate_cooldown"])
     done = 0
-    for rel, src, size, ix, edir, n_new, keep in batch:
+    for rel, src, size, ix, edir, n_new, keep, token in batch:
         if STOP:
             break
         blocked, until, used = budget_gate(cfg)
@@ -1763,7 +2021,7 @@ def refine_pass(cfg, dry=False):
             continue
         try:
             c = dict(cfg, _refine=(ix, edir))
-            if build_entry(rel, src, size, c, gov, zs):
+            if build_entry(rel, src, size, c, gov, zs, token):
                 state.ok(rel)
                 done += 1
         except KeyboardInterrupt:
@@ -1803,11 +2061,27 @@ def cmd_build(cfg, path, own_process=True):
     if os.path.splitext(path)[1].lower() not in VIDEO_EXT:
         log("not a video file; skipped:", rel)
         return 0
+    token = None
     try:
         size = os.stat(path).st_size
     except OSError as ex:
-        log("cannot read", path, ex)
-        return 2
+        if not is_rd(cfg):
+            log("cannot read", path, ex)
+            return 2
+        try:
+            item = rd_state(cfg).item_for(rel)
+        except Exception as rex:                     # noqa: BLE001
+            log("cannot read", path, ex, "- and Real-Debrid has no file for it:", rex)
+            return 2
+        size, token = item["size"], item["token"]
+        log(f"the mount has no file for {rel} yet; reading it from Real-Debrid instead (the store keeps the mount path)")
+    if is_rd(cfg) and token is None:
+        try:
+            token = rd_state(cfg).item_for(rel)["token"]
+        except Exception as ex:                      # noqa: BLE001 - read_source reports it properly below
+            if provider_error(ex):
+                log(f"STOPPING: Real-Debrid: {ex}")
+                return 1
     if size < cfg["min_size_mb"] * 1e6:
         log(f"smaller than {cfg['min_size_mb']:g} MB; skipped: {rel}")
         return 0
@@ -1840,7 +2114,7 @@ def cmd_build(cfg, path, own_process=True):
         gov = Governor(c["workers"], cfg["rate_cooldown"])
         log(f"building {rel} ({size / 1e9:.1f} GB) with {c['workers']} parallel read(s), {c['pause']:g} s rest after each, lowest priority")
         try:
-            build_entry(rel, path, size, c, gov, have_filter("zscale"))
+            build_entry(rel, path, size, c, gov, have_filter("zscale"), token)
             state.ok(rel)
             return 0
         except KeyboardInterrupt:
@@ -1998,7 +2272,12 @@ def cmd_probe(cfg, path):
     random seek, inflating bytes-per-thumbnail far past what the direct HTTP range-read path needs)."""
     abspath = os.path.abspath(os.path.expanduser(path))
     rel = os.path.relpath(abspath, os.path.abspath(cfg["library"])) if cfg.get("library") else os.path.basename(abspath)
-    rsrc = read_source(cfg, rel, abspath) if not rel.startswith("..") else abspath
+    try:
+        rsrc = read_source(cfg, rel, abspath) if not rel.startswith("..") else abspath
+    except Exception as ex:                        # noqa: BLE001
+        if provider_error(ex):
+            sys.exit(f"Real-Debrid: {ex}")
+        raise
     if rsrc != abspath:
         print(f"reading over HTTP: {mask_url(rsrc)}  (mount: {abspath})")
     info = ffprobe(rsrc, cfg)
@@ -2047,8 +2326,13 @@ def cmd_noindex_probe(cfg, path):
     import noindex
     path = os.path.abspath(os.path.expanduser(path))
     rel = os.path.relpath(path, os.path.abspath(cfg["library"])) if cfg.get("library") else os.path.basename(path)
-    rsrc = read_source(cfg, rel, path) if not rel.startswith("..") else path
-    print(f"probing: {rsrc}" + (f"  (mount: {path})" if rsrc != path else ""))
+    try:
+        rsrc = read_source(cfg, rel, path) if not rel.startswith("..") else path
+    except Exception as ex:                        # noqa: BLE001
+        if provider_error(ex):
+            sys.exit(f"Real-Debrid: {ex}")
+        raise
+    print(f"probing: {mask_url(rsrc)}" + (f"  (mount: {path})" if rsrc != path else ""))
     if not cfg.get("no_index", 1):
         print("no_index is set to 0 in this config; the feature is disabled regardless of what follows.")
     try:
@@ -2092,6 +2376,126 @@ def cmd_noindex_probe(cfg, path):
     print(f"  header length (bytes before the first Cluster): {diag['header_len']}")
     print(f"  timecode scale: {diag['timecode_scale']}")
     print("Run a normal build on this film and check the log for \"no Cues (seek index) found\" to confirm it actually did.")
+
+
+def _print_traffic(traffic):
+    if not isinstance(traffic, dict) or not traffic:
+        print("traffic: (no data)")
+        return
+    for host, info in traffic.items():
+        if isinstance(info, dict):
+            left, limit, kind = info.get("left"), info.get("limit"), info.get("type") or ""
+            extra, reset = info.get("extra"), info.get("reset") or ""
+            print(f"traffic {host}: {left} left of {limit} {kind}" + (f", +{extra} extra" if extra else "") + (f", resets {reset}" if reset else ""))
+        else:
+            print(f"traffic {host}: {info}")
+
+
+def cmd_rd_probe(cfg, refresh=False, films=3, extract=False, transcode=False):
+    """Answers the questions a live integration actually has, before a build: is the account usable, does every
+    Real-Debrid file resolve to the mount path the store/viewer use, does a direct URL read with bounded ranges, and
+    what does a seek cost? Reads no film unless --extract is given; writes only the inventory cache."""
+    import realdebrid
+    need_paths(cfg, library=False)
+    token = realdebrid.token_from(cfg)
+    if not token:
+        sys.exit("no Real-Debrid API token: set RD_API_TOKEN (create one at https://real-debrid.com/apitoken)")
+    state = rd_state(cfg)
+    print(f"Real-Debrid API {state.client.base}   token {realdebrid.mask_token(token)}")
+    try:
+        user = state.client.user()
+        traffic = state.client.traffic()
+    except realdebrid.RdError as ex:
+        sys.exit(f"Real-Debrid refused the account check: {ex}")
+    print(f"account: {user.get('username') or '?'} ({user.get('email') or '?'}), type {user.get('type') or '?'}, "
+          f"premium {user.get('premium') or 0}, expires {user.get('expiration') or '?'}")
+    _print_traffic(traffic)
+    try:
+        items, stats = state.mapped(refresh=refresh)
+    except realdebrid.RdError as ex:
+        sys.exit(f"Real-Debrid inventory failed: {ex}")
+    print(f"inventory: {stats.get('raw', 0)} readable video file(s); {stats.get('path', 0)} matched the mount by path, "
+          f"{stats.get('indexed', 0)} by file name and size, {stats.get('size_mismatch', 0)} had a same-named file of another size, "
+          f"{stats.get('ambiguous', 0)} were ambiguous, {stats.get('unmatched', 0)} had no mount file")
+    print(f"API requests this run: {state.client.requests}; mount prefix(es): {realdebrid.mount_prefixes(cfg.get('library') or '')}")
+    if not items:
+        print("nothing to read: no downloaded torrent has a selected video file that maps to the mount")
+        return
+    if not cfg.get("library"):
+        print("library= is empty, so no path could be matched; set it to the Decypharr mount (or its __all__ folder)")
+    for it in items[:max(0, int(films))]:
+        print(f"\n{it['rel']}  {it['size'] / 1e9:.2f} GB  torrent {it['torrent_id']} file {it['token'].get('file_id')}")
+        try:
+            url = state.source_for(it["rel"], it["token"])
+        except realdebrid.RdError as ex:
+            print(f"  could not resolve a direct link: {ex}")
+            continue
+        print(f"  direct link: {mask_url(url)}")
+        rf = RangeFile(url, chunk=262144, timeout=float(cfg.get("seek_timeout") or 30.0))
+        try:
+            t0 = time.time()
+            rf.seek(0, 2)
+            size, t_size = rf.size, time.time() - t0
+            print(f"  range read: size {size / 1e9:.2f} GB in {t_size:.2f} s" + ("" if size == it["size"] else f" (MISMATCH: the API said {it['size']})"))
+            points = (0.15, 0.3, 0.45, 0.6, 0.75, 0.9)
+            t0, got = time.time(), 0
+            for frac in points:
+                rf.seek(int(size * frac))
+                got += len(rf.read(262144))
+            dt = time.time() - t0
+            print(f"  6 random 256 KiB reads: {dt / len(points):.2f} s each, {rf.bytes / 1e6:.1f} MB received in {rf.requests} request(s) "
+                  f"({got / 1e6:.1f} MB of payload)")
+        except OSError as ex:
+            print(f"  range read failed: {ex}")
+        finally:
+            rf.close()
+        if extract:
+            try:
+                info = ffprobe(url, cfg)
+            except Exception as ex:            # noqa: BLE001
+                print(f"  ffprobe failed: {ex}")
+                continue
+            n = max(1, int(info["duration"] // cfg["interval"]))
+            print(f"  ffprobe: {info['duration'] / 60:.0f} min, {info['width']}x{info['height']}, {n} thumbnails at {cfg['interval']:.0f} s")
+            vf = vf_chain(info, cfg["width"], have_filter("zscale"))
+            tmp = tempfile.mkdtemp(prefix="seekthumbs-rd-probe-")
+            try:
+                cands = [("ffmpeg command", CliExtractor(url, vf, cfg), "png")]
+                ok, why = AvExtractor.usable(vf)
+                if ok:
+                    cands.append(("PyAV (open once)", AvExtractor(url, vf, cfg), "ppm"))
+                else:
+                    print("  PyAV not used:", why)
+                for label, ex, suffix in cands:
+                    rx0, t0, okc = net_rx_bytes(), time.time(), 0
+                    for j, frac in enumerate(points):
+                        try:
+                            good, why = ex.grab(info["duration"] * frac, os.path.join(tmp, f"p{j}.{suffix}"))
+                        except Exception as e:    # noqa: BLE001
+                            good, why = False, str(e)
+                        okc += bool(good)
+                        if not good:
+                            print(f"    {label}: seek at {frac * 100:.0f} % failed: {str(why)[:120]}")
+                    dt, rx1 = time.time() - t0, net_rx_bytes()
+                    mb = (rx1 - rx0) / 1e6 / len(points) if rx0 is not None and rx1 is not None else None
+                    print(f"  {label}: {okc}/{len(points)} ok, {dt / len(points):.2f} s per thumbnail"
+                          + (f", {mb:.1f} MB received per thumbnail (whole machine)" if mb is not None else ""))
+                    ex.close()
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+        if transcode:
+            try:
+                data = state.client.unrestrict(it["token"]["link"])
+                xid = data.get("id")
+                if not xid:
+                    print("  transcode: /unrestrict/link returned no id")
+                else:
+                    tr = state.client.transcode(xid)
+                    print("  transcode variants: " + (", ".join(sorted(tr)) or "(none)"))
+                    mf = state.client.media_infos(xid)
+                    print(f"  mediaInfos: duration {mf.get('duration') or '?'} s, {mf.get('nb_streams') or '?'} stream(s)")
+            except realdebrid.RdError as ex:
+                print(f"  transcode probe failed: {ex}")
 
 
 def cmd_status(cfg):
@@ -2321,6 +2725,11 @@ def main(argv):
     p.add_argument("file")
     p = sub.add_parser("noindex-probe", parents=[common])
     p.add_argument("file")
+    p = sub.add_parser("rd-probe", parents=[common], help="check the Real-Debrid account, match its films to the mount, and measure reads (source=rd)")
+    p.add_argument("--refresh", action="store_true", help="re-read the torrent list and every file list, ignoring the cached inventory")
+    p.add_argument("--films", type=int, default=3, help="how many films to resolve and read (default 3)")
+    p.add_argument("--extract", action="store_true", help="also decode six sample thumbnails with each extractor")
+    p.add_argument("--transcode", action="store_true", help="also ask /streaming for transcode variants and media info")
     p = sub.add_parser("build", parents=[common])
     p.add_argument("file")
     for c in ("plan", "scan", "watch", "status"):
@@ -2345,6 +2754,8 @@ def main(argv):
         prefer_to_be_killed_first()
     if args.cmd == "probe":
         cmd_probe(cfg, args.file)
+    elif args.cmd == "rd-probe":
+        cmd_rd_probe(cfg, refresh=args.refresh, films=args.films, extract=args.extract, transcode=args.transcode)
     elif args.cmd == "noindex-probe":
         cmd_noindex_probe(cfg, args.file)
     elif args.cmd == "build":
