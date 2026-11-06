@@ -562,7 +562,7 @@ try:
     # in-process: workers, no waiting for players, scan still waits
     seen = {}
     orig_build, orig_pr = st.build_entry, st.player_running
-    st.build_entry = lambda rel, src, size, c_, gov, zs: seen.update(workers=c_["workers"], jobs=c_["encode_jobs"], limit=gov.max, pause=c_["pause"]) or True
+    st.build_entry = lambda rel, src, size, c_, gov, zs, token=None: seen.update(workers=c_["workers"], jobs=c_["encode_jobs"], limit=gov.max, pause=c_["pause"]) or True
     def boom():
         raise AssertionError("build FILE must not wait for players")
     st.player_running = boom

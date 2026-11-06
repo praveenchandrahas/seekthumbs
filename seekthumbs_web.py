@@ -69,13 +69,17 @@ def pretty_title(key, fallback_name):
 
 
 def library_groups(st, cfg):
-    """One group per film: all its releases (the smallest first, the one that gets built). Returns (groups, hidden): `hidden` counts files left out by skip_tv/exclude."""
+    """One group per film: all its releases (the smallest first, the one that gets built). Returns (groups, hidden): `hidden` counts files left out by skip_tv/exclude.
+    With `source = rd` the list comes from Real-Debrid's inventory (st.list_films); a provider refusal raises st.Throttled and the caller keeps the
+    previous list instead of emptying the page."""
     items, hidden = [], 0
-    for rel, src, size, mtime in st.walk_library(cfg["library"], cfg["min_size_mb"] * 1e6):
+    for rel, src, size, mtime, token in st.list_films(cfg, cfg["min_size_mb"] * 1e6):
         if st.excluded(cfg, rel):
             hidden += 1
             continue
-        items.append((mtime, rel, src, size))
+        # Keep the RD token resolved at listing time with the member: the build then uses that identity instead of
+        # looking the film up in the inventory a second time. For source=mount the token is None and nothing changes.
+        items.append((mtime, rel, src, size, token))
     groups = {}
     for it in items:
         k = st.release_key(it[1]) if cfg.get("share", 1) else None
@@ -210,15 +214,20 @@ class Engine:
 
     # -- the library and what is done
     def refresh_library(self):
-        groups, hidden = library_groups(self.st, self.cfg)
+        try:
+            groups, hidden = library_groups(self.st, self.cfg)
+        except Exception as ex:                    # noqa: BLE001 - a provider outage must not empty the page or kill the server
+            self.st.log(f"library listing failed ({ex}); keeping the previous list")
+            return False
         with self.cv:
             self.groups = {g["id"]: g for g in groups}
             self.hidden, self.scanned_at = hidden, time.time()
             self.queue = [i for i in self.queue if valid_entry(i, self.groups)]
             self.rev += 1
+        return True
 
     def _members_current(self, g):
-        return [self.st.entry_current(self.cfg["store"], rel, size) for _, rel, src, size in g["members"]]
+        return [self.st.entry_current(self.cfg["store"], rel, size) for _, rel, _src, size, _token in g["members"]]
 
     def library(self):
         """The film list for the page: fixed facts from the last library scan, status read fresh from the store."""
@@ -235,7 +244,7 @@ class Engine:
             status = "done" if any(cur) else "new"        # one set per film: a release that matched no other has none of its own until it is played
             first = g["members"][0]
             failed = None
-            for (_, rel, src, size) in g["members"]:
+            for (_, rel, _src, size, _token) in g["members"]:
                 if state.blocked(rel, size):
                     failed = state.d["fail"][rel].get("why", "")[:160]
                     break
@@ -250,7 +259,7 @@ class Engine:
                 id=g["id"], title=g["title"], year=g["year"], status=status, queued=film_qpos.get(g["id"]), running=g["id"] == running_gid, failed=failed,
                 releases=[dict(id=f"{g['id']}:{i}", name=os.path.basename(rel), size=size, tags=file_tags(rel), done=cur[i],
                                 queued=qpos.get(f"{g['id']}:{i}"), running=self.job_gid == f"{g['id']}:{i}")
-                          for i, (_, rel, src, size) in enumerate(g["members"])],
+                          for i, (_, rel, _src, size, _token) in enumerate(g["members"])],
                 size=first[3], newest=g["newest"], thumbs=thumbs))
         real, alias, nbytes = store_usage(st, store)
         return dict(films=films, hidden=self.hidden, scanned_at=self.scanned_at, rev=self.rev,
@@ -423,8 +432,8 @@ class Engine:
             # One set per film: once any release of the film has thumbnails (built, or an alias of one), the other releases may only become aliases.
             # A release whose runtime matches nothing is left alone (it is built when you play it, or queued explicitly as its own release), never read in full a second time.
             members = g["members"]
-            covered = any(st.entry_current(cfg0["store"], rel, size) for (_, rel, _s, size) in members)
-        for (mtime, rel, src, size) in members:
+            covered = any(st.entry_current(cfg0["store"], rel, size) for (_, rel, _s, size, _t) in members)
+        for (mtime, rel, src, size, token) in members:
             if self.closing or self.stop_requested:
                 return
             if st.entry_current(cfg0["store"], rel, size):
@@ -454,7 +463,7 @@ class Engine:
             t0 = time.time()
             rec = dict(title=g["title"], year=g["year"], rel=rel, at=t0, src_gb=round(size / 1e9, 1))
             try:
-                st.build_entry(rel, src, size, cfg, gov, self.zs)
+                st.build_entry(rel, src, size, cfg, gov, self.zs, token)
                 state.ok(rel)
                 self.bad_streak = 0
                 rec.update(status="shared" if job.shared else "built")
