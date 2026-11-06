@@ -23,6 +23,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, ".."))
 import realdebrid as rd  # noqa: E402
 import seekthumbs as st  # noqa: E402
+import seekthumbs_web as web  # noqa: E402
 
 fails = 0
 
@@ -394,6 +395,48 @@ def main():
         check("the RD reads used range requests", any(r.startswith("bytes=") for r in state["ranges"]), state["ranges"][:5])
         check("the signed direct URL is not written to the log", "n=" not in out.getvalue() and "signed link" in out.getvalue(),
               out.getvalue()[-1200:])
+
+        # the web page (seekthumbs-serve) is a separate build path: it must keep the token resolved while listing
+        # and hand it to build_entry, exactly as scan_pass/refine_pass/cmd_build do.
+        store_w = os.path.join(tmp, "store-web")
+        cfgw = dict(cfg, store=store_w, wake_ahead=0)
+        st._RD_STATES.clear()
+        eng = web.Engine(st, cfgw)
+        try:
+            g = next(g for g in eng.groups.values() if any(m[1] == rel for m in g["members"]))
+            member = next(m for m in g["members"] if m[1] == rel)
+            check("the web film list keeps the resolved token on each member",
+                  len(member) == 5 and member[4] is not None and member[4].get("file_id") == 77, member)
+            rdw = st.rd_state(cfgw)
+            calls = []
+            orig_item_for = rdw.item_for
+
+            def spy_item_for(rel_, token=None):
+                calls.append(token is not None)
+                return orig_item_for(rel_, token)
+
+            rdw.item_for = spy_item_for
+            seen = {}
+            orig_build = st.build_entry
+
+            def capture_build(rel_, src_, size_, cfg_, gov_, zs_, token=None):
+                seen.update(rel=rel_, token=token)
+                return orig_build(rel_, src_, size_, cfg_, gov_, zs_, token)
+
+            st.build_entry = capture_build
+            try:
+                eng._do_group(g, g["id"])
+            finally:
+                st.build_entry = orig_build
+                rdw.item_for = orig_item_for
+            check("the web build passes the listed token to build_entry",
+                  seen.get("rel") == rel and seen.get("token") is not None and seen["token"].get("file_id") == 77, seen)
+            check("...so the web build does not look the film up in the inventory again", calls == [True], calls)
+            ixw = st.read_index(st.entry_dir(store_w, rel))
+            check("the web path builds the film from RD into the mount-path entry",
+                  ixw is not None and ixw["count"] >= 3 and all(l > 0 for l in ixw["lengths"]), ixw)
+        finally:
+            eng.close()
 
         # a naming mismatch is repaired by exact (basename, size), but only when exactly one file matches
         lib3 = os.path.join(tmp, "lib3")
