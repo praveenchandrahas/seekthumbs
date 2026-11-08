@@ -404,7 +404,11 @@ class State:
 
     def failed(self, rel, size, why):
         n = self.d["fail"].get(rel, {}).get("count", 0) + 1
-        self.d["fail"][rel] = dict(size=size, count=n, why=why[:200], next=time.time() + min(6 * 3600 * 2 ** (n - 1), 7 * 86400))
+        if TRANSIENT_HTTP_RE.match(why):               # "temporarily unavailable": 1 h, doubling, at most 12 h
+            wait = min(3600 * 2 ** (n - 1), 12 * 3600)
+        else:                                          # anything else: 6 h, doubling, at most 7 days
+            wait = min(6 * 3600 * 2 ** (n - 1), 7 * 86400)
+        self.d["fail"][rel] = dict(size=size, count=n, why=why[:200], next=time.time() + wait)
         self.save()
 
     def ok(self, rel):
@@ -586,10 +590,52 @@ class HttpReadFailed(RuntimeError):
     """The HTTP read of a film failed. Not retried over the mount; the film is recorded as failed and tried again after the usual back-off."""
 
 
-def record_http_error(cfg, rel, step, url, ex):
-    """Appends the full cause of an HTTP read failure to STORE/.http-errors.jsonl and logs it, so the cause can be investigated."""
+def describe_http_failure(url, timeout=15.0):
+    """ffprobe reports only 'Server returned 5XX'. This asks the same address once for its first byte and says what the server really answered:
+    'HTTP 503 Service Unavailable ...' with a few headers and the start of the body, or 'HTTP 302 ...' / 'HTTP 206 ...' when it is answering
+    normally now (the failure was transient). A redirect is reported, not followed, so the credentials never travel to another host.
+    Never raises; costs one request of one byte."""
+    import urllib.request
+    import urllib.error
+    import urllib.parse
+    import base64
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a, **k):
+            return None
+    try:
+        u = urllib.parse.urlsplit(str(url))
+        hd = {"Range": "bytes=0-0"}
+        if u.username is not None:
+            raw = f"{urllib.parse.unquote(u.username)}:{urllib.parse.unquote(u.password or '')}"
+            hd["Authorization"] = "Basic " + base64.b64encode(raw.encode()).decode()
+            host = u.hostname + (f":{u.port}" if u.port else "")
+            u = urllib.parse.urlsplit(urllib.parse.urlunsplit((u.scheme, host, u.path, u.query, "")))
+        opener = urllib.request.build_opener(_NoRedirect)
+        try:
+            with opener.open(urllib.request.Request(u.geturl(), headers=hd), timeout=timeout) as r:
+                return f"HTTP {r.status} {r.reason}"
+        except urllib.error.HTTPError as ex:
+            keep = [f"{k}={ex.headers[k]}" for k in ("Retry-After", "Server", "Content-Type", "Location") if ex.headers.get(k)]
+            body = re.sub(r"\s+", " ", re.sub(r"<[^>]*>", " ", ex.read(400).decode("utf-8", "replace"))).strip()
+            if ex.code in (301, 302, 303, 307, 308):               # a redirect to the download host is the normal, healthy answer
+                keep = [k for k in keep if not k.startswith("Location=")]
+            return f"HTTP {ex.code} {ex.reason}" + (f" [{'; '.join(keep)}]" if keep else "") + (f" body: {body[:200]}" if body else "")
+    except Exception as ex:                                       # noqa: BLE001 - a diagnosis must never break the build
+        return f"no answer to the diagnostic request: {type(ex).__name__}: {str(ex)[:120]}"
+
+
+# 429 and 5xx other than 500 mean "the server cannot serve this just now": worth trying again within hours, not days.
+TRANSIENT_HTTP_RE = re.compile(r"^HTTP probe failed: HTTP (429|502|503|504)\b")
+
+
+def record_http_error(cfg, rel, step, url, ex, detail=None):
+    """Appends the full cause of an HTTP read failure to STORE/.http-errors.jsonl and logs it, so the cause can be investigated.
+    `detail` is what a direct request to the same address answered (describe_http_failure): the status ffprobe hides."""
     rec = dict(time=time.strftime("%Y-%m-%d %H:%M:%S%z"), film=rel, step=step, url=mask_url(url), type=type(ex).__name__, error=str(ex)[:4000])
-    log(f"HTTP ERROR at {step} for {rel}: {type(ex).__name__}: {str(ex)[:300]} (full text in .http-errors.jsonl)")
+    if detail:
+        rec["http"] = detail
+    log(f"HTTP ERROR at {step} for {rel}: {type(ex).__name__}: {str(ex)[:300]}" + (f" | direct request: {detail[:300]}" if detail else "") + " (full text in .http-errors.jsonl)")
     try:
         with open(os.path.join(cfg["store"], ".http-errors.jsonl"), "a") as f:
             f.write(json.dumps(rec) + "\n")
@@ -1648,8 +1694,9 @@ def build_entry(rel, src, size, cfg, gov, zscale_ok, token=None):
             raise
         # Over HTTP there is no fallback to the mount: that path cost tens of GB on one film. Keep the whole error, and let the caller record
         # the film as failed so that it is tried again later.
-        record_http_error(cfg, rel, "probe", rsrc, ex)
-        raise HttpReadFailed(f"HTTP probe failed: {str(ex)[:150]}") from None
+        detail = describe_http_failure(rsrc)
+        record_http_error(cfg, rel, "probe", rsrc, ex, detail)
+        raise HttpReadFailed(f"HTTP probe failed: {detail[:150] if detail.startswith('HTTP ') else str(ex)[:150]}") from None
     t_probe = time.time() - t1
     if job:
         job.t_probe = t_probe

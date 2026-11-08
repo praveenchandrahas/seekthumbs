@@ -1552,6 +1552,59 @@ try:
     check("a dead HTTP address does NOT fall back to the mount: nothing built, film recorded as failed for a later retry", n15 == 0 and "using the mount path" not in out15.getvalue() and not st.entry_current(store15, "Fall.Back.2021.mkv", os.path.getsize(os.path.join(lib15, "Fall.Back.2021.mkv"))) and "Fall.Back.2021.mkv" in st15.d["fail"] and st15.blocked("Fall.Back.2021.mkv", os.path.getsize(os.path.join(lib15, "Fall.Back.2021.mkv"))), (n15, st15.d["fail"], out15.getvalue()[-500:]))
     check("the exact cause is kept in .http-errors.jsonl (step, film, error text)", len(rec15) >= 1 and rec15[0]["film"] == "Fall.Back.2021.mkv" and rec15[0]["step"] == "probe" and rec15[0]["error"], rec15)
 
+    # ---- the real status behind ffprobe's "Server returned 5XX", and a shorter retry for "temporarily unavailable"
+    import http.server
+    hits19 = []
+
+    class H19(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            hits19.append((self.path, self.headers.get("Authorization"), self.headers.get("Range")))
+            if self.path.startswith("/down"):
+                body = b'<?xml version="1.0"?><d:error xmlns:d="DAV:"><s:exception>ServiceUnavailable</s:exception><s:message>Service is temporarily unavailable</s:message></d:error>'
+                self.send_response(503)
+                self.send_header("Retry-After", "120")
+            elif self.path.startswith("/moved"):
+                body = b""
+                self.send_response(302)
+                self.send_header("Location", "http://other.invalid/file")
+            else:
+                body = b"x"
+                self.send_response(206)
+                self.send_header("Content-Range", "bytes 0-0/10")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+    srv19 = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H19)
+    threading.Thread(target=srv19.serve_forever, daemon=True).start()
+    base19 = f"http://127.0.0.1:{srv19.server_address[1]}"
+    d503 = st.describe_http_failure(f"http://user:pw@{base19[7:]}/down/film.mkv")
+    d302 = st.describe_http_failure(f"{base19}/moved/film.mkv")
+    d206 = st.describe_http_failure(f"{base19}/ok/film.mkv")
+    dno = st.describe_http_failure("http://127.0.0.1:1/none.mkv", timeout=2.0)
+    srv19.shutdown()
+    check("a 503 is reported with its status, Retry-After and the start of the body", d503.startswith("HTTP 503") and "Retry-After=120" in d503 and "Service is temporarily unavailable" in d503, d503)
+    check("the diagnostic sends the credentials and asks for one byte", hits19[0][1] and hits19[0][1].startswith("Basic ") and hits19[0][2] == "bytes=0-0", hits19)
+    check("a redirect is reported as such and NOT followed (credentials never leave the host)", d302.startswith("HTTP 302") and len([h for h in hits19 if h[0].startswith("/moved")]) == 1, (d302, hits19))
+    check("a healthy answer says so (the failure was transient)", d206.startswith("HTTP 206"), d206)
+    check("an unreachable host gives a message, never an exception", dno.startswith("no answer"), dno)
+    st19 = st.State(os.path.join(tmp, "store19"))
+    os.makedirs(os.path.join(tmp, "store19"), exist_ok=True)
+    t0 = time.time()
+    st19.failed("A.mkv", 1, "HTTP probe failed: HTTP 503 Service Unavailable [Retry-After=120]")
+    w503 = st19.d["fail"]["A.mkv"]["next"] - t0
+    st19.failed("A.mkv", 1, "HTTP probe failed: HTTP 503 Service Unavailable")
+    w503b = st19.d["fail"]["A.mkv"]["next"] - t0
+    for _ in range(8):
+        st19.failed("A.mkv", 1, "HTTP probe failed: HTTP 503 Service Unavailable")
+    w503max = st19.d["fail"]["A.mkv"]["next"] - t0
+    st19.failed("B.mkv", 1, "ffprobe: something else broke")
+    w_other = st19.d["fail"]["B.mkv"]["next"] - t0
+    check("a 503 is retried after 1 h, then 2 h, and never later than 12 h", 3590 < w503 < 3700 and 7190 < w503b < 7300 and 12 * 3600 - 10 < w503max < 12 * 3600 + 100, (w503, w503b, w503max))
+    check("any other failure keeps the 6 h backoff", 6 * 3600 - 10 < w_other < 6 * 3600 + 100, w_other)
+
     # ---- memory guard: the number of parallel reads follows the free memory
     real_mem, real_cg = st.mem_available_mb, st.cgroup_headroom_mb
     st.cgroup_headroom_mb = lambda: None
