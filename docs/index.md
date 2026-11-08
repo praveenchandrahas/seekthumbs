@@ -1,6 +1,6 @@
 # seekthumbs
 
-seekthumbs makes Netflix-style previews on the mpv seek bar (called *trickplay* or *seek thumbnails*) for a film library on a **read-only rclone mount**. The thumbnails are made in the background and kept in a local folder; the library itself is only ever read.
+seekthumbs makes Netflix-style previews on the mpv seek bar (called *trickplay* or *seek thumbnails*) for a film library on a **read-only mount** (rclone or Decypharr) or read straight from Real-Debrid. The thumbnails are made in the background and kept in a local folder; the library itself is only ever read.
 
 It is one part of the [Software Defined Home Theatre](https://github.com/praveenchandrahas/Software-Defined-Home-Theatre) project. The main repository there holds the overall documentation, build log, results and installer checks; sibling repositories cover the DSP/router configs, the player and Atmos wrapper, room measurement/autocal, and a film browser for mpv.
 
