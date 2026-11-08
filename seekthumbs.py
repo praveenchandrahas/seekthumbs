@@ -1073,6 +1073,28 @@ def release_memory():
         pass
 
 
+_AUTH_OPENER = None
+
+
+def auth_safe_opener():
+    """An urllib opener that drops the Authorization header when a redirect leads to another host. Plain urlopen keeps it, so the WebDAV
+    password would travel to the download host that dav.real-debrid.com redirects to."""
+    global _AUTH_OPENER
+    if _AUTH_OPENER is None:
+        import urllib.request
+        import urllib.parse
+
+        class _Safe(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                new = super().redirect_request(req, fp, code, msg, headers, newurl)
+                if new is not None and urllib.parse.urlsplit(newurl).netloc != urllib.parse.urlsplit(req.full_url).netloc:
+                    for k in [k for k in new.headers if k.lower() == "authorization"]:
+                        del new.headers[k]
+                return new
+        _AUTH_OPENER = urllib.request.build_opener(_Safe)
+    return _AUTH_OPENER
+
+
 class HttpSource(str):
     """A URL string that also knows how to get a fresh one. Real-Debrid direct links are pre-signed and expire; keeping
     the refresh callback on the string means every existing caller (ffprobe, CliExtractor, PyAV, RangeFile) keeps
@@ -1133,7 +1155,7 @@ class RangeFile:
             if self.auth:
                 hd["Authorization"] = self.auth
             try:
-                with urllib.request.urlopen(urllib.request.Request(self.url, headers=hd), timeout=self.timeout) as r:
+                with auth_safe_opener().open(urllib.request.Request(self.url, headers=hd), timeout=self.timeout) as r:
                     data = r.read(hi - lo + 1)
                     cr = r.headers.get("Content-Range", "")
                     status = getattr(r, "status", 206)

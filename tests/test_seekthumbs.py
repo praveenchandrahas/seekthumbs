@@ -1590,6 +1590,42 @@ try:
     check("a redirect is reported as such and NOT followed (credentials never leave the host)", d302.startswith("HTTP 302") and len([h for h in hits19 if h[0].startswith("/moved")]) == 1, (d302, hits19))
     check("a healthy answer says so (the failure was transient)", d206.startswith("HTTP 206"), d206)
     check("an unreachable host gives a message, never an exception", dno.startswith("no answer"), dno)
+    # the password goes to the host asked, not to the host it redirects to
+    seen_a, seen_b = [], []
+
+    class HB(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen_b.append(self.headers.get("Authorization"))
+            self.send_response(206)
+            self.send_header("Content-Range", "bytes 0-3/10")
+            self.send_header("Content-Length", "4")
+            self.end_headers()
+            self.wfile.write(b"abcd")
+
+        def log_message(self, *a):
+            pass
+    srv_b = http.server.ThreadingHTTPServer(("127.0.0.1", 0), HB)
+    threading.Thread(target=srv_b.serve_forever, daemon=True).start()
+    url_b = f"http://localhost:{srv_b.server_address[1]}/cdn/file"          # "localhost" vs "127.0.0.1": another host name
+
+    class HA(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen_a.append(self.headers.get("Authorization"))
+            self.send_response(302)
+            self.send_header("Location", url_b)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+    srv_a = http.server.ThreadingHTTPServer(("127.0.0.1", 0), HA)
+    threading.Thread(target=srv_a.serve_forever, daemon=True).start()
+    rf20 = st.RangeFile(f"http://user:pw@127.0.0.1:{srv_a.server_address[1]}/dav/file", chunk=4)
+    got20 = rf20.read(4)
+    srv_a.shutdown()
+    srv_b.shutdown()
+    check("a redirect to another host is followed, and the data arrives", got20 == b"abcd", got20)
+    check("the password is sent to the host asked, and NOT to the host it redirects to", seen_a and seen_a[0] and seen_a[0].startswith("Basic ") and seen_b and seen_b[0] is None, (seen_a, seen_b))
     st19 = st.State(os.path.join(tmp, "store19"))
     os.makedirs(os.path.join(tmp, "store19"), exist_ok=True)
     t0 = time.time()
