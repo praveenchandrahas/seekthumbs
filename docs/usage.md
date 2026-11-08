@@ -65,6 +65,10 @@ Settings for the viewer live in `script-opts/seekthumbs.conf` next to that `scri
 
 After a `git pull`, run `./seekthumbs.py install-viewer` again — `install-viewer` *copies* `thumbfast.lua` into mpv's scripts folder, so an update to the script in this repository doesn't reach mpv until you reinstall it.
 
+## What to expect (2026-11-08, the author's rig)
+
+Over HTTP (`read_url_base` or `source = rd`), with the keyframe flush on (the default): about 1.7 MB read per thumbnail, 88 to 315 s per 4K film, about 3 reads a second. More parallel reads help little: 16 gave about 17 % more than 10 on the 4K films. Memory was about 1.2 to 1.6 GB at 10 to 16 reads. A release whose HTTP probe fails is recorded in `.http-errors.jsonl` and retried later, never read through the mount. These are one rig's figures; see the README for the table and what is still open.
+
 ## Settings (`config.ini` `[seekthumbs]`, or `--option` on the command line)
 
 `library`, `store`, `interval` (20 s between thumbnails), `width` (400 px), `workers` (6, parallel reads for batch builds), `extractor` (`auto` | `pyav` | `ffmpeg`), `rate_cooldown` (30 s), `pause` (0), `film_pause` (0), `poll` (1800 s, for `watch`), `settle` (600 s), `min_size_mb` (300), `skip_tv` (0; 1 = leave out files whose name has an `S01E02`-style episode tag), `exclude` (empty; a case-insensitive regular expression matched against the path relative to the library, `|` for several), `max_films` (0 = all), `budget_mb` (10, per 2 h of film), `safety` (0.8), `seek_timeout` (30 s), `yield_to_playback` (1), `breaker_hours` (1).

@@ -13,6 +13,22 @@
 Netflix-style previews on the mpv seek bar (called *trickplay* or *seek thumbnails*), for a film library on a **read-only rclone mount**.
 The thumbnails are made in the background and kept in a **local folder**; the library is only ever read.
 
+**Where it stands (2026-11-08).**
+
+| | Before | Now (2026-11-08) |
+|---|---|---|
+| Data read per thumbnail | 46 to 211 MB through the mount (two builds measured: 46 MB on a 43.8 GB film, 211 MB on a 4K on-play build); 5.7 to 10.5 MB over bounded HTTP reads (two films) | **1.7 MB on average, 5.8 MB at worst** (14 films, 5,566 thumbnails) |
+| Data received per film | 47.6 GB and about 99 GB on two builds through the mount | **0.4 to 1.8 GB** |
+| Time per 4K film | 12 to 15 minutes at best and over 25 on average in the October queue (the owner's account); about 18 minutes for the first 4K build through the mount | **88 to 315 s** (about 33 minutes for the whole batch of 14, with 13 more releases aliased in seconds) |
+| Failed reads | 101 of 300 through the mount in one test; stalls and an account block in the queue | 0 of 5,566 |
+| Failed films | a silent fallback to the mount hid them (and cost 47.6 GB) | 4 releases of 3 films returned a 5XX to the probe; they are recorded with the error and retried later, never read through the mount |
+
+*How to read this:* the columns are not a controlled comparison. The worker count, the read method and several other things changed between them, and the "before" figures are single builds. The big steps were reading over HTTP instead of the mount, bounded reads, and the keyframe flush (decode the seek keyframe's own packet and drain the decoder instead of reading on until a frame comes out), which on the same 4K film cut the read from 10.5 to 1.6 MB per thumbnail. The frames matched the old way on all 70 thumbnails that were checked (frame timestamps, not pixels), and the owner viewed the thumbnails of one 4K Dolby Vision film and found them correct.
+
+*Still open:* throughput levels off at about 3 to 4 reads a second (16 parallel reads gave about 17 % more than 10 on the 4K films), at 50 to 60 Mbps of a 200 Mbps line and under half of the machine's CPU; the process was using about one core in total in two `htop` snapshots, which is suggestive of a single-process limit but is untested. The cause of the 5XX probe failures is not known. Dolby Vision profile 5, older PyAV builds and a pixel-level comparison are untested.
+
+The sections below are the working log behind these numbers; older figures in them are history, and the entries marked as corrected say so.
+
 State (2026-10-27): generator (parallel, adaptive), on-play build, one set per film across releases, watcher, a local web page to pick and run films, cold-file handling, mpv viewer and tests are written and pass on synthetic
 films. **The hover preview works in real mpv with uosc** (owner, 2026-10-27, on a film whose thumbnails were already built); **the on-play trigger started a build in real mpv on 2026-10-30, and that build read about 66 MB/s from the debrid mount for as long as it ran (see "On-play build: measured on the owner's rig"), so it is now OFF by default** (the sandbox has neither mpv nor the mount). The generator has been probed on the owner's
 debrid mount (numbers below). Open items are listed at the end.
@@ -278,6 +294,12 @@ Limits: the frame check only runs on the PyAV path; PyAV log lines are process-w
 8. 6 parallel streams may exceed what your backend allows (some debrid/cloud services limit concurrent streams per link or per IP). If `probe`/the first film show
    throttling, lower `--workers`.
 9. **The web page** was tested against a synthetic library in a headless browser (light, dark and phone width, no console errors) and with unit tests; the owner ran it on the real mount on 2026-10-27 (it ran; no numbers recorded yet). Not covered: a real mpv running while it waits (the "wait while a player runs" setting), and very long runs.
+
+**Added 2026-11-08:**
+
+- **The throughput ceiling is not explained.** About 3 to 4 reads per second on 4K HEVC films whether 10 or 16 reads run in parallel, with the line and most of the CPU idle. Two `htop` snapshots at 16 workers showed the process at about 80 to 90 % of one core in total; that matches a single-process limit (Python's GIL) but does not show it. A decisive test, not yet run: two builds of different films at the same time, each with 10 workers; if each keeps about 3 reads per second the single process is the limit.
+- **The 5XX probe failures have no known cause.** 4 releases of 3 films answered the HTTP probe with a 5XX within 1 to 2 s. ffprobe's error text says only "5XX"; the status code, headers and redirect chain are not recorded. Another release of one of those films probed and built normally.
+- **The keyframe flush has been compared with the old way on 70 thumbnails of two films, by frame timestamp.** The remaining ~5,500 thumbnails of the first batch were not compared; one 4K film was viewed by the owner. Not covered: Dolby Vision profile 5, older PyAV or FFmpeg builds (the apt `python3-av`), other codecs.
 
 ### Hover cost (changed 2026-10-29)
 

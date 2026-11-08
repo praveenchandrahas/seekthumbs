@@ -4,6 +4,8 @@ seekthumbs makes Netflix-style previews on the mpv seek bar (called *trickplay* 
 
 It is one part of the [Software Defined Home Theatre](https://github.com/praveenchandrahas/Software-Defined-Home-Theatre) project. The main repository there holds the overall documentation, build log, results and installer checks; sibling repositories cover the DSP/router configs, the player and Atmos wrapper, room measurement/autocal, and a film browser for mpv.
 
+**Where it stands (2026-11-08).** On the author's library, 14 films (2160p HEVC and 1080p remuxes) were built reading **1.7 MB per thumbnail on average** (5.8 MB worst) and 0.4 to 1.8 GB per film, in 88 to 315 s each; the same kind of build used to read tens to hundreds of MB per thumbnail and take 12 to 25 minutes or more. The before-and-after table, how to read it and what is still open are in the [README](https://github.com/praveenchandrahas/seekthumbs#readme). These figures come from one rig and one library, not from a guarantee.
+
 There are three ways to get thumbnails, and you can use any of them:
 
 - **The web page** (`./seekthumbs.py serve`): tick the films you want, press Start, and watch it work.
