@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+- A failed HTTP probe now records what the server really answered: one 1-byte range request to the same address (a redirect is reported, not followed), and its status, `Retry-After`/`Server` headers and the start of the body go to the log and to the `http` field of `.http-errors.jsonl`. ffprobe's own message says only "5XX".
+- A 429, 502, 503 or 504 on the probe is retried after 1 h, doubling to at most 12 h (it was 6 h to 7 days for every failure); other failures keep the old schedule.
+- `RangeFile` no longer sends the WebDAV password to the host a redirect leads to (urllib keeps the Authorization header across hosts); it is dropped when the host changes. Tested with two local servers.
+- Second batch on the owner's library: 25 films, 9,971 thumbnails, about 2 minutes per film; in 10 films read closely 94 of 4,150 thumbnails were lost to bursts of connection resets (the ffmpeg fallback failed too); the WebDAV probe returned 503 for 11 of 28 releases (details in the README). The throughput ceiling is not being pursued.
+
 - With `read_url_base`, a film whose HTTP probe fails is no longer read through the mount. The full cause goes to `STORE/.http-errors.jsonl` and the log, and the film is recorded as failed and retried after the usual back-off.
 - Batch result: first batch on the owner's library: 14 films (2160p HEVC with DV/HDR10/HDR10+ and 1080p AVC remuxes), 5,566 thumbnails, all by the flush, 0 failed reads, 1.7 MB per thumbnail on average (worst 5.8 MB), 11.0 GB received in total, 88 to 315 s per film; 13 other releases aliased in seconds; 4 releases of 3 films failed the HTTP probe with a 5XX within 1 to 2 s (cause not yet known); 16 parallel reads gave only about 17 % more reads per second than 10 on the 4K films (2.9 to 3.4), so a ceiling other than the worker count is in play (details in the seekthumbs README).
 
