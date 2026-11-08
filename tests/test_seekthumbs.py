@@ -1334,6 +1334,51 @@ try:
     rf_dl2 = st.RangeFile(u16, chunk=65536)
     rf_dl2.deadline = time.time() + 30
     check("a RangeFile well within its deadline reads normally", rf_dl2.read(10) is not None)
+
+    # ---- keyframe_flush: decode the keyframe's own packet and drain the decoder, instead of reading on until a frame comes out.
+    # A decoder with B-frame reordering holds the first keyframe back (skip_frame = NONKEY drops everything after it), so the old way
+    # read about two keyframe intervals of data per thumbnail. The fixture needs B-frames and a long GOP (make_film's ultrafast has none).
+    f17 = os.path.join(lib14, "Flush.mkv")                          # served by the range server above (it serves lib14)
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=640x360:r=25", "-t", "60", "-c:v", "libx264", "-preset", "veryfast",
+                    "-b:v", "3M", "-g", "100", "-keyint_min", "100", "-sc_threshold", "0", "-bf", "3", "-pix_fmt", "yuv420p", f17], check=True)
+    u17 = f"http://u:secret@127.0.0.1:{srv16.server_address[1]}/Flush.mkv"
+    vf17 = st.vf_chain(dict(duration=60, width=640, height=360, transfer=""), 200, False)
+
+    def run17(tag, **kw):
+        ex = st.AvExtractor(u17, vf17, dict(st.DEFAULTS, http_chunk_kb=64, seek_timeout=30.0, **kw))
+        files, oks = [], []
+        for t17 in (7, 23, 41, 55):
+            o17 = os.path.join(tmp, f"f17_{tag}_{t17}.ppm")
+            oks.append(ex.grab(t17, o17)[0])
+            files.append(o17)
+        res = dict(ok=all(oks), files=files, mb=sum(f.bytes for f in ex.files) / 1e6, via={k: dict(v) for k, v in ex.via.items()},
+                   check=dict(ex.check), note=ex.diag_note() or "")
+        ex.close()
+        return res
+
+    def same_files(a, b):
+        return all(open(x, "rb").read() == open(y, "rb").read() for x, y in zip(a, b))
+
+    old17, new17 = run17("old", keyframe_flush=0), run17("new", keyframe_flush=1)
+    check("keyframe_flush off: every frame comes the old way (demux)", old17["ok"] and set(old17["via"]) == {"demux"}, old17["via"])
+    check("keyframe_flush on: every frame comes from the keyframe's own packet", new17["ok"] and set(new17["via"]) == {"flush"} and new17["via"]["flush"]["n"] == 4, new17["via"])
+    check("keyframe_flush gives exactly the same thumbnails as the old way", same_files(old17["files"], new17["files"]))
+    check(f"keyframe_flush reads far less ({new17['mb']:.2f} MB against {old17['mb']:.2f} MB for 4 thumbnails)", new17["mb"] * 2 < old17["mb"], (new17["mb"], old17["mb"]))
+    check("keyframe_flush reads one packet per thumbnail where the old way read many",
+          new17["via"]["flush"]["pkt_sum"] / 4 <= 2 and old17["via"]["demux"]["pkt_sum"] / 4 > 20, (new17["via"], old17["via"]))
+    check("the built line says how the frames were obtained", "frames by way: flush 4 grab(s)" in new17["note"] and "frames by way: demux 4 grab(s)" in old17["note"], new17["note"][-300:])
+    chk17 = run17("chk", keyframe_flush=1, keyframe_flush_check=2)
+    check("keyframe_flush_check compares the first grabs with the old way and finds the same frame",
+          chk17["ok"] and chk17["check"]["n"] == 2 and chk17["check"]["same"] == 2 and chk17["check"]["diff"] == 0 and "same-frame check: 2 compared, 0 differed" in chk17["note"], chk17["check"])
+    check("the check changes no thumbnail", same_files(old17["files"], chk17["files"]))
+    orig_ff17 = st.AvExtractor._first_frame
+    st.AvExtractor._first_frame = staticmethod(lambda c, stream, flush: (None, 0, "flush-miss") if flush else orig_ff17(c, stream, False))
+    try:
+        miss17 = run17("miss", keyframe_flush=1)
+    finally:
+        st.AvExtractor._first_frame = staticmethod(orig_ff17)
+    check("when the drain gives nothing the grab is redone the old way and still succeeds, with the same thumbnails",
+          miss17["ok"] and set(miss17["via"]) == {"flush-miss"} and same_files(old17["files"], miss17["files"]), miss17["via"])
     srv16.shutdown()
     srv16.server_close()
 

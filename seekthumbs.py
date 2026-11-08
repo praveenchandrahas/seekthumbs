@@ -55,7 +55,7 @@ DEFAULTS = dict(library="", store="", interval=20.0, width=400, workers=6, pause
                 breaker_hours=1.0, extractor="auto", rate_cooldown=30.0,
                 play_workers=2, play_pause=2.0, worker_mem_mb=1000, read_url_base="", mem_reserve_mb=3000, play_extractor="pyav", share=1, share_tolerance=2.0, encode_jobs=0, skip_tv=0, exclude="",
                 probe_timeout=300.0, wake_ahead=3, progress_every=60.0, http_chunk_kb=1024, server_error_stop=12, daily_budget_gb=150.0, budget_tz="Europe/Berlin",
-                no_index=1, max_mb_per_thumb=150.0,
+                no_index=1, max_mb_per_thumb=150.0, keyframe_flush=1, keyframe_flush_check=0,
                 # source = "mount" keeps the old behaviour. "rd" lists the Real-Debrid account and reads direct links;
                 # `library` is still the Decypharr mount, both for playback and for the store path the viewer looks up.
                 source="mount", rd_token="", rd_api_base="https://api.real-debrid.com/rest/1.0", rd_folder_naming="filename",
@@ -1215,6 +1215,38 @@ class AvExtractor:
         self.stats = {}                       # kind -> dict(n, mb_sum, mb_max)
         self.grab_packets_max = 0
         self.grab_seek_gap_max = 0.0          # seconds: how far BEFORE the target the decoded keyframe actually was
+        # How each frame was obtained (see _first_frame): "flush" = the keyframe's own packet, then the decoder drained; "demux" = packets
+        # read until the decoder let a frame out; "flush-miss" = the drain gave nothing and the grab was redone the old way.
+        # Per way: grabs, bytes (when measurable), packets. This is what shows whether keyframe_flush is doing its job on a given release.
+        self.via = {}                         # way -> dict(n, mb_sum, pkt_sum)
+        self.check = dict(n=0, same=0, diff=0, skipped=0)          # keyframe_flush_check: the same frame as the old way?
+
+    @staticmethod
+    def _first_frame(c, stream, flush):
+        """The first frame after a seek, and how it was got: (frame, packet index, way).
+
+        A seek lands on the keyframe before the target and the stream is decoded with skip_frame = NONKEY. A decoder with frame threads or
+        B-frame reordering does not give that first keyframe back until it has been fed more packets, and every packet after it is skipped
+        but still READ: measured on a test film, about two keyframe intervals of data per thumbnail to get a keyframe of 50 KB. With `flush`,
+        the keyframe's own packet is decoded and the decoder is then drained (decode(None)), which hands the held frame over at once.
+        If the drain gives nothing the way is 'flush-miss' and the caller redoes the grab the old way."""
+        n = 0
+        for n, pkt in enumerate(c.demux(stream)):
+            frs = pkt.decode()
+            if frs:
+                return frs[0], n, "demux"
+            if flush and pkt.size and getattr(pkt, "is_keyframe", False):
+                try:
+                    frs = stream.codec_context.decode(None)
+                finally:
+                    try:
+                        stream.codec_context.flush_buffers()          # leave the decoder usable: a drained one refuses more packets
+                    except Exception:                                  # noqa: BLE001
+                        pass
+                return (frs[0], n, "flush") if frs else (None, n, "flush-miss")
+            if n > 300:
+                break
+        return None, n, "demux"
 
     def _state(self):
         st = getattr(self.local, "st", None)
@@ -1240,6 +1272,44 @@ class AvExtractor:
                 self.opened.append(c)
         return st
 
+    def _verify_same_frame(self, c, stream, ts, t, fpts):
+        """keyframe_flush_check: decode the same target the old way and compare the frame's timestamp with the one the flush gave. It costs the
+        old way's bytes, so only the first `keyframe_flush_check` flushed grabs of this extractor are checked."""
+        ref = None
+        try:
+            c.seek(ts, stream=stream, backward=True, any_frame=False)
+            ref, _, _ = self._first_frame(c, stream, False)
+        except Exception:                                   # noqa: BLE001 - a diagnostic must never fail the grab
+            ref = None
+        with self.lock:
+            if ref is None:
+                self.check["n"] -= 1
+                self.check["skipped"] += 1
+            elif ref.pts == fpts:
+                self.check["same"] += 1
+            else:
+                self.check["diff"] += 1
+        if ref is not None and ref.pts != fpts:
+            log(f"keyframe_flush check: the frame for {t:.1f} s differs (flush pts {fpts}, old way pts {ref.pts}); "
+                f"set keyframe_flush = 0 if this keeps happening")
+
+    def via_note(self):
+        """How the frames were obtained, with the bytes and packets each way cost: the evidence for (or against) keyframe_flush on this release."""
+        if not self.via:
+            return None
+        parts = []
+        for way in ("flush", "demux", "flush-miss"):
+            v = self.via.get(way)
+            if not v:
+                continue
+            mb = f" avg {v['mb_sum'] / v['mb_n']:.1f} MB" if v["mb_n"] else ""
+            parts.append(f"{way} {v['n']} grab(s){mb}, avg {v['pkt_sum'] / v['n']:.1f} packet(s)")
+        note = "frames by way: " + "; ".join(parts)
+        ck = self.check
+        if ck["n"] or ck["skipped"]:
+            note += f"; same-frame check: {ck['n']} compared, {ck['diff']} differed" + (f", {ck['skipped']} not comparable" if ck["skipped"] else "")
+        return note
+
     def diag_note(self):
         """One line per kind of read summarising the per-grab diagnostics above, or None if nothing was
         recorded yet (no successful grab, or net_rx_bytes is unavailable on this machine)."""
@@ -1248,9 +1318,11 @@ class AvExtractor:
         label = {"http": "http(bounded)", "mount": "mount(approx)", "direct-http": "direct-http(approx)"}
         parts = [f"{label.get(k, k)} avg {s['mb_sum'] / s['n']:.1f} MB worst {s['mb_max']:.1f} MB ({s['n']} reads)"
                  for k, s in self.stats.items()]
-        return ("per-thumbnail read: " + ", ".join(parts) +
+        note = ("per-thumbnail read: " + ", ".join(parts) +
                 f"; worst packet count {self.grab_packets_max}, worst seek landed {self.grab_seek_gap_max:.1f}s before target"
                 + (" (approx = this machine's whole network counter, not just this read)" if any(k != "http" for k in self.stats) else ""))
+        via = self.via_note()
+        return note + ("; " + via if via else "")
 
     def _drop(self):
         st = getattr(self.local, "st", None)
@@ -1305,22 +1377,22 @@ class AvExtractor:
             bytes_before = rf.bytes if rf is not None else net_rx_bytes()
             ts = int(t / stream.time_base) + int(stream.start_time or 0)
             c.seek(ts, stream=stream, backward=True, any_frame=False)
-            frame, n = None, 0
-            for n, pkt in enumerate(c.demux(stream)):
-                for fr in pkt.decode():
-                    frame = fr
-                    break
-                if frame is not None or n > 300:
-                    break
+            frame, n, way = self._first_frame(c, stream, bool(int(self.cfg.get("keyframe_flush", 1) or 0)))
+            if way == "flush-miss":                  # the drain gave nothing: redo this grab the old way (the bytes already read are counted)
+                c.seek(ts, stream=stream, backward=True, any_frame=False)
+                frame, n2, _ = self._first_frame(c, stream, False)
+                n += n2 + 1
             if frame is None:
                 return False, "no frame decoded"
             decoded_t = float(frame.pts * stream.time_base) if frame.pts is not None else None
+            fpts = frame.pts
             buf.push(frame)
             o = sink.pull()
             plane = o.planes[0]
             ls, w, h = plane.line_size, o.width, o.height
             data = bytes(plane)
             write_ppm(out, w, h, (data[r * ls: r * ls + w * 3] for r in range(h)))
+            mb = None
             if bytes_before is not None:
                 mb = (rf.bytes - bytes_before) / 1e6 if rf is not None else max(0.0, ((net_rx_bytes() or bytes_before) - bytes_before) / 1e6)
                 gap = max(0.0, t - decoded_t) if decoded_t is not None else 0.0
@@ -1331,6 +1403,19 @@ class AvExtractor:
                     s["mb_max"] = max(s["mb_max"], mb)
                     self.grab_packets_max = max(self.grab_packets_max, n)
                     self.grab_seek_gap_max = max(self.grab_seek_gap_max, gap)
+            with self.lock:
+                v = self.via.setdefault(way, dict(n=0, mb_sum=0.0, mb_n=0, pkt_sum=0))
+                v["n"] += 1
+                v["pkt_sum"] += n + 1
+                if mb is not None:
+                    v["mb_sum"] += mb
+                    v["mb_n"] += 1
+                chk = int(self.cfg.get("keyframe_flush_check") or 0)
+                verify = bool(chk) and way == "flush" and self.check["n"] + self.check["skipped"] < chk
+                if verify:
+                    self.check["n"] += 1
+            if verify:
+                self._verify_same_frame(c, stream, ts, t, fpts)
             return True, ""
         except Exception as ex:                # noqa: BLE001
             self._drop()
