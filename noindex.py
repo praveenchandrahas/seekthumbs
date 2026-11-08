@@ -5,7 +5,7 @@ THE PROBLEM. seekthumbs normally grabs a thumbnail by asking PyAV/ffmpeg to seek
 straight to the right byte offset. When it does not (common for files remuxed by some tools, or muxed to
 a non-seekable pipe), libavformat instead does its own scattered, iterative "estimate a byte offset, read,
 check the timestamp, correct, read again" search for EVERY seek - confirmed directly against a real film
-(Troy, a 68.8 GB HYBRID remux with a full, successfully-parsed `mkvinfo` dump showing no Cues section
+(a 68.8 GB HYBRID remux with a full, successfully-parsed `mkvinfo` dump showing no Cues section
 anywhere) to cost 10x or more the bytes and time of an indexed file. A full `mkvmerge` remux would add a
 real index, but the library this is built for is served from a read-only network mount with nowhere
 writable to put a remuxed copy, so that fix is not available here.

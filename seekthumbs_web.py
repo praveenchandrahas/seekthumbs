@@ -58,7 +58,7 @@ def file_tags(name):
 
 
 def pretty_title(key, fallback_name):
-    """'tron ares|2025' -> ('Tron Ares', 2025). Without a parsable key the file name is cleaned up instead."""
+    """'some title|2025' -> ('Some Title', 2025). Without a parsable key the file name is cleaned up instead."""
     if key and not key.startswith("\0") and "|" in key:
         t, y = key.rsplit("|", 1)
         return " ".join(w[:1].upper() + w[1:] for w in t.split()), int(y) if y.isdigit() else None

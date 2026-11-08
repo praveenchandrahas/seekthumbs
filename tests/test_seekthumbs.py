@@ -387,17 +387,17 @@ try:
     cases = {
         "Movie.Name.2019.2160p.UHD.BluRay.x265-GRP.mkv": "movie name|2019",
         "Movie Name (2019) [1080p].mkv": "movie name|2019",
-        "Blade.Runner.2049.2017.2160p.WEB-DL.mkv": "blade runner 2049|2017",
-        "2001.A.Space.Odyssey.1968.1080p.mkv": "2001 a space odyssey|1968",
-        "Amélie.2001.720p.mkv": "amelie|2001",
-        "Tom & Jerry 2021.mkv": "tom and jerry|2021",
+        "Sequel.Title.2049.2017.2160p.WEB-DL.mkv": "sequel title 2049|2017",
+        "2001.Some.Title.1968.1080p.mkv": "2001 some title|1968",
+        "Café.Noir.2001.720p.mkv": "cafe noir|2001",
+        "Salt & Pepper 2021.mkv": "salt and pepper|2021",
         "Movies/Some Folder/Movie.2019.Extended.2160p.mkv": "movie|2019",
-        "www.UIndex.org - The Imitation Game 2014 REMUX 2160p.mkv": "the imitation game|2014",
-        "The.Imitation.Game.2014.MULTI.1080p.mkv": "the imitation game|2014",
-        "Avatar Fire and Ash 2025 Hybrid 2160p DV HDR10.mkv": "avatar fire and ash|2025",
-        "Avatar.Fire.And.Ash.2025.REPACK.MULTi.VF2.2160p.UHD.mkv": "avatar fire and ash|2025",
+        "www.UIndex.org - The Example Story 2014 REMUX 2160p.mkv": "the example story|2014",
+        "The.Example.Story.2014.MULTI.1080p.mkv": "the example story|2014",
+        "Example Saga Part Two 2025 Hybrid 2160p DV HDR10.mkv": "example saga part two|2025",
+        "Example.Saga.Part.Two.2025.REPACK.MULTi.VF2.2160p.UHD.mkv": "example saga part two|2025",
         "[YTS.MX] Movie Name 2019 1080p.mkv": "movie name|2019",
-        "Everest.IMAX.2160p.mkv": None,
+        "Summit.IMAX.2160p.mkv": None,
         "The.Show.S01E02.2019.1080p.mkv": None,
         "Show.1x05.2019.mkv": None,
         "Show.Season.2.2019.mkv": None,
@@ -408,7 +408,7 @@ try:
     wrong = {k: st.release_key(k) for k, v in cases.items() if st.release_key(k) != v}
     check("release_key parses titles and years (and refuses what it cannot be sure of)", not wrong, wrong)
     check("different title strings do not match (a separate build is the safe fallback)",
-          st.release_key("Hope.2026.1080p.WEB.mkv") != st.release_key("Hopeu - Hope (2026)CZtit 1080p.mkv"))
+          st.release_key("Title.2026.1080p.WEB.mkv") != st.release_key("Other name - Title (2026)CZtit 1080p.mkv"))
 
     lib2, store2 = os.path.join(tmp, "lib2"), os.path.join(tmp, "store2s")
     names = {"a": "Cool.Film.2019.2160p.WEB-DL.mkv", "b": "Cool Film (2019) 1080p BluRay.mkv", "c": "Cool.Film.2019.Extended.mkv",
@@ -1077,14 +1077,14 @@ try:
         check("a second install-viewer does not overwrite the .bak with ours", f.read().startswith("-- the real thumbfast"))
     # ---- skip_tv / exclude
     c_tv = cfg("/x", "/y", skip_tv=1)
-    names_tv = ["Game of Thrones S01-S08 Complete UHD/Game.of.Thrones.S08E05.The.Bells.2160p.mkv", "Show Name s02e10 1080p/Show.Name.s02e10.mkv", "Show.S1E2.mkv"]
-    names_film = ["Tron.Ares.2025.2160p/Tron.Ares.2025.2160p.mkv", "IMAX - Wolves.2001.1080p.mkv", "Game of Thrones S01-S08 Complete UHD/extras.mkv", "Rise.of.Skywalker.2019.mkv", "Wes.Anderson.S1ND.mkv"]
+    names_tv = ["Big Show S01-S08 Complete UHD/Big.Show.S08E05.The.Bells.2160p.mkv", "Show Name s02e10 1080p/Show.Name.s02e10.mkv", "Show.S1E2.mkv"]
+    names_film = ["Example.Title.2025.2160p/Example.Title.2025.2160p.mkv", "IMAX - Prairie.2001.1080p.mkv", "Big Show S01-S08 Complete UHD/extras.mkv", "Space.Saga.2019.mkv", "Some.Director.S1ND.mkv"]
     check("skip_tv leaves out names with an SxxExx tag", all(st.excluded(c_tv, n) for n in names_tv), [n for n in names_tv if not st.excluded(c_tv, n)])
     check("skip_tv keeps films (and folders that only say S01-S08)", not any(st.excluded(c_tv, n) for n in names_film), [n for n in names_film if st.excluded(c_tv, n)])
     check("nothing is excluded by default", not any(st.excluded(cfg("/x", "/y"), n) for n in names_tv + names_film))
-    c_rx = cfg("/x", "/y", exclude="game.of.thrones|IMAX")
-    check("exclude is a case-insensitive regex on the relative path, | for several", st.excluded(c_rx, "IMAX - Wolves.mkv") and st.excluded(c_rx, "GAME OF THRONES/x.mkv") and not st.excluded(c_rx, "Tron.mkv"))
-    check("a broken exclude regex excludes nothing instead of crashing", not st.excluded(cfg("/x", "/y", exclude="("), "Tron.mkv"))
+    c_rx = cfg("/x", "/y", exclude="big.show|IMAX")
+    check("exclude is a case-insensitive regex on the relative path, | for several", st.excluded(c_rx, "IMAX - Prairie.mkv") and st.excluded(c_rx, "BIG SHOW/x.mkv") and not st.excluded(c_rx, "Example.mkv"))
+    check("a broken exclude regex excludes nothing instead of crashing", not st.excluded(cfg("/x", "/y", exclude="("), "Example.mkv"))
     lib7, store7 = os.path.join(tmp, "lib7"), os.path.join(tmp, "store7s")
     ep = os.path.join(lib7, "Show.Name.S01E02.1080p.mkv"); make_film(ep, seconds=30, size="320x180")
     fl = os.path.join(lib7, "Some.Film.2020.mkv"); make_film(fl, seconds=30, size="320x180")
@@ -1712,7 +1712,7 @@ try:
         print("SKIP noindex build_entry integration tests (no PyAV)")
 
     # ---- noindex: a SeekHead that CLAIMS a Cues element must be verified, not trusted blindly - seen on a real
-    # BD remux (Troy, 2026-11-04) whose SeekHead still pointed at a Cues element that was stripped/never written;
+    # BD remux (2026-11-04) whose SeekHead still pointed at a Cues element that was stripped/never written;
     # that false claim made a film with NO usable index look indexed, silently skipping the no-index speed-up.
     def _ebml_id36(v, n):
         return v.to_bytes(n, "big")

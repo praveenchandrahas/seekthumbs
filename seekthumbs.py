@@ -284,7 +284,7 @@ TAG_WORDS = {"bluray", "blu", "bdrip", "brrip", "bdremux", "remux", "web", "webd
 
 def release_key(name):
     """'normalised title|year' parsed from a file name, or None when it cannot be done with certainty (no year, a TV episode, a year only before a tag).
-    The year is the last year-looking word before the first release tag; a year in first position belongs to the title (2001.A.Space.Odyssey.1968)."""
+    The year is the last year-looking word before the first release tag; a year in first position belongs to the title (2001.Some.Title.1968)."""
     base = os.path.splitext(os.path.basename(name))[0]
     s = "".join(c for c in unicodedata.normalize("NFKD", base) if not unicodedata.combining(c)).lower().replace("&", " and ")
     while True:                                # leading site tags and bracket groups: "www.UIndex.org - ", "[YTS.MX] "
@@ -1789,7 +1789,7 @@ def build_entry(rel, src, size, cfg, gov, zscale_ok, token=None):
                 # its first 100 thumbnails and only then hits a pathological patch (e.g. a damaged region of the
                 # file) can keep its lifetime MB/thumbnail under the limit for a long time even while every
                 # thumbnail *right now* costs several times max_mb_per_thumb - exactly what happened on a real
-                # Avengers Endgame build (first seen 2026-11-05): per-grab deadlines kept firing and falling back
+                # build of a film with many releases (first seen 2026-11-05): per-grab deadlines kept firing and falling back
                 # to ffmpeg correctly, but the bail-out itself never tripped, because the early cheap reads were
                 # still propping up the average. So: compare bytes received and thumbnails completed since the
                 # LAST tick, not since the release started.

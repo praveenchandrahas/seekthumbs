@@ -39,10 +39,10 @@ tmp = tempfile.mkdtemp(prefix="seekthumbs-web-")
 srv = engine = None
 try:
     lib, store = os.path.join(tmp, "lib"), os.path.join(tmp, "store")
-    make_film(os.path.join(lib, "Tron.Ares.2025.2160p.Remux", "Tron.Ares.2025.2160p.Remux.mkv"), 60)
-    make_film(os.path.join(lib, "Tron.Ares.2025.1080p.WEB-DL", "Tron.Ares.2025.1080p.WEB-DL.mkv"), 60.4, "640x360")
-    make_film(os.path.join(lib, "Tron.Ares.2025.IMAX.2160p.WEB-DL", "Tron.Ares.2025.IMAX.2160p.WEB-DL.mkv"), 65, "640x360")     # a different runtime: must not be read in full
-    make_film(os.path.join(lib, "Arrival.2016.1080p.BluRay.mkv"), 40)
+    make_film(os.path.join(lib, "Example.Title.2025.2160p.Remux", "Example.Title.2025.2160p.Remux.mkv"), 60)
+    make_film(os.path.join(lib, "Example.Title.2025.1080p.WEB-DL", "Example.Title.2025.1080p.WEB-DL.mkv"), 60.4, "640x360")
+    make_film(os.path.join(lib, "Example.Title.2025.IMAX.2160p.WEB-DL", "Example.Title.2025.IMAX.2160p.WEB-DL.mkv"), 65, "640x360")     # a different runtime: must not be read in full
+    make_film(os.path.join(lib, "Alpha.Film.2016.1080p.BluRay.mkv"), 40)
     make_film(os.path.join(lib, "Show.Name.S01E02.1080p.mkv"), 30)
     cfg = dict(st.DEFAULTS)
     cfg.update(library=lib, store=store, interval=5.0, min_size_mb=0, settle=60, yield_to_playback=0, workers=2, pause=0.0, extractor="auto", rate_cooldown=0.2, skip_tv=1)
@@ -98,9 +98,9 @@ try:
     # ---- the film list
     code, L = call("/api/library")
     titles = sorted(f["title"] for f in L["films"])
-    check("one row per film, releases grouped, TV left out", titles == ["Arrival", "Tron Ares"] and L["hidden"] == 1, (titles, L["hidden"]))
-    tron = next(f for f in L["films"] if f["title"] == "Tron Ares")
-    check("a film shows its releases, smallest first, with quality tags", len(tron["releases"]) == 3 and "4K" in tron["releases"][0]["tags"] + tron["releases"][1]["tags"], tron["releases"])
+    check("one row per film, releases grouped, TV left out", titles == ["Alpha Film", "Example Title"] and L["hidden"] == 1, (titles, L["hidden"]))
+    ex = next(f for f in L["films"] if f["title"] == "Example Title")
+    check("a film shows its releases, smallest first, with quality tags", len(ex["releases"]) == 3 and "4K" in ex["releases"][0]["tags"] + ex["releases"][1]["tags"], ex["releases"])
     check("nothing is built yet", all(f["status"] == "new" for f in L["films"]) and L["store"]["bytes"] == 0)
 
     # ---- queue: only ids the server listed are accepted
@@ -119,7 +119,7 @@ try:
     call("/api/control", {"action": "start"})
     s = wait(lambda s: s["state"] == "idle" and not s["queue"])
     check("the queue runs to the end and goes idle", s["state"] == "idle" and not s["queue"] and "finished" in s["note"], (s["state"], s["note"]))
-    check("both films are built (the second Tron release shares)", s["totals"]["films"] == 2 and s["totals"]["aliases"] == 1, s["totals"])
+    check("both films are built (the second Example Title release shares)", s["totals"]["films"] == 2 and s["totals"]["aliases"] == 1, s["totals"])
     check("the history says which was built and which shared", sorted(h["status"] for h in s["history"]) == ["built", "built", "shared", "skipped"], [h["status"] for h in s["history"]])
     sk = [h for h in s["history"] if h["status"] == "skipped"][0]
     check("the release with another runtime was left out, not read (no thumbnails, no failure mark)", sk["thumbs"] == 0 and sk["n"] == 0 and s["totals"]["failed"] == 0 and "IMAX" in sk["rel"], sk)
@@ -131,8 +131,8 @@ try:
     check("the command line still lists the left-out release (it builds a different cut separately; only the page leaves it out)", st.scan_pass(dict(cfg), dry=True) == 1)
 
     # ---- a specific release can be forced to build on its own, even though its film is already covered by another release
-    tron2 = next(f for f in L["films"] if f["title"] == "Tron Ares")
-    imax_rel = next(r for r in tron2["releases"] if "IMAX" in r["name"])
+    ex2 = next(f for f in L["films"] if f["title"] == "Example Title")
+    imax_rel = next(r for r in ex2["releases"] if "IMAX" in r["name"])
     check("the IMAX release is not done yet and has its own queueable (gid:idx) id", not imax_rel["done"] and ":" in imax_rel["id"], imax_rel)
     check("an out-of-range release index is not accepted", call("/api/queue", {"add": [imax_rel["id"] + "9"]})[1]["added"] == 0)
     check("queueing that one specific release", call("/api/queue", {"add": [imax_rel["id"]]})[1]["added"] == 1)
@@ -142,8 +142,8 @@ try:
     check("the forced release is actually read and built this time, not left out", any(h["status"] == "built" and "IMAX" in h["rel"] for h in s["history"]), s["history"][-3:])
     code, L = call("/api/library")
     check("the store now has a real (non-alias) entry for it too", L["store"]["real"] == 3, L["store"])
-    tron3 = next(f for f in L["films"] if f["title"] == "Tron Ares")
-    imax_rel2 = next(r for r in tron3["releases"] if "IMAX" in r["name"])
+    ex3 = next(f for f in L["films"] if f["title"] == "Example Title")
+    imax_rel2 = next(r for r in ex3["releases"] if "IMAX" in r["name"])
     check("the release itself is now marked done", imax_rel2["done"], imax_rel2)
 
     # ---- pause, resume, stop on a slower film
@@ -203,9 +203,9 @@ try:
     engine = None
 
     # ---- status and tags helpers
-    check("tags: 4K, DV, HDR10+, remux, Atmos", web.file_tags("Tron.Ares.2025.2160p.UHD.Blu-ray.Remux.HDR10+.DoVi.HEVC.TrueHD.7.1.Atmos-HDT.mkv") == ["4K", "DV", "HDR10+", "Remux", "Atmos"])
+    check("tags: 4K, DV, HDR10+, remux, Atmos", web.file_tags("Example.Title.2025.2160p.UHD.Blu-ray.Remux.HDR10+.DoVi.HEVC.TrueHD.7.1.Atmos-HDT.mkv") == ["4K", "DV", "HDR10+", "Remux", "Atmos"])
     check("tags: 1080p BluRay DTS-HD", web.file_tags("Heat.1995.1080p.BluRay.x264.DTS-HD.MA.5.1.mkv") == ["1080p", "BluRay", "DTS-HD"])
-    check("title and year come from the release name", web.pretty_title("the imitation game|2014", "x.mkv") == ("The Imitation Game", 2014))
+    check("title and year come from the release name", web.pretty_title("the example story|2014", "x.mkv") == ("The Example Story", 2014))
 
     # ---- the daily budget counter and controls, on a fresh engine/store
     store19 = os.path.join(tmp, "store19")
