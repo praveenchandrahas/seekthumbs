@@ -1546,7 +1546,11 @@ try:
     out15 = io.StringIO()
     with contextlib.redirect_stderr(out15), contextlib.redirect_stdout(out15):
         n15 = st.scan_pass(cfg(lib15, store15, interval=10.0, workers=2, read_url_base=f"http://127.0.0.1:{port14}/"))     # nothing listens there any more
-    check("a dead HTTP address falls back to the mount path and still builds the film", n15 == 1 and "using the mount path" in out15.getvalue() and st.entry_current(store15, "Fall.Back.2021.mkv", os.path.getsize(os.path.join(lib15, "Fall.Back.2021.mkv"))), out15.getvalue()[-500:])
+    st15 = st.State(store15)
+    errs15 = os.path.join(store15, ".http-errors.jsonl")
+    rec15 = [json.loads(l) for l in open(errs15)] if os.path.exists(errs15) else []
+    check("a dead HTTP address does NOT fall back to the mount: nothing built, film recorded as failed for a later retry", n15 == 0 and "using the mount path" not in out15.getvalue() and not st.entry_current(store15, "Fall.Back.2021.mkv", os.path.getsize(os.path.join(lib15, "Fall.Back.2021.mkv"))) and "Fall.Back.2021.mkv" in st15.d["fail"] and st15.blocked("Fall.Back.2021.mkv", os.path.getsize(os.path.join(lib15, "Fall.Back.2021.mkv"))), (n15, st15.d["fail"], out15.getvalue()[-500:]))
+    check("the exact cause is kept in .http-errors.jsonl (step, film, error text)", len(rec15) >= 1 and rec15[0]["film"] == "Fall.Back.2021.mkv" and rec15[0]["step"] == "probe" and rec15[0]["error"], rec15)
 
     # ---- memory guard: the number of parallel reads follows the free memory
     real_mem, real_cg = st.mem_available_mb, st.cgroup_headroom_mb

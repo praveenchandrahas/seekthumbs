@@ -582,6 +582,21 @@ def have_filter(name):
         return False
 
 
+class HttpReadFailed(RuntimeError):
+    """The HTTP read of a film failed. Not retried over the mount; the film is recorded as failed and tried again after the usual back-off."""
+
+
+def record_http_error(cfg, rel, step, url, ex):
+    """Appends the full cause of an HTTP read failure to STORE/.http-errors.jsonl and logs it, so the cause can be investigated."""
+    rec = dict(time=time.strftime("%Y-%m-%d %H:%M:%S%z"), film=rel, step=step, url=mask_url(url), type=type(ex).__name__, error=str(ex)[:4000])
+    log(f"HTTP ERROR at {step} for {rel}: {type(ex).__name__}: {str(ex)[:300]} (full text in .http-errors.jsonl)")
+    try:
+        with open(os.path.join(cfg["store"], ".http-errors.jsonl"), "a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except OSError:
+        pass
+
+
 class ProbeTimeout(Exception):
     """A file did not open (or probe) within probe_timeout. On a debrid mount the first touch of a cold file can take tens of seconds, so this is
     'slow', not 'broken': the scan skips the file and tries it again at the end of the pass instead of recording a failure."""
@@ -1629,11 +1644,12 @@ def build_entry(rel, src, size, cfg, gov, zscale_ok, token=None):
     except ProbeTimeout:
         raise
     except RuntimeError as ex:
-        if rsrc == src or not os.path.exists(src):
+        if rsrc == src:
             raise
-        log(f"HTTP read failed ({str(ex)[:160]}); using the mount path for {rel}")
-        rsrc = src
-        info = ffprobe(src, cfg)
+        # Over HTTP there is no fallback to the mount: that path cost tens of GB on one film. Keep the whole error, and let the caller record
+        # the film as failed so that it is tried again later.
+        record_http_error(cfg, rel, "probe", rsrc, ex)
+        raise HttpReadFailed(f"HTTP probe failed: {str(ex)[:150]}") from None
     t_probe = time.time() - t1
     if job:
         job.t_probe = t_probe
