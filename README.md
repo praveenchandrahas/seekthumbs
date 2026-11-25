@@ -1,4 +1,4 @@
-# seekthumbs: seek-bar thumbnails for an rclone library
+# seekthumbs: seek-bar thumbnails for a film library
 
 **Full docs:** https://praveenchandrahas.github.io/seekthumbs/ — install and usage (CLI, the web page, the mpv viewer).
 
@@ -10,7 +10,7 @@
 
 > **Part of the [Software Defined Home Theatre](https://github.com/praveenchandrahas/Software-Defined-Home-Theatre) project.** The main repository holds the documentation, build log, results and the installer checks; this is one of its parts. Sibling repositories: [linux-theater-dsp](https://github.com/praveenchandrahas/linux-theater-dsp) (router and CamillaDSP configs) · [mpv-object-audio](https://github.com/praveenchandrahas/mpv-object-audio) (player and Atmos wrapper) · [Roomtone](https://github.com/praveenchandrahas/Roomtone) (measurement, autocal, status page, mpv overlay) · [mpv-shelf](https://github.com/praveenchandrahas/mpv-shelf) (film browser for mpv).
 
-Netflix-style previews on the mpv seek bar (called *trickplay* or *seek thumbnails*), for a film library on a **read-only rclone mount**.
+Netflix-style previews on the mpv seek bar (called *trickplay* or *seek thumbnails*), for a film library on a **read-only mount** (rclone or Decypharr) or read straight from Real-Debrid.
 The thumbnails are made in the background and kept in a **local folder**; the library is only ever read.
 
 **Where it stands (2026-11-08).**

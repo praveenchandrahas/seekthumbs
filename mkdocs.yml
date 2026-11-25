@@ -1,5 +1,5 @@
 site_name: seekthumbs
-site_description: Netflix-style previews on the mpv seek bar (trickplay / seek thumbnails), for a film library on a read-only rclone mount.
+site_description: Netflix-style previews on the mpv seek bar (trickplay / seek thumbnails), for a film library on a read-only mount or read straight from Real-Debrid.
 repo_url: https://github.com/praveenchandrahas/seekthumbs
 repo_name: praveenchandrahas/seekthumbs
 docs_dir: docs
