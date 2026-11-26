@@ -220,6 +220,141 @@ try:
             r = run(link, "--out", out7, "--workers", "3", "--worker-mem-mb", "0", "--server-error-stop", "6")
             H.refuse_from = None
             check("a source that keeps refusing stops the run (exit code 3)", r.returncode == 3 and "refused" in r.stderr, (r.returncode, r.stderr[-600:]))
+
+            # --- the viewer side (thumbfast.lua under lupa, a mocked mp API, the real builder)
+            try:
+                import lupa
+            except ImportError:
+                lupa = None
+                print("SKIP live viewer tests (pip install lupa)")
+            if lupa:
+                L = lupa.LuaRuntime(unpack_returned_tuples=True)
+                src = open(os.path.join(os.path.dirname(HERE), "thumbfast.lua")).read()
+                lbase = os.path.join(tmp, "lv")
+
+                def viewer(path, live_on=True):
+                    h = {"log": [], "async": [], "native": [], "timers": [], "aborted": [], "ev": {}, "msg": {}, "clock": 1000.0}
+                    props = {"path": path, "pid": str(os.getpid()), "working-directory": "/", "file-size": None}
+
+                    def commandv(*a):
+                        h["log"].append(("commandv",) + tuple(str(x) for x in a))
+                        return True
+
+                    def command_native(t):
+                        args = list(dict(dict(t)["args"]).values())
+                        h["native"].append(args)
+                        subprocess.run(args, capture_output=True)
+                        return True
+
+                    def command_native_async(t, cb):
+                        args = list(dict(dict(t)["args"]).values())
+                        h["async"].append((args, cb))
+                        return f"tok{len(h['async'])}"
+
+                    def periodic(sec, fn):
+                        e = {"fn": fn, "dead": False, "sec": sec}
+                        h["timers"].append(e)
+                        return L.table(kill=lambda *a: e.__setitem__("dead", True))
+
+                    def to_lua(v):
+                        if isinstance(v, dict):
+                            return L.table_from({k: to_lua(x) for k, x in v.items()})
+                        if isinstance(v, list):
+                            return L.table(*[to_lua(x) for x in v])
+                        return v
+
+                    def to_py(t):
+                        if hasattr(t, "items"):
+                            return {k: to_py(v) for k, v in t.items()}
+                        return t
+
+                    L.execute("package.loaded['mp']=nil")
+                    g = L.globals()
+                    mp = L.table(get_property=lambda n: props.get(n), commandv=commandv, command_native=command_native,
+                                 command_native_async=command_native_async, abort_async_command=lambda tok: h["aborted"].append(tok),
+                                 register_script_message=lambda n, f: h["msg"].__setitem__(n, f), register_event=lambda n, f: h["ev"].__setitem__(n, f),
+                                 get_time=lambda: h["clock"], add_timeout=lambda sec, fn: L.table(kill=lambda *a: None), add_periodic_timer=periodic,
+                                 msg=L.table(info=lambda *a: h["log"].append(("info",) + tuple(str(x) for x in a))))
+                    utils = L.eval("""function(dec, enc)
+                        return { join_path = function(a, b) if b:sub(1,1) == '/' then return b end return (a:gsub('/+$','')) .. '/' .. b end,
+                                 parse_json = dec, format_json = enc } end""")(lambda x: to_lua(json.loads(x)), lambda t: json.dumps(to_py(t)))
+                    g.package.loaded["mp"] = mp
+                    g.package.loaded["mp.utils"] = utils
+                    g.package.loaded["mp.options"] = L.table(read_options=lambda o, n: None)
+                    os.environ["XDG_RUNTIME_DIR"] = tmp
+                    chunk = src.replace('build = false, builder = "", python = "python3",', f'build = false, builder = "{seek}", python = "{sys.executable}",')
+                    chunk = chunk.replace('live = false, live_dir = "", live_poll_s = 2,', f'live = {"true" if live_on else "false"}, live_dir = "{lbase}", live_poll_s = 2,')
+                    chunk = chunk.replace('local opts = { library = "", store = "",', f'local opts = {{ library = "{tmp}/nolib", store = "{tmp}/nostore",')
+                    L.execute(chunk)
+                    return h, props
+
+                def tick(h):
+                    for e in h["timers"]:
+                        if not e["dead"]:
+                            e["fn"]()
+
+                def infos(h):
+                    return [json.loads(e[3]) for e in h["log"] if e[:3] == ("commandv", "script-message", "thumbfast-info")]
+
+                def overlays(h):
+                    return [e for e in h["log"] if e[:2] == ("commandv", "overlay-add")]
+
+                h, props = viewer(link)
+                h["ev"]["file-loaded"]()
+                check("viewer: a stream starts the live build in the background", len(h["async"]) == 1 and h["async"][0][0][2:4] == ["live", link]
+                      and "--parent-pid" in h["async"][0][0] and str(os.getpid()) in h["async"][0][0], h["async"][:1] and h["async"][0][0])
+                args, cb = h["async"][0]
+                vdir = args[args.index("--out") + 1]
+                check("viewer: the folder is under live_dir and named by mpv's pid", vdir.startswith(lbase + "/" + str(os.getpid()) + "-"), vdir)
+                check("viewer: until a thumbnail exists the OSC is told none are available", infos(h) and infos(h)[-1]["available"] is False, infos(h))
+                h["msg"]["thumb"]("55", "100", "200")
+                check("viewer: a hover before anything is built shows nothing", not overlays(h))
+
+                env = dict(os.environ, no_proxy="127.0.0.1,localhost", NO_PROXY="127.0.0.1,localhost")
+                r = subprocess.run(args, capture_output=True, text=True, timeout=300, env=env)
+                check("viewer: the builder the viewer starts runs to the end", r.returncode == 0, r.stderr[-400:])
+                tick(h)
+                inf = infos(h)[-1]
+                check("viewer: once thumbnails exist the OSC is told their size", inf["available"] is True and inf["width"] == 320 and inf["height"] == 180, inf)
+                n_async, n_native = len(h["async"]), len(h["native"])
+                h["msg"]["thumb"]("55", "100", "200")
+                ov = overlays(h)
+                frame = 320 * 180 * 4
+                check("viewer: a hover at 55 s shows slot 5 straight from frames.bgra",
+                      ov and ov[-1][3:] == ("100", "200", os.path.join(vdir, "frames.bgra"), str(5 * frame), "bgra", "320", "180", "1280"), ov[-1:])
+                check("viewer: a hover starts no program", len(h["async"]) == n_async and len(h["native"]) == n_native)
+
+                # only slots 0 and 11 finished: a hover at 55 s (slot 5) gets the nearest finished one (slot 0, 5 away; slot 11 is 6 away)
+                dpath = os.path.join(vdir, "done")
+                full = open(dpath, "rb").read()
+                with open(dpath, "wb") as f:
+                    f.write(bytes([1] + [0] * 10 + [1]))
+                tick(h)
+                h["clock"] += 1                      # the viewer sends at most one picture every 40 ms
+                h["msg"]["thumb"]("57", "101", "200")
+                ov = overlays(h)
+                check("viewer: an unfinished slot shows the nearest finished one", ov and ov[-1][6] == "0", ov[-1:])
+                h["clock"] += 1
+                h["msg"]["thumb"]("100", "102", "200")
+                check("viewer: ...from the other side too", overlays(h)[-1][6] == str(11 * frame), overlays(h)[-1:])
+                with open(dpath, "wb") as f:
+                    f.write(full)
+
+                cb(True, L.table(status=0))
+                check("viewer: the poll stops when the build has ended", all(e["dead"] for e in h["timers"])
+                      and any("stream build ended" in " ".join(e) for e in h["log"]), [e for e in h["log"] if e[0] == "info"][-3:])
+
+                link2 = link.replace("/1", "/2")
+                props["path"] = link2
+                h["ev"]["file-loaded"]()
+                check("viewer: the next film stops the build of the one before and starts its own", h["aborted"] == ["tok1"] and len(h["async"]) == 2
+                      and h["async"][1][0][3] == link2, (h["aborted"], len(h["async"])))
+                h["ev"]["shutdown"]()
+                check("viewer: the folders are removed when mpv closes", not os.path.exists(vdir), os.listdir(lbase) if os.path.isdir(lbase) else None)
+
+                h2, _ = viewer(link, live_on=False)
+                h2["ev"]["file-loaded"]()
+                check("viewer: with live off a stream starts nothing", not h2["async"], h2["async"])
         finally:
             srv.shutdown()
             srv.server_close()

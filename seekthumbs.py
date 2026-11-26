@@ -2844,7 +2844,7 @@ def set_conf_key(path, key, value):
         f.write("\n".join(out).rstrip("\n") + "\n")
 
 
-def cmd_install_viewer(mpv_dir, on_play=False):
+def cmd_install_viewer(mpv_dir, on_play=False, live=False):
     mpv_dir = os.path.expanduser(mpv_dir)
     sdir = os.path.join(mpv_dir, "scripts")
     os.makedirs(sdir, exist_ok=True)
@@ -2871,6 +2871,15 @@ def cmd_install_viewer(mpv_dir, on_play=False):
     else:
         set_conf_key(conf, "build", "no")
         print("set build=no in", conf, "(the viewer only SHOWS thumbnails that exist; it starts no build. Use `install-viewer --on-play` to turn the on-play build on)")
+    me = os.path.join(os.path.dirname(os.path.abspath(__file__)), "seekthumbs.py")
+    if live:
+        set_conf_key(conf, "builder", me)
+        set_conf_key(conf, "live", "yes")
+        print("set builder= and live=yes in", conf, "(a playing http(s) link gets thumbnails built while it plays, kept until mpv closes;")
+        print("about 2 MB read per thumbnail, every 10 s of film; live=no there turns it off. Needs python3-av)")
+    else:
+        set_conf_key(conf, "live", "no")
+        print("set live=no in", conf, "(streams get no thumbnails. Use `install-viewer --live` to turn that on)")
     print("Needs uosc (or another OSC that talks to thumbfast), ffmpeg on PATH, and library=/store= in ~/.config/seekthumbs/config.ini.")
     print("Check: play a film that has a store entry; mpv's log shows 'seek thumbnails: <path>'. Undo: delete it and rename thumbfast.lua.bak back.")
 
@@ -2923,6 +2932,7 @@ def main(argv):
     p = sub.add_parser("install-viewer", parents=[common])
     p.add_argument("--mpv-config-dir", default="~/.config/mpv-object-audio")
     p.add_argument("--on-play", action="store_true", help="also turn on the on-play build (off by default: it can read tens of GB per film from a debrid mount)")
+    p.add_argument("--live", action="store_true", help="also build thumbnails for a playing http(s) link while it plays (live.py); not stored")
     args = ap.parse_args(argv)
     if args.cmd == "live":
         import live
@@ -2968,7 +2978,7 @@ def main(argv):
     elif args.cmd == "live":
         return live.cmd_live(sys.modules[__name__], cfg, args.url, args.out, args.parent_pid)
     elif args.cmd == "install-viewer":
-        cmd_install_viewer(args.mpv_config_dir, args.on_play)
+        cmd_install_viewer(args.mpv_config_dir, args.on_play, args.live)
     elif args.cmd == "install-service":
         cmd_install_service(cfg, args.enable)
     return 0

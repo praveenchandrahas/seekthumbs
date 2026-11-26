@@ -21,6 +21,12 @@
 -- seekthumbs.py as builder= and sets build=yes in script-opts/seekthumbs.conf; plain `install-viewer` sets build=no. Until the entry exists nothing is shown;
 -- the script looks again every recheck_s seconds and tells the OSC as soon as it is there.
 --
+-- Streams (live = yes): a playing http(s) link has no path in the library, so it has no entry. The script starts `seekthumbs.py live URL` (live.py)
+-- in the background, with mpv's pid so it stops when mpv does, into $XDG_RUNTIME_DIR/seekthumbs-live/<pid>-<hash of the link>. It writes raw BGRA
+-- frames plus a done map; the script reads the map every live_poll_s seconds and a hover shows the nearest finished thumbnail straight from the
+-- frames file (overlay-add at an offset: nothing is started on a hover). Loading another film stops the build of the one before; the folders are
+-- removed when mpv closes. Off by default: `install-viewer --live` records builder= and sets live=yes.
+--
 -- Settings: ~/.config/seekthumbs/config.ini (the same file the generator reads: library=, store=), overridable in script-opts/seekthumbs.conf.
 local mp = require "mp"
 local utils = require "mp.utils"
@@ -28,6 +34,7 @@ local options = require "mp.options"
 
 local opts = { library = "", store = "", overlay_id = 42, ffmpeg = "ffmpeg", cache_items = 80, debug = false,
               build = false, builder = "", python = "python3", min_size_mb = 300, recheck_s = 10,
+              live = false, live_dir = "", live_poll_s = 2,   -- live: thumbnails for a playing http(s) link, built while it plays (see the header)
               bulk = true, bulk_max_mb = 256,            -- bulk: convert the whole pack with ONE ffmpeg run when the film loads (see below)
               no_overlay = false, no_convert = false }   -- the last two are for finding a cost: no_convert answers hovers with nothing, no_overlay converts but never shows
 options.read_options(opts, "seekthumbs")
@@ -57,6 +64,8 @@ local gen = 0              -- bumped when another film is loaded: a conversion f
 -- hover only points overlay-add at the right offset in it. (If that cannot be done, the one-ffmpeg-per-picture path below still works.)
 local bulk = { state = nil, file = nil, token = nil }     -- state: nil | "running" | "ready" | "failed"
 local start_bulk, convert                              -- defined further down
+local livest = nil          -- the stream being built: {dir, token, timer, meta, done, finished, gen}
+local live_dirs = {}        -- folders this mpv made; removed at shutdown
 
 local function dbg(...) if opts.debug then mp.msg.info(...) end end
 
@@ -150,11 +159,114 @@ local function locate()
     return nil
 end
 
-local function send_info()
+-- ---- streams (live = yes)
+local function is_stream(p)
+    return p and p:match("^[Hh][Tt][Tt][Pp][Ss]?://") ~= nil
+end
+
+local function key_of(url)
+    local s = url:gsub("[?#].*$", "")             -- the query may carry a signature that changes
+    local h = 5381
+    for k = 1, #s do h = (h * 33 + s:byte(k)) % 4294967291 end
+    return string.format("%s-%08x", tostring(mp.get_property("pid") or "0"), h)
+end
+
+local function live_read()
+    if not livest then return end
+    if not livest.meta then
+        local m = json_file(utils.join_path(livest.dir, "meta.json"))
+        if type(m) == "table" and tonumber(m.count) and tonumber(m.w) and tonumber(m.h) and tonumber(m.interval) then livest.meta = m end
+    end
+    if not livest.meta then return end
+    local f = io.open(utils.join_path(livest.dir, "done"), "rb")
+    if not f then return end
+    livest.done = f:read("*a") or ""
+    f:close()
+end
+
+local function live_count()
+    local n = 0
+    if livest and livest.done then for k = 1, #livest.done do if livest.done:byte(k) ~= 0 then n = n + 1 end end end
+    return n
+end
+
+-- index of the finished thumbnail nearest to time t, or nil
+local function pick_live(t)
+    local d = livest and livest.done
+    if not d or not ix then return nil end
+    local i0 = math.floor(t / ix.interval)
+    if i0 < 0 then i0 = 0 end
+    if i0 > ix.count - 1 then i0 = ix.count - 1 end
+    for step = 0, ix.count do
+        local a, b = i0 - step, i0 + step
+        if a >= 0 and (d:byte(a + 1) or 0) ~= 0 then return a end
+        if b <= ix.count - 1 and (d:byte(b + 1) or 0) ~= 0 then return b end
+        if a < 0 and b > ix.count - 1 then break end
+    end
+    return nil
+end
+
+local send_info
+
+-- Reads the done map and, the first time there is a finished thumbnail, tells the OSC that thumbnails are available.
+local function live_tick()
+    if not livest then return end
+    live_read()
+    if not ix and livest.meta and live_count() > 0 then
+        local m = livest.meta
+        ix = { live = true, interval = tonumber(m.interval), count = tonumber(m.count), w = tonumber(m.w), h = tonumber(m.h) }
+        edir = livest.dir
+        mp.msg.info(string.format("seek thumbnails: building them for this stream (%d of %d so far, %d x %d)", live_count(), ix.count, ix.w, ix.h))
+        send_info()
+    end
+    if livest.finished and livest.timer then
+        livest.timer:kill(); livest.timer = nil
+        mp.msg.info(string.format("seek thumbnails: stream build ended, %d thumbnails", live_count()))
+    end
+end
+
+local function live_stop()
+    if not livest then return end
+    if livest.timer then livest.timer:kill() end
+    if livest.token and mp.abort_async_command then pcall(mp.abort_async_command, livest.token) end
+    livest = nil
+end
+
+-- Starts the background build for a stream. Returns true if it started.
+local function live_start(url)
+    if not opts.live or opts.builder == "" then return false end
+    local base = expand(opts.live_dir)
+    if base == "" then base = utils.join_path(os.getenv("XDG_RUNTIME_DIR") or "/tmp", "seekthumbs-live") end
+    local dir = utils.join_path(base, key_of(url))
+    mp.command_native({ name = "subprocess", playback_only = false, args = { "mkdir", "-p", dir } })
+    live_dirs[dir] = true
+    local mygen = gen
+    livest = { dir = dir, gen = mygen, finished = false }
+    livest.token = mp.command_native_async({ name = "subprocess", playback_only = false, capture_stdout = true, capture_stderr = false,
+        args = { opts.python, expand(opts.builder), "live", url, "--out", dir, "--parent-pid", tostring(mp.get_property("pid") or "") } },
+        function(ok, res)
+            local st = res and res.status
+            if not ok or st == nil or (st ~= 0 and st ~= -2) then          -- -2: aborted by this script (another film was loaded)
+                mp.msg.warn(string.format("seek thumbnails: the stream build exited (%s); see the lines starting 'seekthumbs live:' above",
+                                          tostring(res and (res.error_string ~= "" and res.error_string) or st)))
+            end
+            if livest and livest.gen == mygen then
+                livest.finished = true
+                live_tick()
+            end
+        end)
+    if livest and not livest.finished then
+        livest.timer = mp.add_periodic_timer(tonumber(opts.live_poll_s) or 2, live_tick)
+    end
+    mp.msg.info("seek thumbnails: a stream; building them in the background while it plays")
+    return true
+end
+
+function send_info()
     local avail = ix ~= nil
     local info = { width = avail and ix.w or 0, height = avail and ix.h or 0, disabled = not avail, available = avail,
                    socket = "", thumbnail = "", overlay_id = tonumber(opts.overlay_id) or 42 }
-    mp.commandv("script-message", "thumbfast-info", utils.format_json(info))
+    mp.commandv("script-message", "thumbfast-info", (utils.format_json(info)))      -- (): format_json returns 2 values on some mpv versions
 end
 
 local function clear()
@@ -363,6 +475,21 @@ function convert(i, x, y)
 end
 
 local function on_thumb(t, x, y)
+    if livest then
+        if not ix then live_tick() end
+        if not ix then return end
+        t, x, y = tonumber(t), tonumber(x), tonumber(y)
+        if not (t and x and y) then return end
+        local i = pick_live(t)
+        if i == nil then return end
+        want, last_x, last_y = i, x, y
+        if opts.no_convert then return end
+        if not cache[i] then
+            cache[i] = { file = utils.join_path(livest.dir, "frames.bgra"), off = i * ix.w * ix.h * 4, w = ix.w, h = ix.h, shared = true }
+        end
+        show(i, x, y)
+        return
+    end
     if not ix then
         -- an OSC that still sends hovers: look again now and then (a build may have finished, started by this session or another program)
         local now = mp.get_time and mp.get_time() or os.time()
@@ -391,6 +518,7 @@ end
 local function on_file_loaded()
     clear()
     stop_timer()
+    live_stop()
     for k in pairs(cache) do if not cache[k].shared then os.remove(cache[k].file) end end
     if bulk.token and mp.abort_async_command then pcall(mp.abort_async_command, bulk.token) end     -- stop a conversion of the film that is leaving
     if bulk.file then os.remove(bulk.file) end
@@ -399,6 +527,10 @@ local function on_file_loaded()
     gen = gen + 1
     ix, edir = nil, nil
     if not ini_done then ini_done = true; read_ini() end     -- library=, store= (if not set in script-opts) and min_size_mb from the generator's config.ini
+    if is_stream(mp.get_property("path")) and live_start(mp.get_property("path")) then
+        send_info()
+        return
+    end
     if not adopt() then
         mp.msg.info("seek thumbnails: none for this file")
         maybe_build()
@@ -412,6 +544,8 @@ mp.register_script_message("seekthumbs-reload", on_file_loaded)
 mp.register_event("file-loaded", on_file_loaded)
 mp.register_event("end-file", function() on_clear() end)
 mp.register_event("shutdown", function()
+    live_stop()
+    for d in pairs(live_dirs) do mp.command_native({ name = "subprocess", playback_only = false, args = { "rm", "-rf", d } }) end
     if tmpdir then mp.command_native({ name = "subprocess", args = { "rm", "-rf", tmpdir } }) end
 end)
 -- uosc asks for the state when it starts after this script

@@ -15,7 +15,8 @@
 ./seekthumbs.py refine --interval 10 --dry-run    # which films, and how many thumbnails each still needs, for a finer interval
 ./seekthumbs.py refine --interval 10              # read only those; thumbnails already on the new grid are kept
 ./seekthumbs.py verify                            # flags anything over the per-film budget
-./seekthumbs.py live "https://..." --out DIR      # a streamed link: thumbnails while it plays, not stored (work in progress; see the README)
+./seekthumbs.py install-viewer --live             # streams too: a playing http(s) link gets thumbnails built while it plays (not stored; see the README)
+./seekthumbs.py live "https://..." --out DIR      # what the viewer starts for a stream; can be run by hand
 python3 tools/live-check.py                       # measures what `live` would cost on the link in $XDG_RUNTIME_DIR/stremio-last.m3u8
 ```
 
