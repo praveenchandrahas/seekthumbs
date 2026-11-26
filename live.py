@@ -16,13 +16,22 @@ How:
         DIR/done          count bytes; byte i is 1 once thumbnail i is complete (the frame is written before its byte)
         DIR/meta.json     {v, kind: "live", interval, count, w, h, duration, started}; written after the first thumbnail, so w and h are known
   - Run again with the same DIR and settings, it reads only the slots not done yet (a film loaded again in the same mpv).
-  - Stops when: every slot is done; --parent-pid has gone away (mpv closed); SIGTERM; `server_error_stop` reads in a row failed; or the reads
-    average more than `max_mb_per_thumb` (a release with no usable seek index), so a bad link cannot read gigabytes in the background.
+  - Two kinds of failed read. A refusal (5XX, 429, a traffic-limit message: PROVIDER_RE) counts toward `server_error_stop` in a row, as in a
+    library build. A dropped connection (reset, timeout, EOF) does not: Real-Debrid drops a dozen in-flight reads at once now and then and then
+    recovers (seen in the 2026-11-08 batch, and on 2026-11-26 a live run on the author's rig stopped at 436 of 943 because these were counted).
+    After BURST dropped reads in a row all workers wait (10 s, doubling to 2 min) and the slots go back in the queue (up to TRIES reads each).
+  - Stops when: every slot is done; --parent-pid has gone away (mpv closed); SIGTERM; `server_error_stop` refusals in a row; no thumbnail at
+    all for GIVE_UP_S; or the reads average more than `max_mb_per_thumb` (a release with no usable seek index), so a bad link cannot read
+    gigabytes in the background.
+  - PyAV prints a traceback straight to the error output for every read that failed inside it ("PyAV library exception being dropped"), below
+    anything Python can filter. `live` points the error output at /dev/null and writes its own lines to a copy of the real one, so mpv's
+    terminal shows the start line, one line per burst, and the end line.
   - Lowest CPU and I/O priority, and first in line for the kernel's out-of-memory killer.
 """
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -36,6 +45,11 @@ from concurrent.futures import ThreadPoolExecutor
 
 LIVE_DEFAULTS = dict(interval=10.0, width=320, workers=8)
 STALE_S = 12 * 3600
+BURST = 4                 # dropped reads in a row that make all workers wait
+WAIT_S = float(os.environ.get("SEEKTHUMBS_LIVE_WAIT_S") or 10.0)      # the variable is for the tests
+WAIT_MAX_S = 120.0
+TRIES = 5                 # reads per slot before it is left empty (a dropped connection is rarely the slot's fault)
+GIVE_UP_S = 600.0         # no thumbnail at all for this long: stop
 
 
 def host(u):
@@ -138,6 +152,11 @@ def clean_stale(base, keep, now=None):
     return n
 
 
+def refusal(st, why):
+    """True when a failed read means the source is refusing (5XX, 429, a limit message), not that a connection dropped."""
+    return bool(st.PROVIDER_RE.search(why or "")) or bool(re.search(r"\b429\b|too many requests", why or "", re.I))
+
+
 def alive(pid):
     if not pid:
         return True
@@ -156,7 +175,12 @@ class Live:
         self.log = log or (lambda *a: print("seekthumbs live:", *a, file=sys.stderr, flush=True))
         self.stop = threading.Event()
         self.lock = threading.Lock()
-        self.fails_in_row = 0
+        self.fails_in_row = 0                     # refusals in a row (the stop rule)
+        self.drops_in_row = 0                     # dropped connections in a row (a burst: wait, do not stop)
+        self.hold_until = 0.0                     # all workers wait until then
+        self.wait = WAIT_S
+        self.bursts = 0
+        self.last_ok = time.time()
         self.failed = {}                          # slot -> tries
         self.why_stopped = ""
         self.bad = False                          # stopped by a guard (failures in a row, too many MB per thumbnail): exit code 3
@@ -327,6 +351,10 @@ class Live:
             while True:
                 if self._should_stop(ext):
                     return
+                wait = self.hold_until - time.time()
+                if wait > 0:
+                    self.stop.wait(wait)
+                    continue
                 with qlock:
                     if not queue:
                         return
@@ -334,22 +362,37 @@ class Live:
                 res, why = self._grab(ext, (i + 0.5) * interval, tmpdir, i)
                 with self.lock:
                     if res is None:
-                        self.fails_in_row += 1
                         tries = self.failed.get(i, 0) + 1
                         self.failed[i] = tries
-                        if tries < 2:
+                        if tries < TRIES:
                             with qlock:
-                                queue.append(i)      # once more, after everything else
-                        if self.fails_in_row >= limit:
-                            self.why_stopped = f"{self.fails_in_row} reads in a row failed (last: {why[:160]})"
+                                queue.append(i)      # again, after everything else
+                        if refusal(self.st, why):
+                            self.fails_in_row += 1
+                            if self.fails_in_row >= limit:
+                                self.why_stopped = f"{self.fails_in_row} reads in a row refused (last: {why[:160]})"
+                                self.bad = True
+                                self.stop.set()
+                        else:
+                            self.drops_in_row += 1
+                            if self.drops_in_row >= BURST and time.time() >= self.hold_until:
+                                self.bursts += 1
+                                self.hold_until = time.time() + self.wait
+                                self.log(f"{self.drops_in_row} reads dropped in a row ({why[:100]}); waiting {self.wait:.0f} s")
+                                self.wait = min(self.wait * 2, WAIT_MAX_S)
+                                self.drops_in_row = 0
+                        if time.time() - self.last_ok > GIVE_UP_S:
+                            self.why_stopped = f"no thumbnail could be read for {GIVE_UP_S / 60:.0f} minutes (last: {why[:160]})"
                             self.bad = True
                             self.stop.set()
                         continue
                     w, h, rgb = res
                     if (w, h) != (self.w, self.h):
-                        self.failed[i] = 2
+                        self.failed[i] = TRIES
                         continue
-                    self.fails_in_row = 0
+                    self.fails_in_row = self.drops_in_row = 0
+                    self.wait = WAIT_S
+                    self.last_ok = time.time()
                     self.failed.pop(i, None)
                 self._put(i, rgb_to_bgra(rgb, w, h))
                 with self.lock:
@@ -371,8 +414,26 @@ class Live:
         s = ext.stats.get("http") or {}
         mb = f", {s['mb_sum'] / s['n']:.1f} MB per thumbnail" if s.get("n") else ""
         self.log(f"{done}/{count} thumbnails ({self.grabbed} read now) in {time.time() - t0:.0f} s{mb}"
+                 + (f"; {self.bursts} burst(s) of dropped reads waited out" if self.bursts else "")
                  + (f"; stopped: {self.why_stopped}" if self.why_stopped else ""))
         return rc
+
+
+def quiet_stderr():
+    """Points file descriptor 2 at /dev/null (PyAV's dropped-exception tracebacks go there) and returns a log function that writes to a copy of
+    the real error output. Uncaught exceptions, in any thread, still reach the real one."""
+    import traceback
+    real = os.fdopen(os.dup(2), "w", buffering=1)
+    null = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(null, 2)
+    os.close(null)
+
+    def log(*a):
+        print("seekthumbs live:", *a, file=real, flush=True)
+
+    sys.excepthook = lambda t, v, tb: traceback.print_exception(t, v, tb, file=real)
+    threading.excepthook = lambda a: traceback.print_exception(a.exc_type, a.exc_value, a.exc_traceback, file=real)
+    return log
 
 
 def cmd_live(st, cfg, url, out=None, parent_pid=None):
@@ -390,7 +451,8 @@ def cmd_live(st, cfg, url, out=None, parent_pid=None):
     if shutil.which("ionice"):
         subprocess.run(["ionice", "-c3", "-p", str(os.getpid())], capture_output=True)
     st.prefer_to_be_killed_first()
-    live = Live(st, cfg, url, out or default_out(url), parent_pid=parent_pid)
+    log = quiet_stderr()
+    live = Live(st, cfg, url, out or default_out(url), parent_pid=parent_pid, log=log)
 
     def on_term(signum, frame):
         live.why_stopped = live.why_stopped or "asked to stop"

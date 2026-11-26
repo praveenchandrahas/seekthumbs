@@ -4,7 +4,9 @@ import http.server
 import json
 import os
 import shutil
+import socket
 import socketserver
+import struct
 import subprocess
 import sys
 import tempfile
@@ -88,6 +90,10 @@ try:
         class H(http.server.BaseHTTPRequestHandler):
             ranges = True
             delay = 0.0
+            reset_at = None           # from this file request on, for reset_s seconds: every request is answered with a TCP reset
+            reset_s = 1.5
+            reset_t0 = None
+            refuse_from = None        # from this file request on: 503
 
             def log_message(self, *a):
                 pass
@@ -101,6 +107,18 @@ try:
                     return
                 hits["file"] += 1
                 time.sleep(self.delay)
+                if H.reset_at is not None and hits["file"] >= H.reset_at and H.reset_t0 is None:
+                    H.reset_t0 = time.time()
+                if H.reset_t0 is not None and time.time() - H.reset_t0 < H.reset_s:
+                    self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                    self.close_connection = True
+                    self.connection.close()
+                    return
+                if self.refuse_from is not None and hits["file"] >= self.refuse_from:
+                    self.send_response(503, "Service Unavailable")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
                 rng = self.headers.get("Range")
                 lo, hi = 0, size - 1
                 if rng and self.ranges:
@@ -184,6 +202,24 @@ try:
             d5 = open(os.path.join(out5, "done"), "rb").read()
             check("SIGTERM stops it and keeps the finished thumbnails", p.returncode == 0 and "asked to stop" in err and 0 < sum(d5) < len(d5),
                   (p.returncode, err[-300:], sum(d5), len(d5)))
+
+            # a burst of dropped connections in the middle: waited out, not a stop
+            out6 = os.path.join(tmp, "out6")
+            H.reset_at = hits["file"] + 15
+            r = run(link, "--out", out6, "--workers", "3", "--worker-mem-mb", "0", env_extra={"SEEKTHUMBS_LIVE_WAIT_S": "0.5"})
+            H.reset_at = H.reset_t0 = None
+            d6 = open(os.path.join(out6, "done"), "rb").read()
+            check("a burst of connection resets is waited out and every slot still gets done",
+                  r.returncode == 0 and all(d6) and "waiting" in r.stderr and "burst" in r.stderr, (r.returncode, r.stderr[-600:], sum(d6)))
+            check("PyAV's dropped-exception tracebacks do not reach the output", "exception being dropped" not in r.stderr and "Traceback" not in r.stderr,
+                  r.stderr[-600:])
+
+            # the source refusing (503 on every read): stops after server_error_stop, exit code 3
+            out7 = os.path.join(tmp, "out7")
+            H.refuse_from = hits["file"] + 15
+            r = run(link, "--out", out7, "--workers", "3", "--worker-mem-mb", "0", "--server-error-stop", "6")
+            H.refuse_from = None
+            check("a source that keeps refusing stops the run (exit code 3)", r.returncode == 3 and "refused" in r.stderr, (r.returncode, r.stderr[-600:]))
         finally:
             srv.shutdown()
             srv.server_close()

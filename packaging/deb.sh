@@ -23,6 +23,7 @@ stage() {
   inst 644 seekthumbs_web.py "$L/seekthumbs_web.py"
   inst 644 noindex.py "$L/noindex.py"
   inst 644 live.py "$L/live.py"
+  inst 644 realdebrid.py "$L/realdebrid.py"
   inst 644 thumbfast.lua "$L/thumbfast.lua"
   inst 644 web/index.html "$L/web/index.html"
   script /usr/bin/seekthumbs <<'X'
