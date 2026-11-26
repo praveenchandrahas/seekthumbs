@@ -1,6 +1,8 @@
 # Changelog
 
-## [Unreleased]
+## [0.2.0] - 2026-11-26
+
+Second pre-release. Experimental. New since 0.1.0: thumbnails for streamed films (`live`, `install-viewer --live`), confirmed on the author's rig with uosc in one session; reading over HTTP with the keyframe flush (about 1.7 MB per thumbnail on the author's library); Real-Debrid as a source; the calibrated path for films with no seek index. Untested: the on-play trigger beyond one run, Dolby Vision profile 5, older PyAV builds, any rig but the author's.
 
 - Stream thumbnails confirmed on the author's rig with uosc (owner, 2026-11-26): thumbnails appeared on the seek bar of a streamed 4K film while it played. Docs: README, the documentation site (Home, Install, Usage) describe the fourth way to get thumbnails.
 - Viewer: stream thumbnails (`live=yes`, set by `install-viewer --live` or `seekthumbs-setup install --live`). A playing http(s) link starts `seekthumbs.py live` in the background with mpv's pid; a hover shows the nearest finished thumbnail straight from `frames.bgra` with `overlay-add` (nothing is started on a hover); another film stops the build before; the folders go when mpv closes. Tested under the mocked mp API with the real builder, and in a real mpv 0.37 with `--vo=null`.
