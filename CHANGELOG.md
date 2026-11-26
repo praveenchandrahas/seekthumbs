@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- `tools/live-check.py`: step 0 of building seek thumbnails on the fly for streamed links (no store). On one link it checks that the final address answers range requests, measures MB and seconds per thumbnail at 4 parallel reads, the keyframe spacing (whether a 10 s grid gives distinct pictures), and, when mpv is playing, the cache and dropped frames before and during the reads. Prints host names only, never the link. Tested against a local range server behind a redirect; not yet run on a real stream.
 - A failed HTTP probe now records what the server really answered: one 1-byte range request to the same address (a redirect is reported, not followed), and its status, `Retry-After`/`Server` headers and the start of the body go to the log and to the `http` field of `.http-errors.jsonl`. ffprobe's own message says only "5XX".
 - A 429, 502, 503 or 504 on the probe is retried after 1 h, doubling to at most 12 h (it was 6 h to 7 days for every failure); other failures keep the old schedule.
 - `RangeFile` no longer sends the WebDAV password to the host a redirect leads to (urllib keeps the Authorization header across hosts); it is dropped when the host changes. Tested with two local servers.
