@@ -15,6 +15,8 @@
 ./seekthumbs.py refine --interval 10 --dry-run    # which films, and how many thumbnails each still needs, for a finer interval
 ./seekthumbs.py refine --interval 10              # read only those; thumbnails already on the new grid are kept
 ./seekthumbs.py verify                            # flags anything over the per-film budget
+./seekthumbs.py live "https://..." --out DIR      # a streamed link: thumbnails while it plays, not stored (work in progress; see the README)
+python3 tools/live-check.py                       # measures what `live` would cost on the link in $XDG_RUNTIME_DIR/stremio-last.m3u8
 ```
 
 Every setting can also be given on the command line, before or after the subcommand (`./seekthumbs.py scan --max-films 1`). `prune` is manual and deletes (`--yes` to actually delete); it never deletes a pack that an alias still uses.

@@ -101,6 +101,17 @@ It listens on 127.0.0.1 only and every request needs the token; the Host header 
 listed. It reads the library and writes the thumbnail store, nothing else. The queue is saved in the store (`.web-queue.json`), so closing the page keeps it. The film being read is recorded there too: if the page is killed mid-film (out of memory, power cut), the film comes back at the top of the queue on the next start (`RESUMED:` in the log) instead of being lost. Until 2026-10-28 the film in hand was dropped from the saved queue the moment it started, so it was lost after a kill. Do not run
 `scan` or `watch` at the same time as a Start from the page (one film is never built twice, but the two would compete for the mount).
 
+## Streams: thumbnails built while the film plays (work in progress, `live-thumbs` branch)
+
+A streamed link (a Stremio/Comet stream, say) has no path in the library, so the store never has an entry for it and the viewer shows nothing. `seekthumbs.py live URL --out DIR` builds the thumbnails of one link while it plays, into a folder that is not kept (`live.py`). Step 1 of 3: the builder is done and tested against a local server; the viewer side (step 2), which starts it from mpv and shows what it writes, is not written yet, so nothing appears in mpv yet.
+
+- **Why it is affordable now.** The keyframe flush brought a thumbnail down to about 2 MB of reading. Measured with `tools/live-check.py` on the author's rig on 2026-11-26, one run each, while the same link played in mpv: a 157 min 4K HDR10 remux (74.6 GB) gave 0.70 thumbnails a second at 4 parallel reads and 0.92 at 8 (2.1 to 2.2 MB each), an 8.8 GB 4K HDR10 file 2.35 a second at 8 (1.5 MB each); mpv's cache did not drop and no frame was dropped in any run. The Comet link answered 302 to a Real-Debrid download host, which accepted range requests.
+- **What it reads.** The link is resolved once (the 302 is not asked for again per thumbnail; resolved again once if the final address expires), then read with the same bounded range reads, PyAV and keyframe flush as a library build. Defaults for a stream: a thumbnail every 10 s, 320 px wide, 8 parallel reads (cut by `worker_mem_mb`/`mem_reserve_mb` when memory is short, as for any build); the library's `interval`, `width` and `workers` in config.ini do not apply, the command line does.
+- **Order.** The gaps are halved: the middle first, then the quarter points, the eighths and so on, so the thumbnails are evenly spread at every moment and no slot is read twice. On the 74.6 GB film at 0.92 a second that is one about every 3 minutes of film after 1 minute, about every minute after 3, and the full 10 s grid (943 thumbnails, about 2 GB read, under 3 % of the file) after about 17 minutes.
+- **Output.** `frames.bgra` (thumbnail i is raw BGRA at offset i * w * h * 4, so the viewer can hand it straight to mpv's `overlay-add` without starting any program), `done` (one byte per thumbnail, set after its frame is written) and `meta.json` (written after the first thumbnail). About 230 KB per thumbnail at 320x180: 217 MB for the 157 min film. The same folder and settings again reads only what is missing. Folders left behind (a crashed player) are removed after 12 h at the next start.
+- **Stops** when everything is done, when `--parent-pid` is gone (the player closed), on SIGTERM, after `server_error_stop` failed reads in a row, or when reads average more than `max_mb_per_thumb` (a release with no usable seek index). Lowest CPU and I/O priority.
+- **Left out.** Stremio's own torrent server (`127.0.0.1:11470`): every seek would fetch new torrent pieces. No pause when mpv's cache runs low: not built, because the runs above showed no effect on playback; to be added if a stutter ever shows up.
+
 ## How it works
 
 - **Extraction:** one `ffprobe` per film, then one `ffmpeg` per thumbnail: `-ss <t> -i FILE -noaccurate_seek -frames:v 1`, so ffmpeg jumps to the
@@ -315,7 +326,7 @@ Finding the cost inside the script: two switches in `seekthumbs.conf in the `scr
 
 ## Tests
 
-`bash tests/run.sh` runs `tests/test_seekthumbs.py` (generator, viewer under a mocked mpv), `tests/test_web.py` (the web page: its token and Host checks, the film list, queue, start, pause, resume, stop, and what ends up in the store) and `tests/test_realdebrid.py` (the RD client, pagination/429/error mapping, the inventory and link caches, mount matching, `RangeFile` link refresh, and an end-to-end `source = rd` build against a local mock API and file server). Needs ffmpeg; `pip install lupa av` adds the viewer and PyAV tests.
+`bash tests/run.sh` runs `tests/test_seekthumbs.py` (generator, viewer under a mocked mpv), `tests/test_web.py` (the web page: its token and Host checks, the film list, queue, start, pause, resume, stop, and what ends up in the store) `tests/test_realdebrid.py` (the RD client, pagination/429/error mapping, the inventory and link caches, mount matching, `RangeFile` link refresh, and an end-to-end `source = rd` build against a local mock API and file server) and `tests/test_live.py` (stream thumbnails: the halving order, the BGRA output, resume, the player-gone and SIGTERM stops, refusing torrent links and servers without range requests, against a local server behind a redirect). Needs ffmpeg; `pip install lupa av` adds the viewer and PyAV tests.
 
 ## Adapting it to your system
 

@@ -17,6 +17,7 @@ grows back one step per 40 clean reads. Standard library plus ffmpeg/ffprobe; Py
     seekthumbs.py prune [--yes]     list (or delete, with --yes) store entries whose film no longer exists; refuses if the library looks unmounted
     seekthumbs.py install-service [--enable]   write ~/.config/systemd/user/seekthumbs.service
     seekthumbs.py install-viewer [--mpv-config-dir DIR] [--on-play]   put the mpv viewer (thumbfast.lua) into DIR/scripts, moving a real thumbfast aside; --on-play also turns on the build of the playing film (off by default)
+    seekthumbs.py live URL [--out DIR] [--parent-pid PID]          thumbnails of a streamed link while it plays, not stored (live.py)
     seekthumbs.py rd-probe [--refresh] [--films N] [--extract]   check the Real-Debrid account, match its torrents to the mount, and measure reads (source=rd)
 
 Settings come from ~/.config/seekthumbs/config.ini ([seekthumbs] library=, store=, ...) and can be overridden on the command line.
@@ -2915,10 +2916,19 @@ def main(argv):
     p = sub.add_parser("serve", parents=[common], help="a local web page: pick films, queue them, start/pause/stop, watch the progress")
     p.add_argument("--port", type=int, default=8781)
     p.add_argument("--open", action="store_true", help="also open the page in your browser")
+    p = sub.add_parser("live", parents=[common], help="build seek thumbnails for a streamed link while it plays, into a folder that is not kept (see live.py)")
+    p.add_argument("url")
+    p.add_argument("--out", help="the folder to write (default: $XDG_RUNTIME_DIR/seekthumbs-live/<hash of the link>)")
+    p.add_argument("--parent-pid", type=int, help="stop when this process (the player) is gone")
     p = sub.add_parser("install-viewer", parents=[common])
     p.add_argument("--mpv-config-dir", default="~/.config/mpv-object-audio")
     p.add_argument("--on-play", action="store_true", help="also turn on the on-play build (off by default: it can read tens of GB per film from a debrid mount)")
     args = ap.parse_args(argv)
+    if args.cmd == "live":
+        import live
+        for k, v in live.LIVE_DEFAULTS.items():      # the library's interval/width/workers in config.ini do not apply to a stream; the command line does
+            if getattr(args, k, None) is None:
+                setattr(args, k, v)
     cfg = load_config(args)
     if args.cmd in ("build", "scan", "watch", "serve", "probe", "refine"):
         prefer_to_be_killed_first()
@@ -2955,6 +2965,8 @@ def main(argv):
         signal.signal(signal.SIGTERM, on_signal)
         import seekthumbs_web
         return seekthumbs_web.serve(sys.modules[__name__], cfg, args.port, args.open)
+    elif args.cmd == "live":
+        return live.cmd_live(sys.modules[__name__], cfg, args.url, args.out, args.parent_pid)
     elif args.cmd == "install-viewer":
         cmd_install_viewer(args.mpv_config_dir, args.on_play)
     elif args.cmd == "install-service":
