@@ -17,7 +17,7 @@
 ./seekthumbs.py verify                            # flags anything over the per-film budget
 ./seekthumbs.py install-viewer --live             # streams too: a playing http(s) link gets thumbnails built while it plays (not stored; see the README)
 ./seekthumbs.py live "https://..." --out DIR      # what the viewer starts for a stream; can be run by hand
-python3 tools/live-check.py                       # measures what `live` would cost on the link in $XDG_RUNTIME_DIR/stremio-last.m3u8
+python3 tools/live-check.py URL                   # measures what `live` would cost on one link, and whether it disturbs mpv playing it
 ```
 
 Every setting can also be given on the command line, before or after the subcommand (`./seekthumbs.py scan --max-films 1`). `prune` is manual and deletes (`--yes` to actually delete); it never deletes a pack that an alias still uses.
@@ -57,7 +57,7 @@ Do not run `scan` or `watch` at the same time as a Start from the page — one f
 
 `install-viewer` installs `thumbfast.lua` into mpv's `scripts` folder (the folder it prints; `~/.config/mpv-object-audio/scripts` for this project's mpv, or `~/.config/mpv` for plain mpv), moving aside any real `thumbfast.lua` as `.bak` — this script replaces it, answering the same seek-bar hover messages from the local thumbnail store instead of opening the film in a second mpv.
 
-Settings for the viewer live in `script-opts/seekthumbs.conf` next to that `scripts` folder: `library`, `store` and `min_size_mb` are read from the main `config.ini`, and this file can override them, plus `overlay_id`, `ffmpeg`, `debug=yes`, `build=no`/`build=yes`, `builder=` (set by `install-viewer`), `python=`, `recheck_s`.
+Settings for the viewer live in `script-opts/seekthumbs.conf` next to that `scripts` folder: `library`, `store` and `min_size_mb` are read from the main `config.ini`, and this file can override them, plus `overlay_id`, `ffmpeg`, `debug=yes`, `build=no`/`build=yes`, `builder=` (set by `install-viewer`), `python=`, `recheck_s`, `live=no`/`live=yes`, `live_dir=` (default `$XDG_RUNTIME_DIR/seekthumbs-live`), `live_poll_s` (2).
 
 **On-play build.** When the playing file is a video under `library`, at least `min_size_mb`, and has no usable thumbnail entry, the viewer starts a background build of that one file through mpv's detached `run` (it never blocks mpv), once per file per session. Nothing is shown until it finishes; the viewer checks again every 10 s and tells uosc as soon as the entry exists (hovering also re-checks, at most every 5 s). The first play of a film has no thumbnails for the first few minutes; later plays do.
 
@@ -66,7 +66,20 @@ Settings for the viewer live in `script-opts/seekthumbs.conf` next to that `scri
 !!! warning "On-play build is off by default"
     On the author's rig, an on-play build on a 4K remux read about 66 MB/s from the debrid mount for as long as it ran. Because of that measurement, the on-play trigger is off by default; turn it on only with `install-viewer --on-play`, and be aware of what it can cost on a metered or rate-limited mount.
 
-After a `git pull`, run `./seekthumbs.py install-viewer` again — `install-viewer` *copies* `thumbfast.lua` into mpv's scripts folder, so an update to the script in this repository doesn't reach mpv until you reinstall it.
+**Stream thumbnails** (`live=yes`, set by `install-viewer --live`). A film streamed over http(s) has no path in the library, so it never has a store entry. When one starts playing, the viewer starts `seekthumbs.py live URL` in the background with mpv's process ID, so the build stops when mpv does. The builder:
+
+- resolves the link once and reads the final address with bounded range requests, PyAV and the keyframe flush, the same reads a library build makes;
+- makes one thumbnail every 10 s, 320 px wide, with 8 parallel reads (fewer when memory is short);
+- fills the bar by halving the gaps: the middle first, then the quarter points, and so on, so the thumbnails are spread evenly at every moment;
+- writes raw frames to `$XDG_RUNTIME_DIR/seekthumbs-live/`, so a hover shows the nearest finished thumbnail without starting any program inside mpv;
+- waits out bursts of dropped connections, and stops if the source keeps refusing (`server_error_stop`) or a release costs more than `max_mb_per_thumb` per thumbnail.
+
+Loading another film stops the build of the one before; the folders are removed when mpv closes. The builder's lines start with `seekthumbs live:` in mpv's output. A local torrent-streaming server on `127.0.0.1:11470` is left out, since every seek there would fetch new torrent pieces. `live=no` turns it off; plain `install-viewer` writes `live=no`.
+
+!!! note "What a stream costs (the author's rig, 2026-11-26)"
+    A 157-minute 4K HDR10 stream (74.6 GB): about 2 MB read per thumbnail, 943 thumbnails, about 2 GB for the whole film (under 3 % of the stream), 1 to 2 thumbnails a second at 8 parallel reads. Over several runs while the film played, mpv's cache did not drop and no frame was dropped. RAM: about 230 KB per thumbnail, 217 MB for that film, until mpv closes. One rig and a few films, not a guarantee.
+
+After a `git pull`, run `./seekthumbs.py install-viewer` again — `install-viewer` *copies* `thumbfast.lua` into mpv's scripts folder, so an update to the script in this repository doesn't reach mpv until you reinstall it (add `--live` and/or `--on-play` again if you use them: a plain `install-viewer` turns both off).
 
 ## What to expect (2026-11-08, the author's rig)
 

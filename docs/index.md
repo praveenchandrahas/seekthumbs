@@ -6,15 +6,16 @@ It is one part of the [Software Defined Home Theatre](https://github.com/praveen
 
 **Where it stands (2026-11-08).** On the author's library, 14 films (2160p HEVC and 1080p remuxes) were built reading **1.7 MB per thumbnail on average** (5.8 MB worst) and 0.4 to 1.8 GB per film, in 88 to 315 s each; the same kind of build used to read tens to hundreds of MB per thumbnail and take 12 to 25 minutes or more. The before-and-after table, how to read it and what is still open are in the [README](https://github.com/praveenchandrahas/seekthumbs#readme). These figures come from one rig and one library, not from a guarantee.
 
-There are three ways to get thumbnails, and you can use any of them:
+There are four ways to get thumbnails, and you can use any of them:
 
 - **The web page** (`./seekthumbs.py serve`): tick the films you want, press Start, and watch it work.
 - **On play** (off by default): once turned on, the first time you play a film with no thumbnails, the viewer starts a gentle background build of that one film.
 - **Batch**: `scan` / `watch` build the whole library ahead of time.
+- **Streams** (off by default; `install-viewer --live`): a film streamed over http(s) has no place in the library, so its thumbnails are built while it plays, starting with an even spread across the film and filling in to one every 10 s, and dropped when mpv closes. On the author's rig a 157-minute 4K stream read about 2 MB per thumbnail, about 2 GB for the whole film, with no effect on playback that could be measured.
 
-In all three, releases of the same film share one set of thumbnails where their runtimes match closely enough — see [Usage](usage.md) for how that works.
+In the first three, releases of the same film share one set of thumbnails where their runtimes match closely enough — see [Usage](usage.md) for how that works.
 
 See [Install](install.md) to get it onto your machine, and [Usage](usage.md) for the CLI subcommands, `config.ini` options, the web page and the mpv viewer.
 
 !!! warning "Pre-release, experimental"
-    Releases are marked pre-release. The hover preview has been confirmed in real mpv with uosc on a finished film; the on-play trigger has not. See the project's [README](https://github.com/praveenchandrahas/seekthumbs#not-verified-yet--known-weak-spots) for the full list of what is and isn't verified yet.
+    Releases are marked pre-release. The hover preview has been confirmed in real mpv with uosc on a finished film, and stream thumbnails on a streamed film (2026-11-26); the on-play trigger has not. See the project's [README](https://github.com/praveenchandrahas/seekthumbs#not-verified-yet--known-weak-spots) for the full list of what is and isn't verified yet.

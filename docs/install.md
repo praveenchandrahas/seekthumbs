@@ -36,6 +36,7 @@ cd seekthumbs      # this repository
 ./seekthumbs.py install-service --enable          # afterwards: the background watcher picks up new films (systemd user service)
 ./seekthumbs.py install-viewer                    # the mpv side, into ~/.config/mpv-object-audio/scripts (see Usage); sets build=no (the viewer only shows thumbnails)
 ./seekthumbs.py install-viewer --on-play          # same, and turns the on-play build on (records builder= and build=yes); read the warning in Usage first
+./seekthumbs.py install-viewer --live             # same, and turns stream thumbnails on (records builder= and live=yes); needs python3-av; see Usage
 ```
 
 `min_size_mb` (default 300; the author sets 20000 in `config.ini`) decides which files count as films: everything smaller is ignored, by `plan`/`scan`/`watch`, by `build` and by the viewer's on-play check alike. Non-video files (`.iso`, `.rar`, `.nfo`, ...) are never considered whatever their size.

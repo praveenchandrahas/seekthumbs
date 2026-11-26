@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Stream thumbnails confirmed on the author's rig with uosc (owner, 2026-11-26): thumbnails appeared on the seek bar of a streamed 4K film while it played. Docs: README, the documentation site (Home, Install, Usage) describe the fourth way to get thumbnails.
 - Viewer: stream thumbnails (`live=yes`, set by `install-viewer --live` or `seekthumbs-setup install --live`). A playing http(s) link starts `seekthumbs.py live` in the background with mpv's pid; a hover shows the nearest finished thumbnail straight from `frames.bgra` with `overlay-add` (nothing is started on a hover); another film stops the build before; the folders go when mpv closes. Tested under the mocked mp API with the real builder, and in a real mpv 0.37 with `--vo=null`.
 - Viewer: `thumbfast-info` is sent with exactly one argument (`utils.format_json` returns two values on mpv 0.37, which made `commandv` fail with "argument 4 is not a string").
 - `live`: a dropped connection (reset, timeout) no longer counts toward `server_error_stop`; after 4 in a row all reads wait (10 s, doubling to 2 min) and the slots are read again (up to 5 reads each). Only refusals (5XX, 429, limit messages) stop the run, as in a library build; it also stops after 10 minutes without a single thumbnail. The first real run stopped at 436 of 943 on a burst of resets (2026-11-26). PyAV's dropped-exception tracebacks no longer reach the output.
